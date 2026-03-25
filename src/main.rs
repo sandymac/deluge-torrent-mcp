@@ -71,6 +71,16 @@ async fn main() -> anyhow::Result<()> {
         "Starting deluge-torrent-mcp"
     );
 
-    // TODO: build Deluge client config, wire up MCP server and tools
+    let client = deluge::DelugeClient::connect(
+        &cli.host,
+        cli.port,
+        cli.cert_fingerprint,
+    )
+    .await?;
+
+    let auth_level = client.login(&cli.username, &cli.password).await?;
+    info!(auth_level, "Authenticated with Deluge daemon");
+
+    // TODO: wire up MCP server and tools
     Ok(())
 }
