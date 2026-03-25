@@ -1,4 +1,5 @@
 use clap::Parser;
+use rmcp::ServiceExt;
 use tracing::info;
 
 mod deluge;
@@ -81,6 +82,19 @@ async fn main() -> anyhow::Result<()> {
     let auth_level = client.login(&cli.username, &cli.password).await?;
     info!(auth_level, "Authenticated with Deluge daemon");
 
-    // TODO: wire up MCP server and tools
+    let server = tools::DelugeServer::new(client, allow_risky, allow_destructive);
+
+    match cli.transport {
+        Transport::Stdio => {
+            info!("Starting MCP server on stdio");
+            let service = server.serve(rmcp::transport::stdio()).await?;
+            service.waiting().await?;
+        }
+        Transport::Http => {
+            // TODO: HTTP/SSE transport
+            anyhow::bail!("HTTP transport not yet implemented");
+        }
+    }
+
     Ok(())
 }
