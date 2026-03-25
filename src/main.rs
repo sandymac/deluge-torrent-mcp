@@ -40,6 +40,10 @@ struct Cli {
     /// MCP transport to use
     #[arg(long, default_value = "stdio")]
     transport: Transport,
+
+    /// Connect to Deluge, list torrents, print results to stderr, and exit
+    #[arg(long, default_value_t = false)]
+    test_connection: bool,
 }
 
 #[derive(Debug, Clone, clap::ValueEnum)]
@@ -81,6 +85,22 @@ async fn main() -> anyhow::Result<()> {
 
     let auth_level = client.login(&cli.username, &cli.password).await?;
     info!(auth_level, "Authenticated with Deluge daemon");
+
+    if cli.test_connection {
+        use crate::rencode::Value;
+        let keys = Value::List(vec![
+            Value::String("name".into()),
+            Value::String("state".into()),
+            Value::String("progress".into()),
+            Value::String("total_size".into()),
+            Value::String("save_path".into()),
+        ]);
+        let result = client
+            .call("core.get_torrents_status", vec![Value::Dict(vec![]), keys], vec![])
+            .await?;
+        eprintln!("{result:#?}");
+        return Ok(());
+    }
 
     let server = tools::DelugeServer::new(client, allow_risky, allow_destructive);
 

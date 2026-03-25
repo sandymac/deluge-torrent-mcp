@@ -31,6 +31,10 @@ const INT_NEG_FIXED_COUNT: u8 = 32;
 const STR_FIXED_START: u8 = 128;
 const STR_FIXED_COUNT: u8 = 64; // lengths 0..=63
 
+// Fixed-length short dict
+const DICT_FIXED_START: u8 = 102;
+const DICT_FIXED_COUNT: u8 = 25; // lengths 0..=24 (tags 102–126)
+
 // Fixed-length short list
 const LIST_FIXED_START: u8 = 192;
 const LIST_FIXED_COUNT: u8 = 64; // lengths 0..=63
@@ -108,12 +112,18 @@ fn encode_into(value: &Value, buf: &mut Vec<u8>) {
         }
 
         Value::Dict(pairs) => {
-            buf.push(CHR_DICT);
+            if pairs.len() < DICT_FIXED_COUNT as usize {
+                buf.push(DICT_FIXED_START + pairs.len() as u8);
+            } else {
+                buf.push(CHR_DICT);
+            }
             for (k, v) in pairs {
                 encode_into(k, buf);
                 encode_into(v, buf);
             }
-            buf.push(CHR_TERM);
+            if pairs.len() >= DICT_FIXED_COUNT as usize {
+                buf.push(CHR_TERM);
+            }
         }
     }
 }
@@ -195,6 +205,20 @@ fn decode_from(data: &[u8], pos: usize) -> Result<(Value, usize), RencodeError> 
             Err(_) => Value::Bytes(bytes),
         };
         return Ok((value, end));
+    }
+
+    // Fixed dict (tags 102–126, must be checked before fixed negative ints which start at 70)
+    if tag >= DICT_FIXED_START && tag < DICT_FIXED_START + DICT_FIXED_COUNT {
+        let count = (tag - DICT_FIXED_START) as usize;
+        let mut pairs = Vec::with_capacity(count);
+        let mut cur = pos + 1;
+        for _ in 0..count {
+            let (k, next) = decode_from(data, cur)?;
+            let (v, next2) = decode_from(data, next)?;
+            pairs.push((k, v));
+            cur = next2;
+        }
+        return Ok((Value::Dict(pairs), cur));
     }
 
     // Fixed negative integer
@@ -361,9 +385,16 @@ mod tests {
 
     #[test]
     fn test_dict() {
+        // Small dict — uses fixed dict encoding (< 25 entries)
         roundtrip(Value::Dict(vec![
             (Value::String("key".into()), Value::Int(42)),
         ]));
+        // Dict with 24 entries — still fixed
+        let large = (0..24).map(|i| (Value::Int(i), Value::Bool(true))).collect();
+        roundtrip(Value::Dict(large));
+        // Dict with 25 entries — uses CHR_DICT + CHR_TERM
+        let overflow = (0..25).map(|i| (Value::Int(i), Value::Bool(false))).collect();
+        roundtrip(Value::Dict(overflow));
     }
 
     #[test]

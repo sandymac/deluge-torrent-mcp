@@ -1,7 +1,5 @@
 // Deluge RPC client — connection, authentication, and method wrappers.
 
-mod tls;
-
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -12,10 +10,11 @@ use bytes::{Buf, BytesMut};
 use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
 use tokio::sync::{oneshot, Mutex as AsyncMutex};
-use tokio_rustls::client::TlsStream;
+use tokio_native_tls::TlsStream;
 use tracing::{debug, warn};
 
 use crate::rencode::{self, Value};
@@ -36,28 +35,47 @@ pub struct DelugeClient {
 impl DelugeClient {
     /// Connect to a Deluge daemon via TLS TCP.
     ///
+    /// Uses native-tls to tolerate Deluge's legacy self-signed certificates.
     /// If `cert_fingerprint` is None the server certificate is accepted without
     /// verification and its SHA-256 fingerprint is logged at WARN level so the
-    /// user can copy-paste it for future pinning.
+    /// user can copy-paste it for future pinning via `--cert-fingerprint`.
     pub async fn connect(
         host: &str,
         port: u16,
         cert_fingerprint: Option<String>,
     ) -> Result<Arc<Self>> {
-        // Install the default crypto provider if not already installed.
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let cx = native_tls::TlsConnector::builder()
+            .danger_accept_invalid_certs(true)
+            .danger_accept_invalid_hostnames(true)
+            .build()?;
+        let cx = tokio_native_tls::TlsConnector::from(cx);
 
-        let verifier = Arc::new(tls::CertVerifier::new(cert_fingerprint));
-        let config = rustls::ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(verifier)
-            .with_no_client_auth();
-
-        let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
         let tcp = TcpStream::connect((host, port)).await?;
-        let server_name = rustls::pki_types::ServerName::try_from(host.to_string())
-            .map_err(|e| anyhow!("invalid server name '{host}': {e}"))?;
-        let tls = connector.connect(server_name, tcp).await?;
+        let tls = cx.connect(host, tcp).await?;
+
+        // Inspect the peer certificate for fingerprint logging / pinning.
+        let peer_cert = tls.get_ref().peer_certificate()?;
+        if let Some(cert) = peer_cert {
+            let der = cert.to_der()?;
+            let fp = cert_fingerprint_from_der(&der);
+
+            match &cert_fingerprint {
+                Some(pinned) => {
+                    if !fp.eq_ignore_ascii_case(pinned) {
+                        bail!(
+                            "TLS certificate fingerprint mismatch: expected {pinned}, got {fp}"
+                        );
+                    }
+                    debug!("TLS certificate fingerprint verified: {fp}");
+                }
+                None => {
+                    warn!(
+                        "TLS certificate not verified. \
+                         To pin this certificate, add: --cert-fingerprint \"{fp}\""
+                    );
+                }
+            }
+        }
 
         let (reader, writer) = tokio::io::split(tls);
         let pending: Arc<PendingMap> = Arc::new(Mutex::new(HashMap::new()));
@@ -126,6 +144,14 @@ impl DelugeClient {
         rx.await
             .map_err(|_| anyhow!("response channel dropped for request {id}"))?
     }
+}
+
+fn cert_fingerprint_from_der(der: &[u8]) -> String {
+    let hash = Sha256::digest(der);
+    hash.iter()
+        .map(|b| format!("{b:02X}"))
+        .collect::<Vec<_>>()
+        .join(":")
 }
 
 async fn send_frame(
