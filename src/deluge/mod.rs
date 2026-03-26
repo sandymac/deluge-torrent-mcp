@@ -383,7 +383,7 @@ fn dispatch_frame(body: &[u8], pending: &Arc<PendingMap>) -> Result<()> {
                 _ => String::new(),
             };
             if let Some(tx) = pending.lock().unwrap().remove(&id) {
-                let _ = tx.send(Err(anyhow!("{exc_type}: {exc_msg}")));
+                let _ = tx.send(Err(anyhow!("{}", enrich_deluge_error(&exc_type, &exc_msg))));
             }
         }
 
@@ -394,6 +394,48 @@ fn dispatch_frame(body: &[u8], pending: &Arc<PendingMap>) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Enrich a Deluge RPC exception with an actionable hint for the LLM.
+/// Preserves the raw exception text so the LLM retains full context,
+/// then appends a [Hint: ...] for known recoverable error types.
+fn enrich_deluge_error(exc_type: &str, exc_msg: &str) -> String {
+    let hint = match exc_type {
+        "InvalidTorrentError" if exc_msg.to_lowercase().contains("already") => Some(
+            "This torrent is already in Deluge. Use list_torrents to find its info_hash — do not retry adding it.",
+        ),
+        "InvalidTorrentError" => Some(
+            "The torrent data is invalid or unrecognized. Do not retry with the same input.",
+        ),
+        "AddTorrentError" => Some(
+            "The torrent could not be added. The file may be corrupt or the URL unreachable. Do not retry with the same input.",
+        ),
+        "InvalidPathError" => Some(
+            "The path does not exist on the Deluge server. Verify the path with get_free_space or get_path_size before retrying.",
+        ),
+        "WrappedException"
+            if exc_msg.contains("Errno 2") || exc_msg.contains("No such file") =>
+        {
+            Some("File or directory not found on the Deluge server. Verify the path exists before retrying.")
+        }
+        "WrappedException"
+            if exc_msg.contains("Errno 13") || exc_msg.contains("Permission denied") =>
+        {
+            Some("Permission denied on the Deluge server. The Deluge process lacks access to this path. Do not retry.")
+        }
+        "NotAuthorizedError" => Some(
+            "The Deluge connection lacks sufficient permissions for this operation. Do not retry — inform the user.",
+        ),
+        "BadLoginError" => Some(
+            "Deluge authentication failed. Do not retry — inform the user to check their credentials.",
+        ),
+        _ => None,
+    };
+
+    match hint {
+        Some(h) => format!("{exc_type}: {exc_msg}\n[Hint: {h}]"),
+        None => format!("{exc_type}: {exc_msg}"),
+    }
 }
 
 fn zlib_compress(data: &[u8]) -> Result<Vec<u8>> {
