@@ -25,6 +25,9 @@ const RPC_RESPONSE: i64 = 1;
 const RPC_ERROR: i64 = 2;
 // RPC_EVENT = 3 — server-initiated, ignored for now
 
+const MAX_FRAME_BYTES: usize = 32 * 1024 * 1024; // 32 MB compressed
+const MAX_DECOMPRESSED_BYTES: usize = MAX_FRAME_BYTES * 4; // 128 MB decompressed
+
 type PendingMap = Mutex<HashMap<i64, oneshot::Sender<Result<Value>>>>;
 
 /// Active TLS connection state — writer half and pending response map.
@@ -298,6 +301,13 @@ async fn read_loop(
                 break;
             }
             let length = u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]) as usize;
+            if length > MAX_FRAME_BYTES {
+                bail!(
+                    "incoming frame is {length} bytes, exceeding the {} MB limit; \
+                     this may indicate a misconfigured or malicious server",
+                    MAX_FRAME_BYTES / (1024 * 1024)
+                );
+            }
             if buf.len() < 5 + length {
                 break;
             }
@@ -381,6 +391,16 @@ fn zlib_compress(data: &[u8]) -> Result<Vec<u8>> {
 fn zlib_decompress(data: &[u8]) -> Result<Vec<u8>> {
     let mut decoder = ZlibDecoder::new(data);
     let mut out = Vec::new();
-    decoder.read_to_end(&mut out)?;
+    decoder
+        .by_ref()
+        .take(MAX_DECOMPRESSED_BYTES as u64 + 1)
+        .read_to_end(&mut out)?;
+    if out.len() > MAX_DECOMPRESSED_BYTES {
+        bail!(
+            "decompressed frame exceeds the {} MB limit; \
+             this may indicate a misconfigured or malicious server",
+            MAX_DECOMPRESSED_BYTES / (1024 * 1024)
+        );
+    }
     Ok(out)
 }
