@@ -62,13 +62,13 @@ struct Cli {
 
     /// Enable tools matching a pattern (min 3 chars, substring of tool name).
     /// Comma-separated or repeated: --enable-tools=move_storage,rename  or  --enable-tool move_storage
-    #[arg(long = "enable-tool", alias = "enable-tools", value_delimiter = ',', action = clap::ArgAction::Append)]
+    #[arg(long = "enable-tool", alias = "enable-tools", value_name = "PATTERN", value_delimiter = ',', action = clap::ArgAction::Append)]
     enable: Vec<String>,
 
     /// Disable tools matching a pattern (min 3 chars, substring of tool name).
     /// Disabled by default: move_storage, rename_folder, rename_files, force_recheck, remove_torrent
     /// Can also restrict default-on tools: --disable-tools=add,pause
-    #[arg(long = "disable-tool", alias = "disable-tools", value_delimiter = ',', action = clap::ArgAction::Append)]
+    #[arg(long = "disable-tool", alias = "disable-tools", value_name = "PATTERN", value_delimiter = ',', action = clap::ArgAction::Append)]
     disable: Vec<String>,
 
     /// MCP transport to use
