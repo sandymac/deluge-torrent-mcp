@@ -160,7 +160,11 @@ impl DelugeServer {
             }
             let bytes = tokio::fs::read(&path)
                 .await
-                .map_err(|e| format!("Failed to read file: {e}"))?;
+                .map_err(|e| format!(
+                    "Failed to read file: {e}\n\
+                     [Hint: file_path must be an absolute path to a .torrent file on the \
+                     Deluge server's filesystem, not on the client machine.]"
+                ))?;
             let encoded = BASE64.encode(&bytes);
             let filename = std::path::Path::new(&path)
                 .file_name()
@@ -194,7 +198,7 @@ impl DelugeServer {
 
         result
             .map(|v| format!("Torrent added. Hash: {}", Self::value_to_string(v)))
-            .map_err(|e| e.to_string())
+            .map_err(Self::enrich_client_error)
     }
 
     /// Remove a torrent from Deluge. Disabled by default; enable with --enable-tool=remove_torrent.
@@ -225,7 +229,7 @@ impl DelugeServer {
                     if p.delete_data { " (data deleted)" } else { "" }
                 )
             })
-            .map_err(|e| e.to_string())
+            .map_err(Self::enrich_client_error)
     }
 
     /// List all torrents in Deluge with their current status.
@@ -254,7 +258,7 @@ impl DelugeServer {
             )
             .await
             .map(Self::value_to_json_string)
-            .map_err(|e| e.to_string())
+            .map_err(Self::enrich_client_error)
     }
 
     /// Get comprehensive status and metadata for a single torrent.
@@ -275,7 +279,7 @@ impl DelugeServer {
             )
             .await
             .map(Self::value_to_json_string)
-            .map_err(|e| e.to_string())
+            .map_err(Self::enrich_client_error)
     }
 
     /// Pause a torrent, stopping all upload and download activity.
@@ -291,7 +295,7 @@ impl DelugeServer {
             .call("core.pause_torrent", vec![Value::String(p.info_hash.clone())], vec![])
             .await
             .map(|_| format!("Torrent {} paused.", p.info_hash))
-            .map_err(|e| e.to_string())
+            .map_err(Self::enrich_client_error)
     }
 
     /// Resume a previously paused torrent.
@@ -307,7 +311,7 @@ impl DelugeServer {
             .call("core.resume_torrent", vec![Value::String(p.info_hash.clone())], vec![])
             .await
             .map(|_| format!("Torrent {} resumed.", p.info_hash))
-            .map_err(|e| e.to_string())
+            .map_err(Self::enrich_client_error)
     }
 
     /// Set per-torrent options such as speed limits, ratio targets, and completion behavior.
@@ -362,7 +366,7 @@ impl DelugeServer {
             )
             .await
             .map(|_| format!("Options updated for torrent {}.", p.info_hash))
-            .map_err(|e| e.to_string())
+            .map_err(Self::enrich_client_error)
     }
 
     /// Move a torrent's data files to a new directory on the Deluge server. Disabled by default; enable with --enable-tool=move_storage.
@@ -387,7 +391,7 @@ impl DelugeServer {
             )
             .await
             .map(|_| format!("Moving torrent {} to '{}'.", p.info_hash, p.dest))
-            .map_err(|e| e.to_string())
+            .map_err(Self::enrich_client_error)
     }
 
     /// Rename a top-level folder within a torrent's file structure. Disabled by default; enable with --enable-tool=rename_folder.
@@ -419,7 +423,7 @@ impl DelugeServer {
                     p.folder, p.new_name, p.info_hash
                 )
             })
-            .map_err(|e| e.to_string())
+            .map_err(Self::enrich_client_error)
     }
 
     /// Rename one or more files within a torrent. Disabled by default; enable with --enable-tool=rename_files.
@@ -452,7 +456,7 @@ impl DelugeServer {
             )
             .await
             .map(|_| format!("Renamed {} file(s) in torrent {}.", p.renames.len(), p.info_hash))
-            .map_err(|e| e.to_string())
+            .map_err(Self::enrich_client_error)
     }
 
     /// Force a full hash recheck of a torrent's downloaded files against the torrent metadata. Disabled by default; enable with --enable-tool=force_recheck.
@@ -475,7 +479,7 @@ impl DelugeServer {
             )
             .await
             .map(|_| format!("Recheck started for torrent {}.", p.info_hash))
-            .map_err(|e| e.to_string())
+            .map_err(Self::enrich_client_error)
     }
 
     /// Get the available free disk space at a path on the Deluge server.
@@ -491,7 +495,7 @@ impl DelugeServer {
                 Value::Int(bytes) => format!("{} bytes ({:.2} GiB) free", bytes, bytes as f64 / 1_073_741_824.0),
                 other => Self::value_to_string(other),
             })
-            .map_err(|e| e.to_string())
+            .map_err(Self::enrich_client_error)
     }
 
     /// Get the total size of a file or directory on the Deluge server.
@@ -507,7 +511,7 @@ impl DelugeServer {
                 Value::Int(bytes) => format!("{} bytes ({:.2} GiB)", bytes, bytes as f64 / 1_073_741_824.0),
                 other => Self::value_to_string(other),
             })
-            .map_err(|e| e.to_string())
+            .map_err(Self::enrich_client_error)
     }
 }
 
@@ -546,10 +550,31 @@ impl DelugeServer {
         let valid_hex = hash.bytes().all(|b| b.is_ascii_hexdigit());
         if !valid_len || !valid_hex {
             return Err(format!(
-                "invalid info_hash '{hash}': must be 40 hex characters (v1) or 64 hex characters (v2)"
+                "invalid info_hash '{hash}': must be 40 hex characters (v1) or 64 hex characters (v2).\n\
+                 [Hint: Do not guess or construct an info_hash. Use list_torrents to find the correct \
+                 info_hash for the torrent you want to act on.]"
             ));
         }
         Ok(())
+    }
+
+    /// Enrich transport-level errors (connection loss, send failure, reconnect timeout) with
+    /// guidance telling the LLM whether to retry and what to check.
+    fn enrich_client_error(e: anyhow::Error) -> String {
+        let msg = e.to_string();
+        if msg.starts_with("send failed")
+            || msg.starts_with("Failed to reconnect")
+            || msg.contains("connection lost")
+            || msg.starts_with("response channel dropped")
+        {
+            format!(
+                "{msg}\n[Hint: The connection to Deluge was interrupted. \
+                 Retry the operation once — the server reconnects automatically. \
+                 If it keeps failing, check that the Deluge daemon is running and reachable.]"
+            )
+        } else {
+            msg
+        }
     }
 
     fn value_to_string(v: Value) -> String {
