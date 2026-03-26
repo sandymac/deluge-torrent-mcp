@@ -32,90 +32,90 @@ pub struct DelugeServer {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 struct AddTorrentParams {
-    /// Magnet link (magnet:?xt=...)
+    /// A magnet URI (must start with 'magnet:'). Provide EXACTLY ONE of magnet_link, url, file_path, or file_content — not multiple.
     magnet_link: Option<String>,
-    /// URL to a remote .torrent file
+    /// HTTP or HTTPS URL pointing to a remote .torrent file. Deluge fetches this asynchronously — the call may succeed before the download completes. Provide EXACTLY ONE of magnet_link, url, file_path, or file_content.
     url: Option<String>,
-    /// Absolute path to a .torrent file on the server
+    /// Absolute path to a .torrent file on the Deluge server's filesystem. Provide EXACTLY ONE of magnet_link, url, file_path, or file_content.
     file_path: Option<String>,
-    /// Base64-encoded .torrent file content
+    /// Base64-encoded contents of a .torrent file. Provide EXACTLY ONE of magnet_link, url, file_path, or file_content.
     file_content: Option<String>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
 struct TorrentIdParams {
-    /// Info hash of the torrent (40-character hex string)
+    /// Info hash identifying the torrent: 40 hex characters (v1/SHA-1) or 64 hex characters (v2/SHA-256). Obtain from list_torrents or get_torrent_status.
     info_hash: String,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
 struct RemoveTorrentParams {
-    /// Info hash of the torrent (40-character hex string)
+    /// Info hash identifying the torrent: 40 hex characters (v1/SHA-1) or 64 hex characters (v2/SHA-256). Obtain from list_torrents or get_torrent_status.
     info_hash: String,
-    /// Also delete downloaded data from disk
+    /// If true, permanently deletes all downloaded files from disk — this is irreversible. If false (default), removes the torrent from Deluge but leaves files on disk. Always confirm with the user before setting to true.
     #[serde(default)]
     delete_data: bool,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
 struct SetOptionsParams {
-    /// Info hash of the torrent (40-character hex string)
+    /// Info hash identifying the torrent: 40 hex characters (v1/SHA-1) or 64 hex characters (v2/SHA-256). Obtain from list_torrents or get_torrent_status.
     info_hash: String,
-    /// Maximum download speed in KiB/s (-1 for unlimited)
+    /// Maximum download speed in KiB/s. Use -1 for unlimited (global default). Example: 10240 = 10 MiB/s. Only set fields you want to change.
     max_download_speed: Option<f64>,
-    /// Maximum upload speed in KiB/s (-1 for unlimited)
+    /// Maximum upload speed in KiB/s. Use -1 for unlimited. Example: 1024 = 1 MiB/s.
     max_upload_speed: Option<f64>,
-    /// Maximum number of connections (-1 for unlimited)
+    /// Maximum number of simultaneous peer connections. Use -1 for unlimited.
     max_connections: Option<i64>,
-    /// Seed ratio limit (-1 for unlimited)
+    /// Target upload/download ratio for seeding (e.g. 2.0 = upload twice what was downloaded). Use -1.0 for unlimited.
     ratio_limit: Option<f64>,
-    /// Remove torrent when ratio limit is reached
+    /// If true, automatically removes the torrent when ratio_limit is reached. Only meaningful when ratio_limit is set.
     remove_at_ratio: Option<bool>,
-    /// Move completed downloads to a different path
+    /// If true, moves downloaded files to move_completed_path when the download finishes.
     move_completed: Option<bool>,
-    /// Path to move completed downloads to
+    /// Absolute directory path on the Deluge server to move completed files to. Only used when move_completed is true.
     move_completed_path: Option<String>,
-    /// Prioritize first and last pieces
+    /// If true, prioritizes downloading the first and last pieces first — useful for media files that need headers/footers to begin playback before fully downloaded.
     prioritize_first_last_pieces: Option<bool>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
 struct MoveStorageParams {
-    /// Info hash of the torrent (40-character hex string)
+    /// Info hash identifying the torrent: 40 hex characters (v1/SHA-1) or 64 hex characters (v2/SHA-256). Obtain from list_torrents or get_torrent_status.
     info_hash: String,
-    /// Destination path for the torrent data
+    /// Absolute destination directory path on the Deluge server. Deluge will attempt to create it if it does not exist. The Deluge process must have write access to this path.
     dest: String,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
 struct RenameFolderParams {
-    /// Info hash of the torrent (40-character hex string)
+    /// Info hash identifying the torrent: 40 hex characters (v1/SHA-1) or 64 hex characters (v2/SHA-256). Obtain from list_torrents or get_torrent_status.
     info_hash: String,
-    /// Current folder name within the torrent
+    /// Current folder name within the torrent's file structure (as shown in the torrent file list, not a filesystem path).
     folder: String,
-    /// New folder name
+    /// New folder name. Should not contain path separators.
     new_name: String,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
 struct FileRename {
-    /// File index within the torrent
+    /// Zero-based index of the file within the torrent. Obtain indices by calling get_torrent_status and reading the 'files' field, which lists all files with their indices in order.
     index: i64,
-    /// New filename
+    /// New filename for this file. May include subdirectory path components (e.g. "subfolder/newname.mkv") to move the file within the torrent's folder structure.
     new_name: String,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
 struct RenameFilesParams {
-    /// Info hash of the torrent (40-character hex string)
+    /// Info hash identifying the torrent: 40 hex characters (v1/SHA-1) or 64 hex characters (v2/SHA-256). Obtain from list_torrents or get_torrent_status.
     info_hash: String,
-    /// List of file renames
+    /// List of file renames to apply. Each entry needs an index (from get_torrent_status 'files' field) and the new_name to assign.
     renames: Vec<FileRename>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
 struct PathParams {
-    /// Filesystem path to query
+    /// Absolute path (file or directory) on the Deluge server to query.
     path: String,
 }
 
@@ -125,8 +125,11 @@ struct PathParams {
 
 #[tool_router]
 impl DelugeServer {
-    /// Add a torrent by magnet link, URL, or .torrent file.
-    /// Provide exactly one of: magnet_link, url, file_path, or file_content.
+    /// Add a new torrent to Deluge by magnet link, .torrent URL, server file path, or base64 file content.
+    /// Provide EXACTLY ONE of: magnet_link, url, file_path, or file_content — not multiple.
+    /// Returns the info_hash of the newly added torrent on success.
+    /// When using url, Deluge fetches the .torrent file asynchronously; the call returns once the
+    /// fetch begins, not when it completes, and will return an error if the URL is unreachable.
     #[tool]
     async fn add_torrent(
         &self,
@@ -194,7 +197,10 @@ impl DelugeServer {
             .map_err(|e| e.to_string())
     }
 
-    /// Remove a torrent. Disabled by default; enable with --enable-tool=remove_torrent.
+    /// Remove a torrent from Deluge. Disabled by default; enable with --enable-tool=remove_torrent.
+    /// If delete_data is true, all downloaded files are permanently deleted from disk — irreversible.
+    /// If delete_data is false (default), files remain on disk and only the torrent entry is removed.
+    /// Returns true on success. Returns an error if the info_hash is not found in Deluge.
     #[tool]
     async fn remove_torrent(
         &self,
@@ -222,7 +228,12 @@ impl DelugeServer {
             .map_err(|e| e.to_string())
     }
 
-    /// List all torrents with their current status.
+    /// List all torrents in Deluge with their current status.
+    /// WORKFLOW: Use this first to discover torrents and obtain info_hash values required by all other tools.
+    /// Returns a JSON object keyed by info_hash. Each value contains: name, state, progress (0–100),
+    /// total_size (bytes), download_payload_rate (bytes/sec), upload_payload_rate (bytes/sec),
+    /// eta (seconds to completion, -1 if not applicable), save_path.
+    /// Possible state values: Allocating, Checking, Downloading, Seeding, Paused, Queued, Error, Moving.
     #[tool]
     async fn list_torrents(&self) -> Result<String, String> {
         let keys = Value::List(vec![
@@ -246,7 +257,10 @@ impl DelugeServer {
             .map_err(|e| e.to_string())
     }
 
-    /// Get detailed status for a single torrent.
+    /// Get comprehensive status and metadata for a single torrent.
+    /// Use this when you need file details (names, zero-based indices, per-file progress) required
+    /// for rename_files, tracker information, piece details, or fields not in list_torrents.
+    /// Returns a JSON object with all available torrent fields including a 'files' array.
     #[tool]
     async fn get_torrent_status(
         &self,
@@ -264,7 +278,9 @@ impl DelugeServer {
             .map_err(|e| e.to_string())
     }
 
-    /// Pause a torrent.
+    /// Pause a torrent, stopping all upload and download activity.
+    /// The torrent remains in Deluge and can be resumed with resume_torrent.
+    /// Safe to call on an already-paused torrent (idempotent). Returns nothing on success.
     #[tool]
     async fn pause_torrent(
         &self,
@@ -278,7 +294,9 @@ impl DelugeServer {
             .map_err(|e| e.to_string())
     }
 
-    /// Resume a paused torrent.
+    /// Resume a previously paused torrent.
+    /// If auto-management is enabled, the torrent may re-enter the queue rather than downloading immediately.
+    /// Safe to call on a torrent that is not paused (no-op). Returns nothing on success.
     #[tool]
     async fn resume_torrent(
         &self,
@@ -292,7 +310,10 @@ impl DelugeServer {
             .map_err(|e| e.to_string())
     }
 
-    /// Set per-torrent options such as speed limits and ratio settings.
+    /// Set per-torrent options such as speed limits, ratio targets, and completion behavior.
+    /// Only include options you want to change — omitted fields are left unchanged.
+    /// Speed values are in KiB/s (1024 KiB/s = 1 MiB/s); use -1 for unlimited (global default).
+    /// Changes take effect immediately on the running torrent. Returns nothing on success.
     #[tool]
     async fn set_torrent_options(
         &self,
@@ -344,7 +365,10 @@ impl DelugeServer {
             .map_err(|e| e.to_string())
     }
 
-    /// Move a torrent's storage to a new path. Disabled by default; enable with --enable-tool=move_storage.
+    /// Move a torrent's data files to a new directory on the Deluge server. Disabled by default; enable with --enable-tool=move_storage.
+    /// ASYNC: Returns immediately but the file move continues in the background.
+    /// The torrent enters Moving state during the operation and returns to its previous state when complete.
+    /// Use list_torrents or get_torrent_status to confirm the move has finished (state leaves Moving).
     #[tool]
     async fn move_storage(
         &self,
@@ -366,7 +390,11 @@ impl DelugeServer {
             .map_err(|e| e.to_string())
     }
 
-    /// Rename a folder within a torrent. Disabled by default; enable with --enable-tool=rename_folder.
+    /// Rename a top-level folder within a torrent's file structure. Disabled by default; enable with --enable-tool=rename_folder.
+    /// ASYNC: The rename occurs asynchronously in Deluge.
+    /// Best performed on paused torrents. The old folder may remain on disk as an orphan — Deluge
+    /// renames the tracked path but does not always remove the original directory.
+    /// If renaming causes file path mismatches, follow up with force_recheck to reconcile.
     #[tool]
     async fn rename_folder(
         &self,
@@ -395,6 +423,9 @@ impl DelugeServer {
     }
 
     /// Rename one or more files within a torrent. Disabled by default; enable with --enable-tool=rename_files.
+    /// ASYNC: The rename occurs asynchronously in Deluge.
+    /// PREREQUISITE: Call get_torrent_status first to retrieve file indices from the 'files' field.
+    /// File indices are zero-based and stable for the lifetime of the torrent in Deluge.
     #[tool]
     async fn rename_files(
         &self,
@@ -424,7 +455,11 @@ impl DelugeServer {
             .map_err(|e| e.to_string())
     }
 
-    /// Force a hash recheck of a torrent's files. Disabled by default; enable with --enable-tool=force_recheck.
+    /// Force a full hash recheck of a torrent's downloaded files against the torrent metadata. Disabled by default; enable with --enable-tool=force_recheck.
+    /// Use after moving files outside Deluge, suspecting data corruption, or after a rename operation to reconcile file paths.
+    /// ASYNC: The torrent enters Checking state immediately and returns to its previous state when done.
+    /// If the torrent was Paused before the recheck, it automatically returns to Paused after checking completes.
+    /// This operation is CPU and disk I/O intensive.
     #[tool]
     async fn force_recheck(
         &self,
@@ -443,7 +478,10 @@ impl DelugeServer {
             .map_err(|e| e.to_string())
     }
 
-    /// Get free disk space for a given path on the Deluge server.
+    /// Get the available free disk space at a path on the Deluge server.
+    /// Returns free space in bytes as an integer (divide by 1073741824 for GiB).
+    /// Returns an error if the path is invalid or does not exist.
+    /// Use before add_torrent or move_storage to verify sufficient space is available.
     #[tool]
     async fn get_free_space(&self, Parameters(p): Parameters<PathParams>) -> Result<String, String> {
         self.client
@@ -456,7 +494,10 @@ impl DelugeServer {
             .map_err(|e| e.to_string())
     }
 
-    /// Get the size of a path on the Deluge server.
+    /// Get the total size of a file or directory on the Deluge server.
+    /// Returns size in bytes as an integer, or -1 if the path is inaccessible (never raises an error).
+    /// For directories, returns the recursive total size of all contents.
+    /// Useful for verifying downloaded content size or checking the size of a directory before moving it.
     #[tool]
     async fn get_path_size(&self, Parameters(p): Parameters<PathParams>) -> Result<String, String> {
         self.client
