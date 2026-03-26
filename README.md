@@ -68,6 +68,9 @@ deluge-torrent-mcp --host 192.168.1.50 --port 58846 -u admin -p secret [OPTIONS]
 | `--allow-destructive` | — | off | Enable `remove_torrent`; implies `--allow-risky` |
 | `--cert-fingerprint <SHA256>` | — | — | Pin the Deluge TLS certificate by fingerprint |
 | `--transport <stdio\|http>` | — | `stdio` | MCP transport to use |
+| `--http-bind <ADDR>` | — | `0.0.0.0:8080` | Bind address for HTTP transport |
+| `--api-token <TOKEN>` | `DELUGE_API_TOKEN` | — | Bearer token required for HTTP requests |
+| `--test-connection` | — | off | Connect, list torrents, print output, and exit |
 
 > Prefer environment variables over CLI flags for credentials to avoid passwords appearing in shell history.
 
@@ -83,6 +86,24 @@ Example for full access:
 ```bash
 deluge-torrent-mcp -u admin -p secret --allow-destructive
 ```
+
+## HTTP Transport
+
+To use the HTTP/SSE transport for remote or agentic clients, start with `--transport http`:
+
+```bash
+deluge-torrent-mcp -u admin -p secret --transport http --http-bind 0.0.0.0:8080 --api-token "your-secret-token"
+```
+
+MCP clients connect to `http://<host>:8080/mcp`. The `--api-token` flag is strongly recommended when binding to a network interface — without it, anyone who can reach the port can control Deluge.
+
+Clients must include the token in every request:
+
+```
+Authorization: Bearer your-secret-token
+```
+
+> For internet-facing deployments, put this behind a reverse proxy (nginx, Caddy, Traefik) that terminates TLS. The server itself does not handle HTTPS.
 
 ## TLS Certificate Handling
 
