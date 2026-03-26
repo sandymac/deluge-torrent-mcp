@@ -532,7 +532,10 @@ impl DelugeServer {
             Ok(())
         } else {
             Err(format!(
-                "Tool '{tool_name}' is disabled. Use --enable-tool={tool_name} to enable it."
+                "Tool '{tool_name}' is disabled. Use --enable-tool={tool_name} to enable it.\n\
+                 [Hint: This tool has been administratively disabled on this server. \
+                 Do not attempt this operation by other means — inform the user that the \
+                 server must be restarted with --enable-tool={tool_name} to allow this action.]"
             ))
         }
     }
