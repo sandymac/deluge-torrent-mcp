@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::{anyhow, bail, Result};
 use bytes::{Buf, BytesMut};
@@ -15,7 +16,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
 use tokio::sync::{oneshot, Mutex as AsyncMutex};
 use tokio_native_tls::TlsStream;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::rencode::{self, Value};
 
@@ -26,40 +27,117 @@ const RPC_ERROR: i64 = 2;
 
 type PendingMap = Mutex<HashMap<i64, oneshot::Sender<Result<Value>>>>;
 
-pub struct DelugeClient {
-    writer: AsyncMutex<WriteHalf<TlsStream<TcpStream>>>,
+/// Active TLS connection state — writer half and pending response map.
+struct LiveConn {
+    writer: WriteHalf<TlsStream<TcpStream>>,
     pending: Arc<PendingMap>,
+}
+
+pub struct DelugeClient {
+    // Stored for reconnect
+    host: String,
+    port: u16,
+    cert_fingerprint: Option<String>,
+    username: String,
+    password: String,
+
+    // None when disconnected; reconnected lazily on next call()
+    conn: Arc<AsyncMutex<Option<LiveConn>>>,
     next_id: AtomicI64,
 }
 
 impl DelugeClient {
-    /// Connect to a Deluge daemon via TLS TCP.
+    /// Connect to a Deluge daemon via TLS TCP and authenticate.
     ///
-    /// Uses native-tls to tolerate Deluge's legacy self-signed certificates.
-    /// If `cert_fingerprint` is None the server certificate is accepted without
-    /// verification and its SHA-256 fingerprint is logged at WARN level so the
-    /// user can copy-paste it for future pinning via `--cert-fingerprint`.
+    /// Returns the client and the granted auth level (0–10).
+    /// All parameters are stored for automatic reconnection if the connection drops.
     pub async fn connect(
         host: &str,
         port: u16,
         cert_fingerprint: Option<String>,
-    ) -> Result<Arc<Self>> {
+        username: &str,
+        password: &str,
+    ) -> Result<(Arc<Self>, i64)> {
+        let client = Arc::new(Self {
+            host: host.to_string(),
+            port,
+            cert_fingerprint,
+            username: username.to_string(),
+            password: password.to_string(),
+            conn: Arc::new(AsyncMutex::new(None)),
+            next_id: AtomicI64::new(1),
+        });
+
+        let (live_conn, auth_level) = client.try_connect_and_login().await?;
+        *client.conn.lock().await = Some(live_conn);
+
+        Ok((client, auth_level))
+    }
+
+    /// Send an RPC call and wait for the response.
+    ///
+    /// If the connection is dead (e.g. after a laptop sleep), transparently
+    /// reconnects with exponential backoff before sending.
+    pub async fn call(
+        &self,
+        method: &str,
+        args: Vec<Value>,
+        kwargs: Vec<(Value, Value)>,
+    ) -> Result<Value> {
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let (tx, rx) = oneshot::channel();
+
+        // Hold the conn lock only during send, not during the response wait.
+        {
+            let mut conn_guard = self.conn.lock().await;
+
+            if conn_guard.is_none() {
+                info!("Connection to Deluge lost — reconnecting...");
+                let (new_conn, auth_level) = self.try_connect_and_login_with_retry().await?;
+                debug!(auth_level, "Re-authenticated with Deluge daemon");
+                *conn_guard = Some(new_conn);
+            }
+
+            let conn = conn_guard.as_mut().unwrap();
+            conn.pending.lock().unwrap().insert(id, tx);
+
+            let request = Value::List(vec![Value::List(vec![
+                Value::Int(id),
+                Value::String(method.to_string()),
+                Value::List(args),
+                Value::Dict(kwargs),
+            ])]);
+            let encoded = rencode::encode(&request);
+            let compressed = zlib_compress(&encoded)?;
+
+            if let Err(e) = send_frame(&mut conn.writer, &compressed).await {
+                conn.pending.lock().unwrap().remove(&id);
+                *conn_guard = None;
+                return Err(anyhow!("send failed: {e}"));
+            }
+        } // conn lock released here — other calls can proceed while we wait
+
+        rx.await
+            .map_err(|_| anyhow!("response channel dropped for request {id}"))?
+    }
+
+    /// Establish a new TLS connection and authenticate. Used for both initial
+    /// connect and reconnect. Does not touch `self.conn`.
+    async fn try_connect_and_login(&self) -> Result<(LiveConn, i64)> {
         let cx = native_tls::TlsConnector::builder()
             .danger_accept_invalid_certs(true)
             .danger_accept_invalid_hostnames(true)
             .build()?;
         let cx = tokio_native_tls::TlsConnector::from(cx);
 
-        let tcp = TcpStream::connect((host, port)).await?;
-        let tls = cx.connect(host, tcp).await?;
+        let tcp = TcpStream::connect((&self.host as &str, self.port)).await?;
+        let tls = cx.connect(&self.host, tcp).await?;
 
-        // Inspect the peer certificate for fingerprint logging / pinning.
-        let peer_cert = tls.get_ref().peer_certificate()?;
-        if let Some(cert) = peer_cert {
+        // Fingerprint logging / pinning
+        if let Some(cert) = tls.get_ref().peer_certificate()? {
             let der = cert.to_der()?;
             let fp = cert_fingerprint_from_der(&der);
-
-            match &cert_fingerprint {
+            match &self.cert_fingerprint {
                 Some(pinned) => {
                     if !fp.eq_ignore_ascii_case(pinned) {
                         bail!(
@@ -77,72 +155,79 @@ impl DelugeClient {
             }
         }
 
-        let (reader, writer) = tokio::io::split(tls);
+        let (reader, mut writer) = tokio::io::split(tls);
         let pending: Arc<PendingMap> = Arc::new(Mutex::new(HashMap::new()));
 
-        let client = Arc::new(Self {
-            writer: AsyncMutex::new(writer),
-            pending: pending.clone(),
-            next_id: AtomicI64::new(1),
-        });
-
-        // Background task: reads frames and dispatches responses to waiters.
+        // Spawn read loop. On termination, drain pending requests with an error
+        // and mark the connection as dead so the next call() triggers reconnect.
+        let conn_ref = self.conn.clone();
+        let pending_for_loop = pending.clone();
         tokio::spawn(async move {
-            if let Err(e) = read_loop(reader, pending).await {
-                warn!("Deluge read loop terminated: {e}");
+            if let Err(e) = read_loop(reader, pending_for_loop.clone()).await {
+                warn!("Deluge read loop terminated: {e}. Will reconnect on next request.");
             }
+            for (_, tx) in pending_for_loop.lock().unwrap().drain() {
+                let _ = tx.send(Err(anyhow!("connection lost")));
+            }
+            *conn_ref.lock().await = None;
         });
 
-        Ok(client)
-    }
+        // Login directly — can't use self.call() here because the conn lock
+        // may already be held by the caller (during reconnect).
+        let login_id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let result = send_call_direct(
+            &mut writer,
+            &pending,
+            login_id,
+            "daemon.login",
+            vec![
+                Value::String(self.username.clone()),
+                Value::String(self.password.clone()),
+            ],
+            vec![(
+                Value::String("client_version".into()),
+                Value::String("2.0.0".into()),
+            )],
+        )
+        .await?;
 
-    /// Authenticate with the Deluge daemon. Returns the granted auth level (0–10).
-    pub async fn login(&self, username: &str, password: &str) -> Result<i64> {
-        let result = self
-            .call(
-                "daemon.login",
-                vec![
-                    Value::String(username.to_string()),
-                    Value::String(password.to_string()),
-                ],
-                vec![(
-                    Value::String("client_version".to_string()),
-                    Value::String("2.0.0".to_string()),
-                )],
-            )
-            .await?;
-        match result {
-            Value::Int(level) => Ok(level),
+        let auth_level = match result {
+            Value::Int(level) => level,
             other => bail!("unexpected login result: {other:?}"),
-        }
+        };
+
+        Ok((LiveConn { writer, pending }, auth_level))
     }
 
-    /// Send an RPC call and wait for the response.
-    pub async fn call(
-        &self,
-        method: &str,
-        args: Vec<Value>,
-        kwargs: Vec<(Value, Value)>,
-    ) -> Result<Value> {
-        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-        let (tx, rx) = oneshot::channel();
-        self.pending.lock().unwrap().insert(id, tx);
-
-        // Wire format: a list containing one request tuple
-        let request = Value::List(vec![Value::List(vec![
-            Value::Int(id),
-            Value::String(method.to_string()),
-            Value::List(args),
-            Value::Dict(kwargs),
-        ])]);
-
-        let encoded = rencode::encode(&request);
-        let compressed = zlib_compress(&encoded)?;
-
-        send_frame(&mut *self.writer.lock().await, &compressed).await?;
-
-        rx.await
-            .map_err(|_| anyhow!("response channel dropped for request {id}"))?
+    /// Retry `try_connect_and_login` with exponential backoff.
+    /// Attempts: 5 max, delays: 2s, 4s, 8s, 16s, 30s (~60s total).
+    /// This covers the typical WiFi reconnect window after a laptop wakes from sleep.
+    async fn try_connect_and_login_with_retry(&self) -> Result<(LiveConn, i64)> {
+        const MAX_ATTEMPTS: u32 = 5;
+        let mut attempt = 0u32;
+        loop {
+            attempt += 1;
+            match self.try_connect_and_login().await {
+                Ok(result) => {
+                    info!("Reconnected to Deluge daemon");
+                    return Ok(result);
+                }
+                Err(e) if attempt >= MAX_ATTEMPTS => {
+                    return Err(anyhow!(
+                        "Failed to reconnect after {MAX_ATTEMPTS} attempts: {e}"
+                    ));
+                }
+                Err(e) => {
+                    let delay_secs = 2u64.pow(attempt.min(5)).min(30);
+                    warn!(
+                        attempt,
+                        MAX_ATTEMPTS,
+                        "Reconnect failed: {e}. Retrying in {delay_secs}s"
+                    );
+                    tokio::time::sleep(Duration::from_secs(delay_secs)).await;
+                }
+            }
+        }
     }
 }
 
@@ -152,6 +237,33 @@ fn cert_fingerprint_from_der(der: &[u8]) -> String {
         .map(|b| format!("{b:02X}"))
         .collect::<Vec<_>>()
         .join(":")
+}
+
+/// Send a single RPC call and await the response, operating directly on a
+/// writer and pending map. Used for login during connect/reconnect to avoid
+/// re-entering the conn lock held by call().
+async fn send_call_direct(
+    writer: &mut WriteHalf<TlsStream<TcpStream>>,
+    pending: &Arc<PendingMap>,
+    id: i64,
+    method: &str,
+    args: Vec<Value>,
+    kwargs: Vec<(Value, Value)>,
+) -> Result<Value> {
+    let (tx, rx) = oneshot::channel();
+    pending.lock().unwrap().insert(id, tx);
+
+    let request = Value::List(vec![Value::List(vec![
+        Value::Int(id),
+        Value::String(method.to_string()),
+        Value::List(args),
+        Value::Dict(kwargs),
+    ])]);
+    let encoded = rencode::encode(&request);
+    let compressed = zlib_compress(&encoded)?;
+    send_frame(writer, &compressed).await?;
+
+    rx.await.map_err(|_| anyhow!("login response channel dropped"))?
 }
 
 async fn send_frame(
