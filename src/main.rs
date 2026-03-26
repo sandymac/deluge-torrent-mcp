@@ -1,13 +1,41 @@
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use anyhow::bail;
 use clap::Parser;
 use rmcp::ServiceExt;
 use serde_json;
-use tracing::info;
+use tracing::{info, warn};
 
 mod deluge;
 mod rencode;
 mod tools;
+
+/// All tool names exposed by this server, in a stable order used for logging.
+const ALL_TOOLS: &[&str] = &[
+    "add_torrent",
+    "list_torrents",
+    "get_torrent_status",
+    "pause_torrent",
+    "resume_torrent",
+    "set_torrent_options",
+    "get_free_space",
+    "get_path_size",
+    "move_storage",
+    "rename_folder",
+    "rename_files",
+    "force_recheck",
+    "remove_torrent",
+];
+
+/// Tools that are disabled unless explicitly enabled via --enable.
+const DEFAULT_DISABLED: &[&str] = &[
+    "move_storage",
+    "rename_folder",
+    "rename_files",
+    "force_recheck",
+    "remove_torrent",
+];
 
 #[derive(Parser, Debug)]
 #[command(name = "deluge-torrent-mcp", about = "MCP server for Deluge torrent daemon")]
@@ -32,13 +60,16 @@ struct Cli {
     #[arg(long)]
     cert_fingerprint: Option<String>,
 
-    /// Enable risky tools: move_storage, rename_folder, rename_files, force_recheck
-    #[arg(long, default_value_t = false)]
-    allow_risky: bool,
+    /// Enable tools matching a pattern (min 3 chars, substring of tool name).
+    /// Comma-separated or repeated: --enable-tools=move_storage,rename  or  --enable-tool move_storage
+    #[arg(long = "enable-tool", alias = "enable-tools", value_delimiter = ',', action = clap::ArgAction::Append)]
+    enable: Vec<String>,
 
-    /// Enable destructive tools: remove_torrent (implies --allow-risky)
-    #[arg(long, default_value_t = false)]
-    allow_destructive: bool,
+    /// Disable tools matching a pattern (min 3 chars, substring of tool name).
+    /// Disabled by default: move_storage, rename_folder, rename_files, force_recheck, remove_torrent
+    /// Can also restrict default-on tools: --disable-tools=add,pause
+    #[arg(long = "disable-tool", alias = "disable-tools", value_delimiter = ',', action = clap::ArgAction::Append)]
+    disable: Vec<String>,
 
     /// MCP transport to use
     #[arg(long, default_value = "stdio")]
@@ -52,7 +83,11 @@ struct Cli {
     #[arg(long, env = "DELUGE_API_TOKEN")]
     api_token: Option<String>,
 
-    /// Connect to Deluge, list torrents, print results to stderr, and exit
+    /// List all tools with their default enabled/disabled state and exit
+    #[arg(long, default_value_t = false)]
+    list_tools: bool,
+
+    /// Connect to Deluge, print session status, and exit
     #[arg(long, default_value_t = false)]
     test_connection: bool,
 }
@@ -61,6 +96,92 @@ struct Cli {
 enum Transport {
     Stdio,
     Http,
+}
+
+/// Scan raw CLI args in order and return `(is_enable, pattern)` pairs.
+/// Clap cannot preserve relative ordering between two different repeated flags,
+/// so we read `std::env::args()` directly for this purpose.
+fn parse_tool_flags_in_order() -> anyhow::Result<Vec<(bool, String)>> {
+    let args: Vec<String> = std::env::args().collect();
+    let mut result = Vec::new();
+    let mut i = 1usize;
+    while i < args.len() {
+        let arg = &args[i];
+        let (is_enable, patterns_str) =
+            if let Some(v) = arg.strip_prefix("--enable-tool=").or_else(|| arg.strip_prefix("--enable-tools=")) {
+                (true, v.to_string())
+            } else if arg == "--enable-tool" || arg == "--enable-tools" {
+                if i + 1 < args.len() {
+                    i += 1;
+                    (true, args[i].clone())
+                } else {
+                    bail!("{} requires a value", arg);
+                }
+            } else if let Some(v) = arg.strip_prefix("--disable-tool=").or_else(|| arg.strip_prefix("--disable-tools=")) {
+                (false, v.to_string())
+            } else if arg == "--disable-tool" || arg == "--disable-tools" {
+                if i + 1 < args.len() {
+                    i += 1;
+                    (false, args[i].clone())
+                } else {
+                    bail!("{} requires a value", arg);
+                }
+            } else {
+            i += 1;
+            continue;
+        };
+
+        for pattern in patterns_str.split(',') {
+            let pattern = pattern.trim();
+            if pattern.is_empty() {
+                continue;
+            }
+            if pattern.len() < 3 {
+                bail!(
+                    "Tool pattern '{}' is too short (minimum 3 characters). \
+                     Available tools: {}",
+                    pattern,
+                    ALL_TOOLS.join(", ")
+                );
+            }
+            let matches: Vec<&str> = ALL_TOOLS
+                .iter()
+                .filter(|&&t| t.contains(pattern))
+                .copied()
+                .collect();
+            if matches.is_empty() {
+                bail!(
+                    "No tools match pattern '{}'. Available tools: {}",
+                    pattern,
+                    ALL_TOOLS.join(", ")
+                );
+            }
+            result.push((is_enable, pattern.to_string()));
+        }
+        i += 1;
+    }
+    Ok(result)
+}
+
+/// Apply ordered enable/disable flags to the default tool state.
+/// Last flag wins per tool.
+fn resolve_enabled_tools(ordered_flags: Vec<(bool, String)>) -> HashSet<String> {
+    let mut state: HashMap<&str, bool> = ALL_TOOLS
+        .iter()
+        .map(|&t| (t, !DEFAULT_DISABLED.contains(&t)))
+        .collect();
+
+    for (is_enable, pattern) in &ordered_flags {
+        for &tool in ALL_TOOLS.iter().filter(|&&t| t.contains(pattern.as_str())) {
+            state.insert(tool, *is_enable);
+        }
+    }
+
+    state
+        .into_iter()
+        .filter(|(_, enabled)| *enabled)
+        .map(|(t, _)| t.to_string())
+        .collect()
 }
 
 #[tokio::main]
@@ -74,16 +195,41 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
+    let ordered_flags = parse_tool_flags_in_order()?;
+    let enabled_tools = resolve_enabled_tools(ordered_flags);
+
+    // Handle --list-tools before clap parsing so credentials aren't required.
+    if std::env::args().any(|a| a == "--list-tools") {
+        eprintln!("{:<22} {}", "TOOL", "DEFAULT");
+        eprintln!("{}", "-".repeat(34));
+        for &tool in ALL_TOOLS {
+            let default = if DEFAULT_DISABLED.contains(&tool) { "disabled" } else { "enabled" };
+            eprintln!("{:<22} {}", tool, default);
+        }
+        return Ok(());
+    }
+
     let cli = Cli::parse();
 
-    let allow_risky = cli.allow_risky || cli.allow_destructive;
-    let allow_destructive = cli.allow_destructive;
+    // Log effective tool permissions at startup
+    let enabled_list: Vec<&str> = ALL_TOOLS
+        .iter()
+        .copied()
+        .filter(|&t| enabled_tools.contains(t))
+        .collect();
+    let disabled_list: Vec<&str> = ALL_TOOLS
+        .iter()
+        .copied()
+        .filter(|&t| !enabled_tools.contains(t))
+        .collect();
+    info!(enabled = %enabled_list.join(", "), "Enabled tools");
+    if !disabled_list.is_empty() {
+        warn!(disabled = %disabled_list.join(", "), "Disabled tools");
+    }
 
     info!(
         host = %cli.host,
         port = cli.port,
-        allow_risky,
-        allow_destructive,
         "Starting deluge-torrent-mcp"
     );
 
@@ -129,7 +275,7 @@ async fn main() -> anyhow::Result<()> {
     match cli.transport {
         Transport::Stdio => {
             info!("Starting MCP server on stdio");
-            let server = tools::DelugeServer::new(client, allow_risky, allow_destructive);
+            let server = tools::DelugeServer::new(client, enabled_tools);
             let service = server.serve(rmcp::transport::stdio()).await?;
             service.waiting().await?;
         }
@@ -159,8 +305,9 @@ async fn main() -> anyhow::Result<()> {
             // Build the MCP service — factory creates a DelugeServer per session
             let mcp_service = {
                 let client = client.clone();
+                let enabled_tools = enabled_tools.clone();
                 StreamableHttpService::new(
-                    move || Ok(tools::DelugeServer::new(client.clone(), allow_risky, allow_destructive)),
+                    move || Ok(tools::DelugeServer::new(client.clone(), enabled_tools.clone())),
                     Arc::new(LocalSessionManager::default()),
                     StreamableHttpServerConfig::default(),
                 )

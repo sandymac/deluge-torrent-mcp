@@ -22,8 +22,7 @@ use crate::rencode::Value;
 #[derive(Clone)]
 pub struct DelugeServer {
     client: Arc<DelugeClient>,
-    allow_risky: bool,
-    allow_destructive: bool,
+    enabled_tools: std::collections::HashSet<String>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -183,13 +182,13 @@ impl DelugeServer {
             .map_err(|e| e.to_string())
     }
 
-    /// Remove a torrent. Requires --allow-destructive.
+    /// Remove a torrent. Disabled by default; enable with --enable=remove_torrent.
     #[tool]
     async fn remove_torrent(
         &self,
         Parameters(p): Parameters<RemoveTorrentParams>,
     ) -> Result<String, String> {
-        self.destructive_gate()?;
+        self.tool_gate("remove_torrent")?;
         self.client
             .call(
                 "core.remove_torrent",
@@ -328,13 +327,13 @@ impl DelugeServer {
             .map_err(|e| e.to_string())
     }
 
-    /// Move a torrent's storage to a new path. Requires --allow-risky.
+    /// Move a torrent's storage to a new path. Disabled by default; enable with --enable=move_storage.
     #[tool]
     async fn move_storage(
         &self,
         Parameters(p): Parameters<MoveStorageParams>,
     ) -> Result<String, String> {
-        self.risky_gate()?;
+        self.tool_gate("move_storage")?;
         self.client
             .call(
                 "core.move_storage",
@@ -349,13 +348,13 @@ impl DelugeServer {
             .map_err(|e| e.to_string())
     }
 
-    /// Rename a folder within a torrent. Requires --allow-risky.
+    /// Rename a folder within a torrent. Disabled by default; enable with --enable=rename_folder.
     #[tool]
     async fn rename_folder(
         &self,
         Parameters(p): Parameters<RenameFolderParams>,
     ) -> Result<String, String> {
-        self.risky_gate()?;
+        self.tool_gate("rename_folder")?;
         self.client
             .call(
                 "core.rename_folder",
@@ -376,13 +375,13 @@ impl DelugeServer {
             .map_err(|e| e.to_string())
     }
 
-    /// Rename one or more files within a torrent. Requires --allow-risky.
+    /// Rename one or more files within a torrent. Disabled by default; enable with --enable=rename_files.
     #[tool]
     async fn rename_files(
         &self,
         Parameters(p): Parameters<RenameFilesParams>,
     ) -> Result<String, String> {
-        self.risky_gate()?;
+        self.tool_gate("rename_files")?;
         let renames = Value::List(
             p.renames
                 .iter()
@@ -405,13 +404,13 @@ impl DelugeServer {
             .map_err(|e| e.to_string())
     }
 
-    /// Force a hash recheck of a torrent's files. Requires --allow-risky.
+    /// Force a hash recheck of a torrent's files. Disabled by default; enable with --enable=force_recheck.
     #[tool]
     async fn force_recheck(
         &self,
         Parameters(p): Parameters<TorrentIdParams>,
     ) -> Result<String, String> {
-        self.risky_gate()?;
+        self.tool_gate("force_recheck")?;
         self.client
             .call(
                 "core.force_recheck",
@@ -457,30 +456,22 @@ impl DelugeServer {
 impl DelugeServer {
     pub fn new(
         client: Arc<DelugeClient>,
-        allow_risky: bool,
-        allow_destructive: bool,
+        enabled_tools: std::collections::HashSet<String>,
     ) -> Self {
         Self {
             client,
-            allow_risky,
-            allow_destructive,
+            enabled_tools,
             tool_router: Self::tool_router(),
         }
     }
 
-    fn risky_gate(&self) -> Result<(), String> {
-        if !self.allow_risky {
-            Err("This tool requires --allow-risky to be enabled.".to_string())
-        } else {
+    fn tool_gate(&self, tool_name: &str) -> Result<(), String> {
+        if self.enabled_tools.contains(tool_name) {
             Ok(())
-        }
-    }
-
-    fn destructive_gate(&self) -> Result<(), String> {
-        if !self.allow_destructive {
-            Err("This tool requires --allow-destructive to be enabled.".to_string())
         } else {
-            Ok(())
+            Err(format!(
+                "Tool '{tool_name}' is disabled. Use --enable={tool_name} to enable it."
+            ))
         }
     }
 
