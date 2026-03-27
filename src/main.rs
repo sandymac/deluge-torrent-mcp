@@ -75,8 +75,8 @@ struct Cli {
     #[arg(long, default_value = "stdio")]
     transport: Transport,
 
-    /// Bind address for HTTP transport (e.g. 0.0.0.0:8080)
-    #[arg(long, default_value = "0.0.0.0:8080")]
+    /// Bind address for HTTP transport (e.g. 127.0.0.1:8080 or 0.0.0.0:8080 for all interfaces)
+    #[arg(long, default_value = "127.0.0.1:8080")]
     http_bind: String,
 
     /// Bearer token required for HTTP transport requests (recommended)
