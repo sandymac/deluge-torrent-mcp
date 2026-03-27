@@ -179,6 +179,14 @@ impl DelugeServer {
                 )
                 .await
         } else if let Some(content) = p.file_content {
+            const MAX_FILE_CONTENT_BYTES: usize = 32 * 1024 * 1024; // 32 MB
+            if content.len() > MAX_FILE_CONTENT_BYTES {
+                return Err(format!(
+                    "file_content is {} bytes, exceeding the 32 MB limit. \
+                     .torrent files are typically under 1 MB — this input is likely incorrect.",
+                    content.len()
+                ));
+            }
             self.client
                 .call(
                     "core.add_torrent_file",

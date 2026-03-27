@@ -51,7 +51,11 @@ pub enum RencodeError {
     IntegerOverflow,
     #[error("invalid utf-8 in string")]
     InvalidUtf8,
+    #[error("nesting depth limit exceeded (max 128)")]
+    DepthLimitExceeded,
 }
+
+const MAX_DEPTH: usize = 128;
 
 /// A dynamically-typed rencode value.
 #[derive(Debug, Clone, PartialEq)]
@@ -165,11 +169,14 @@ fn encode_bytes(b: &[u8], buf: &mut Vec<u8>) {
 // ---------------------------------------------------------------------------
 
 pub fn decode(data: &[u8]) -> Result<Value, RencodeError> {
-    let (value, _) = decode_from(data, 0)?;
+    let (value, _) = decode_from(data, 0, 0)?;
     Ok(value)
 }
 
-fn decode_from(data: &[u8], pos: usize) -> Result<(Value, usize), RencodeError> {
+fn decode_from(data: &[u8], pos: usize, depth: usize) -> Result<(Value, usize), RencodeError> {
+    if depth > MAX_DEPTH {
+        return Err(RencodeError::DepthLimitExceeded);
+    }
     let tag = *data.get(pos).ok_or(RencodeError::UnexpectedEof)?;
 
     // Fixed positive integer
@@ -183,7 +190,7 @@ fn decode_from(data: &[u8], pos: usize) -> Result<(Value, usize), RencodeError> 
         let mut items = Vec::with_capacity(count);
         let mut cur = pos + 1;
         for _ in 0..count {
-            let (v, next) = decode_from(data, cur)?;
+            let (v, next) = decode_from(data, cur, depth + 1)?;
             items.push(v);
             cur = next;
         }
@@ -213,8 +220,8 @@ fn decode_from(data: &[u8], pos: usize) -> Result<(Value, usize), RencodeError> 
         let mut pairs = Vec::with_capacity(count);
         let mut cur = pos + 1;
         for _ in 0..count {
-            let (k, next) = decode_from(data, cur)?;
-            let (v, next2) = decode_from(data, next)?;
+            let (k, next) = decode_from(data, cur, depth + 1)?;
+            let (v, next2) = decode_from(data, next, depth + 1)?;
             pairs.push((k, v));
             cur = next2;
         }
@@ -285,7 +292,7 @@ fn decode_from(data: &[u8], pos: usize) -> Result<(Value, usize), RencodeError> 
                     cur += 1;
                     break;
                 }
-                let (v, next) = decode_from(data, cur)?;
+                let (v, next) = decode_from(data, cur, depth + 1)?;
                 items.push(v);
                 cur = next;
             }
@@ -300,8 +307,8 @@ fn decode_from(data: &[u8], pos: usize) -> Result<(Value, usize), RencodeError> 
                     cur += 1;
                     break;
                 }
-                let (k, next) = decode_from(data, cur)?;
-                let (v, next2) = decode_from(data, next)?;
+                let (k, next) = decode_from(data, cur, depth + 1)?;
+                let (v, next2) = decode_from(data, next, depth + 1)?;
                 pairs.push((k, v));
                 cur = next2;
             }
