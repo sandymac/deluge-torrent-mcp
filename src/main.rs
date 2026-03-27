@@ -38,7 +38,7 @@ const DEFAULT_DISABLED: &[&str] = &[
 ];
 
 #[derive(Parser, Debug)]
-#[command(name = "deluge-torrent-mcp", about = "MCP server for Deluge torrent daemon")]
+#[command(name = "deluge-torrent-mcp", about = "MCP server for Deluge torrent daemon", version)]
 struct Cli {
     /// Deluge daemon hostname or IP
     #[arg(long, default_value = "127.0.0.1", env = "DELUGE_HOST")]
