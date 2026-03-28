@@ -119,9 +119,9 @@ To use the HTTP/SSE transport for remote or agentic clients, start with `--trans
 deluge-torrent-mcp -u admin -p secret --transport http --http-bind 0.0.0.0:8080 --api-token "your-secret-token"
 ```
 
-MCP clients connect to `http://<host>:8080/mcp`. The `--api-token` flag is strongly recommended when binding to a network interface — without it, anyone who can reach the port can control Deluge.
+MCP clients connect to `http://<host>:8080/mcp`. The `--api-token` flag is strongly recommended when binding to a network interface — without it, anyone who can reach the port can access the MCP endpoint and control Deluge.
 
-Clients must include the token in every request:
+Clients must include the token in every request when --api-token is set:
 
 ```
 Authorization: Bearer your-secret-token
