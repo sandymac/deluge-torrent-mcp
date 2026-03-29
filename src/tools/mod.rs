@@ -7,11 +7,15 @@ use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use rmcp::{
     ServerHandler,
     handler::server::router::tool::ToolRouter,
+    handler::server::tool::ToolCallContext,
     handler::server::wrapper::Parameters,
-    model::{Implementation, ServerInfo},
+    model::{CallToolRequestParams, CallToolResult, Implementation, ListToolsResult,
+            PaginatedRequestParams, ServerInfo, Tool},
     schemars,
     serde_json,
-    tool, tool_handler, tool_router,
+    service::RequestContext,
+    tool, tool_router,
+    ErrorData, RoleServer,
 };
 use serde::Deserialize;
 
@@ -678,12 +682,37 @@ impl DelugeServer {
 // ServerHandler
 // ---------------------------------------------------------------------------
 
-#[tool_handler]
 impl ServerHandler for DelugeServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::default().with_server_info(Implementation::new(
             env!("CARGO_PKG_NAME"),
             env!("CARGO_PKG_VERSION"),
         ))
+    }
+
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, ErrorData> {
+        let tools: Vec<Tool> = self
+            .tool_router
+            .list_all()
+            .into_iter()
+            .filter(|t| self.enabled_tools.contains(t.name.as_ref()))
+            .collect();
+        Ok(ListToolsResult { tools, meta: None, next_cursor: None })
+    }
+
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.tool_router.call(ToolCallContext::new(self, request, context)).await
+    }
+
+    fn get_tool(&self, name: &str) -> Option<Tool> {
+        self.tool_router.get(name).cloned()
     }
 }

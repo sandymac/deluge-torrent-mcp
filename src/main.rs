@@ -203,12 +203,15 @@ async fn main() -> anyhow::Result<()> {
 
     // Handle --list-tools before clap parsing so credentials aren't required.
     if std::env::args().any(|a| a == "--list-tools") {
-        eprintln!("{:<22} {}", "TOOL", "DEFAULT");
-        eprintln!("{}", "-".repeat(34));
+        eprintln!("{:<22} {:<10} {}", "TOOL", "STATUS", "DEFAULT");
+        eprintln!("{}", "-".repeat(46));
         for &tool in ALL_TOOLS {
+            let status = if enabled_tools.contains(tool) { "visible" } else { "hidden" };
             let default = if DEFAULT_DISABLED.contains(&tool) { "disabled" } else { "enabled" };
-            eprintln!("{:<22} {}", tool, default);
+            eprintln!("{:<22} {:<10} {}", tool, status, default);
         }
+        eprintln!();
+        eprintln!("Visible tools are reported to the MCP client. Hidden tools are not.");
         return Ok(());
     }
 
