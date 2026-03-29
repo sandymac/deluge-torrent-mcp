@@ -114,6 +114,19 @@ struct RenameFilesParams {
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
+struct ListTorrentsParams {
+    /// Filter by torrent state. Valid values: Downloading, Seeding, Paused, Queued, Checking,
+    /// Error, Moving, Allocating. Omit to return all torrents.
+    state: Option<String>,
+    /// Maximum number of torrents to return per page (default: 100). Use with offset to paginate
+    /// through large libraries.
+    limit: Option<usize>,
+    /// Number of torrents to skip before returning results (default: 0). Use the next_offset
+    /// value from a previous response to fetch the next page.
+    offset: Option<usize>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
 struct PathParams {
     /// Absolute path (file or directory) on the Deluge server to query.
     path: String,
@@ -240,14 +253,30 @@ impl DelugeServer {
             .map_err(Self::enrich_client_error)
     }
 
-    /// List all torrents in Deluge with their current status.
+    /// List torrents in Deluge with their current status, with optional state filtering and pagination.
     /// WORKFLOW: Use this first to discover torrents and obtain info_hash values required by all other tools.
-    /// Returns a JSON object keyed by info_hash. Each value contains: name, state, progress (0–100),
+    /// Returns a summary header (total, returned, offset, limit, has_more, next_offset) followed by
+    /// a 'torrents' object keyed by info_hash. Each torrent contains: name, state, progress (0–100),
     /// total_size (bytes), download_payload_rate (bytes/sec), upload_payload_rate (bytes/sec),
     /// eta (seconds to completion, -1 if not applicable), save_path.
     /// Possible state values: Allocating, Checking, Downloading, Seeding, Paused, Queued, Error, Moving.
+    /// If has_more is true, call again with offset=next_offset to retrieve the next page.
     #[tool]
-    async fn list_torrents(&self) -> Result<String, String> {
+    async fn list_torrents(
+        &self,
+        Parameters(p): Parameters<ListTorrentsParams>,
+    ) -> Result<String, String> {
+        let limit = p.limit.unwrap_or(100).max(1);
+        let offset = p.offset.unwrap_or(0);
+
+        let filter = match p.state {
+            Some(ref s) => Value::Dict(vec![(
+                Value::String("state".into()),
+                Value::String(s.clone()),
+            )]),
+            None => Value::Dict(vec![]),
+        };
+
         let keys = Value::List(vec![
             Value::String("name".into()),
             Value::String("state".into()),
@@ -258,15 +287,49 @@ impl DelugeServer {
             Value::String("eta".into()),
             Value::String("save_path".into()),
         ]);
-        self.client
-            .call(
-                "core.get_torrents_status",
-                vec![Value::Dict(vec![]), keys],
-                vec![],
-            )
+
+        let result = self.client
+            .call("core.get_torrents_status", vec![filter, keys], vec![])
             .await
-            .map(Self::value_to_json_string)
-            .map_err(Self::enrich_client_error)
+            .map_err(Self::enrich_client_error)?;
+
+        let mut pairs = match result {
+            Value::Dict(pairs) => pairs,
+            other => return Ok(Self::value_to_json_string(other)),
+        };
+
+        let total = pairs.len();
+
+        // Sort by name for deterministic pagination
+        pairs.sort_by(|(_, a), (_, b)| {
+            Self::torrent_name(a).cmp(Self::torrent_name(b))
+        });
+
+        let page: Vec<_> = pairs.into_iter().skip(offset).take(limit).collect();
+        let returned = page.len();
+        let has_more = offset + returned < total;
+
+        let mut out = serde_json::Map::new();
+        out.insert("total".into(), serde_json::json!(total));
+        out.insert("returned".into(), serde_json::json!(returned));
+        out.insert("offset".into(), serde_json::json!(offset));
+        out.insert("limit".into(), serde_json::json!(limit));
+        out.insert("has_more".into(), serde_json::json!(has_more));
+        if has_more {
+            out.insert("next_offset".into(), serde_json::json!(offset + returned));
+        }
+
+        let mut torrents = serde_json::Map::new();
+        for (k, v) in page {
+            let key = match k {
+                Value::String(s) => s,
+                other => format!("{other:?}"),
+            };
+            torrents.insert(key, crate::rencode::value_to_json(v));
+        }
+        out.insert("torrents".into(), serde_json::Value::Object(torrents));
+
+        Ok(serde_json::to_string_pretty(&serde_json::Value::Object(out)).unwrap_or_default())
     }
 
     /// Get comprehensive status and metadata for a single torrent.
@@ -583,6 +646,20 @@ impl DelugeServer {
         } else {
             msg
         }
+    }
+
+    /// Extract the torrent name from a torrent status Value for sorting purposes.
+    fn torrent_name(v: &Value) -> &str {
+        if let Value::Dict(fields) = v {
+            for (k, val) in fields {
+                if matches!(k, Value::String(s) if s == "name") {
+                    if let Value::String(s) = val {
+                        return s.as_str();
+                    }
+                }
+            }
+        }
+        ""
     }
 
     fn value_to_string(v: Value) -> String {
