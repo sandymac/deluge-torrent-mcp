@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Sandy McArthur, Jr.
+// SPDX-License-Identifier: MIT
+
 use std::sync::Arc;
 
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};

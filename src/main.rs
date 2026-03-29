@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Sandy McArthur, Jr.
+// SPDX-License-Identifier: MIT
+
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 

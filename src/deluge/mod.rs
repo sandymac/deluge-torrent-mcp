@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Sandy McArthur, Jr.
+// SPDX-License-Identifier: MIT
+
 // Deluge RPC client — connection, authentication, and method wrappers.
 
 use std::collections::HashMap;

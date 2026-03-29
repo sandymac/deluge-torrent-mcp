@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Sandy McArthur, Jr.
+// SPDX-License-Identifier: MIT
+
 /// Internal rencode serializer/deserializer for the Deluge RPC wire format.
 ///
 /// rencode is a compact binary encoding similar to bencoding but supporting
