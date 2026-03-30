@@ -51,13 +51,13 @@ struct AddTorrentParams {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 struct TorrentIdParams {
-    /// Info hash identifying the torrent: 40 hex characters (v1/SHA-1) or 64 hex characters (v2/SHA-256). Obtain from list_torrents or get_torrent_status.
+    /// Target torrent info_hash.
     info_hash: String,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
 struct RemoveTorrentParams {
-    /// Info hash identifying the torrent: 40 hex characters (v1/SHA-1) or 64 hex characters (v2/SHA-256). Obtain from list_torrents or get_torrent_status.
+    /// Target torrent info_hash.
     info_hash: String,
     /// If true, permanently deletes all downloaded files from disk — this is irreversible. If false (default), removes the torrent from Deluge but leaves files on disk. Always confirm with the user before setting to true.
     #[serde(default)]
@@ -66,7 +66,7 @@ struct RemoveTorrentParams {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 struct SetOptionsParams {
-    /// Info hash identifying the torrent: 40 hex characters (v1/SHA-1) or 64 hex characters (v2/SHA-256). Obtain from list_torrents or get_torrent_status.
+    /// Target torrent info_hash.
     info_hash: String,
     /// Maximum download speed in KiB/s. Use -1 for unlimited (global default). Example: 10240 = 10 MiB/s. Only set fields you want to change.
     max_download_speed: Option<f64>,
@@ -88,7 +88,7 @@ struct SetOptionsParams {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 struct MoveStorageParams {
-    /// Info hash identifying the torrent: 40 hex characters (v1/SHA-1) or 64 hex characters (v2/SHA-256). Obtain from list_torrents or get_torrent_status.
+    /// Target torrent info_hash.
     info_hash: String,
     /// Absolute destination directory path on the Deluge server. Deluge will attempt to create it if it does not exist. The Deluge process must have write access to this path.
     dest: String,
@@ -96,7 +96,7 @@ struct MoveStorageParams {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 struct RenameFolderParams {
-    /// Info hash identifying the torrent: 40 hex characters (v1/SHA-1) or 64 hex characters (v2/SHA-256). Obtain from list_torrents or get_torrent_status.
+    /// Target torrent info_hash.
     info_hash: String,
     /// Current folder name within the torrent's file structure (as shown in the torrent file list, not a filesystem path).
     folder: String,
@@ -114,7 +114,7 @@ struct FileRename {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 struct RenameFilesParams {
-    /// Info hash identifying the torrent: 40 hex characters (v1/SHA-1) or 64 hex characters (v2/SHA-256). Obtain from list_torrents or get_torrent_status.
+    /// Target torrent info_hash.
     info_hash: String,
     /// List of file renames to apply. Each entry needs an index (from get_torrent_status 'files' field) and the new_name to assign.
     renames: Vec<FileRename>,
@@ -225,14 +225,16 @@ impl DelugeServer {
         };
 
         result
-            .map(|v| format!("Torrent added. Hash: {}", Self::value_to_string(v)))
+            .map(|v| match v {
+                Value::String(s) => s,
+                other => Self::value_to_string(other),
+            })
             .map_err(Self::enrich_client_error)
     }
 
-    /// Remove a torrent from Deluge. Disabled by default; enable with --enable-tool=remove_torrent.
+    /// Remove a torrent from Deluge.
     /// If delete_data is true, all downloaded files are permanently deleted from disk — irreversible.
     /// If delete_data is false (default), files remain on disk and only the torrent entry is removed.
-    /// Returns true on success. Returns an error if the info_hash is not found in Deluge.
     #[tool(title = "Remove Torrent", annotations(destructive_hint = true, open_world_hint = false))]
     async fn remove_torrent(
         &self,
@@ -250,13 +252,7 @@ impl DelugeServer {
                 vec![],
             )
             .await
-            .map(|_| {
-                format!(
-                    "Torrent {} removed{}.",
-                    p.info_hash,
-                    if p.delete_data { " (data deleted)" } else { "" }
-                )
-            })
+            .map(|_| if p.delete_data { "deleted".to_string() } else { "ok".to_string() })
             .map_err(Self::enrich_client_error)
     }
 
@@ -372,7 +368,7 @@ impl DelugeServer {
         self.client
             .call("core.pause_torrent", vec![Value::String(p.info_hash.clone())], vec![])
             .await
-            .map(|_| format!("Torrent {} paused.", p.info_hash))
+            .map(|_| "ok".to_string())
             .map_err(Self::enrich_client_error)
     }
 
@@ -388,7 +384,7 @@ impl DelugeServer {
         self.client
             .call("core.resume_torrent", vec![Value::String(p.info_hash.clone())], vec![])
             .await
-            .map(|_| format!("Torrent {} resumed.", p.info_hash))
+            .map(|_| "ok".to_string())
             .map_err(Self::enrich_client_error)
     }
 
@@ -443,11 +439,11 @@ impl DelugeServer {
                 vec![],
             )
             .await
-            .map(|_| format!("Options updated for torrent {}.", p.info_hash))
+            .map(|_| "ok".to_string())
             .map_err(Self::enrich_client_error)
     }
 
-    /// Move a torrent's data files to a new directory on the Deluge server. Disabled by default; enable with --enable-tool=move_storage.
+    /// Move a torrent's data files to a new directory on the Deluge server.
     /// ASYNC: Returns immediately but the file move continues in the background.
     /// The torrent enters Moving state during the operation and returns to its previous state when complete.
     /// Use list_torrents or get_torrent_status to confirm the move has finished (state leaves Moving).
@@ -468,11 +464,11 @@ impl DelugeServer {
                 vec![],
             )
             .await
-            .map(|_| format!("Moving torrent {} to '{}'.", p.info_hash, p.dest))
+            .map(|_| "ok".to_string())
             .map_err(Self::enrich_client_error)
     }
 
-    /// Rename a top-level folder within a torrent's file structure. Disabled by default; enable with --enable-tool=rename_folder.
+    /// Rename a top-level folder within a torrent's file structure.
     /// ASYNC: The rename occurs asynchronously in Deluge.
     /// Best performed on paused torrents. The old folder may remain on disk as an orphan — Deluge
     /// renames the tracked path but does not always remove the original directory.
@@ -495,16 +491,11 @@ impl DelugeServer {
                 vec![],
             )
             .await
-            .map(|_| {
-                format!(
-                    "Renamed folder '{}' to '{}' in torrent {}.",
-                    p.folder, p.new_name, p.info_hash
-                )
-            })
+            .map(|_| "ok".to_string())
             .map_err(Self::enrich_client_error)
     }
 
-    /// Rename one or more files within a torrent. Disabled by default; enable with --enable-tool=rename_files.
+    /// Rename one or more files within a torrent.
     /// ASYNC: The rename occurs asynchronously in Deluge.
     /// PREREQUISITE: Call get_torrent_status first to retrieve file indices from the 'files' field.
     /// File indices are zero-based and stable for the lifetime of the torrent in Deluge.
@@ -533,11 +524,11 @@ impl DelugeServer {
                 vec![],
             )
             .await
-            .map(|_| format!("Renamed {} file(s) in torrent {}.", p.renames.len(), p.info_hash))
+            .map(|_| "ok".to_string())
             .map_err(Self::enrich_client_error)
     }
 
-    /// Force a full hash recheck of a torrent's downloaded files against the torrent metadata. Disabled by default; enable with --enable-tool=force_recheck.
+    /// Force a full hash recheck of a torrent's downloaded files against the torrent metadata.
     /// Use after moving files outside Deluge, suspecting data corruption, or after a rename operation to reconcile file paths.
     /// ASYNC: The torrent enters Checking state immediately and returns to its previous state when done.
     /// If the torrent was Paused before the recheck, it automatically returns to Paused after checking completes.
@@ -556,7 +547,7 @@ impl DelugeServer {
                 vec![],
             )
             .await
-            .map(|_| format!("Recheck started for torrent {}.", p.info_hash))
+            .map(|_| "ok".to_string())
             .map_err(Self::enrich_client_error)
     }
 
@@ -570,7 +561,7 @@ impl DelugeServer {
             .call("core.get_free_space", vec![Value::String(p.path)], vec![])
             .await
             .map(|v| match v {
-                Value::Int(bytes) => format!("{} bytes ({:.2} GiB) free", bytes, bytes as f64 / 1_073_741_824.0),
+                Value::Int(bytes) => bytes.to_string(),
                 other => Self::value_to_string(other),
             })
             .map_err(Self::enrich_client_error)
@@ -586,7 +577,7 @@ impl DelugeServer {
             .call("core.get_path_size", vec![Value::String(p.path)], vec![])
             .await
             .map(|v| match v {
-                Value::Int(bytes) => format!("{} bytes ({:.2} GiB)", bytes, bytes as f64 / 1_073_741_824.0),
+                Value::Int(bytes) => bytes.to_string(),
                 other => Self::value_to_string(other),
             })
             .map_err(Self::enrich_client_error)
@@ -670,11 +661,11 @@ impl DelugeServer {
     }
 
     fn value_to_string(v: Value) -> String {
-        serde_json::to_string_pretty(&crate::rencode::value_to_json(v)).unwrap_or_default()
+        serde_json::to_string(&crate::rencode::value_to_json(v)).unwrap_or_default()
     }
 
     fn value_to_json_string(v: Value) -> String {
-        serde_json::to_string_pretty(&crate::rencode::value_to_json(v)).unwrap_or_default()
+        serde_json::to_string(&crate::rencode::value_to_json(v)).unwrap_or_default()
     }
 }
 
