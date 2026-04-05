@@ -16,28 +16,28 @@ mod tools;
 
 /// All tool names exposed by this server, in a stable order used for logging.
 const ALL_TOOLS: &[&str] = &[
-    "add_torrent",
-    "list_torrents",
-    "get_torrent_status",
-    "pause_torrent",
-    "resume_torrent",
-    "set_torrent_options",
-    "get_free_space",
-    "get_path_size",
-    "move_storage",
-    "rename_folder",
-    "rename_files",
-    "force_recheck",
-    "remove_torrent",
+    "deluge_add_torrent",
+    "deluge_list_torrents",
+    "deluge_get_torrent_status",
+    "deluge_pause_torrent",
+    "deluge_resume_torrent",
+    "deluge_set_torrent_options",
+    "deluge_get_free_space",
+    "deluge_get_path_size",
+    "deluge_move_storage",
+    "deluge_rename_folder",
+    "deluge_rename_files",
+    "deluge_force_recheck",
+    "deluge_remove_torrent",
 ];
 
 /// Tools that are disabled unless explicitly enabled via --enable.
 const DEFAULT_DISABLED: &[&str] = &[
-    "move_storage",
-    "rename_folder",
-    "rename_files",
-    "force_recheck",
-    "remove_torrent",
+    "deluge_move_storage",
+    "deluge_rename_folder",
+    "deluge_rename_files",
+    "deluge_force_recheck",
+    "deluge_remove_torrent",
 ];
 
 #[derive(Parser, Debug)]

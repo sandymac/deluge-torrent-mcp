@@ -176,7 +176,7 @@ impl DelugeServer {
     /// Returns the info_hash of the newly added torrent on success.
     /// When using url, Deluge fetches the .torrent file asynchronously; the call returns once the
     /// fetch begins, not when it completes, and will return an error if the URL is unreachable.
-    #[tool(title = "Add Torrent", annotations(destructive_hint = false, open_world_hint = true))]
+    #[tool(name = "deluge_add_torrent", title = "Add Torrent", annotations(destructive_hint = false, open_world_hint = true))]
     async fn add_torrent(
         &self,
         Parameters(p): Parameters<AddTorrentParams>,
@@ -261,12 +261,12 @@ impl DelugeServer {
     /// Remove a torrent from Deluge.
     /// If delete_data is true, all downloaded files are permanently deleted from disk — irreversible.
     /// If delete_data is false (default), files remain on disk and only the torrent entry is removed.
-    #[tool(title = "Remove Torrent", annotations(destructive_hint = true, open_world_hint = false))]
+    #[tool(name = "deluge_remove_torrent", title = "Remove Torrent", annotations(destructive_hint = true, open_world_hint = false))]
     async fn remove_torrent(
         &self,
         Parameters(p): Parameters<RemoveTorrentParams>,
     ) -> Result<String, String> {
-        self.tool_gate("remove_torrent")?;
+        self.tool_gate("deluge_remove_torrent")?;
         Self::validate_info_hash(&p.info_hash)?;
         self.client
             .call(
@@ -290,7 +290,7 @@ impl DelugeServer {
     /// eta (seconds to completion, -1 if not applicable), save_path.
     /// Possible state values: Allocating, Checking, Downloading, Seeding, Paused, Queued, Error, Moving.
     /// If has_more is true, call again with offset=next_offset to retrieve the next page.
-    #[tool(title = "List Torrents", annotations(read_only_hint = true, open_world_hint = false))]
+    #[tool(name = "deluge_list_torrents", title = "List Torrents", annotations(read_only_hint = true, open_world_hint = false))]
     async fn list_torrents(
         &self,
         Parameters(p): Parameters<ListTorrentsParams>,
@@ -371,7 +371,7 @@ impl DelugeServer {
     /// Use this when you need file details (names, zero-based indices, per-file progress) required
     /// for rename_files, tracker information, piece details, or fields not in list_torrents.
     /// Returns a JSON object with all available torrent fields including a 'files' array.
-    #[tool(title = "Get Torrent Status", annotations(read_only_hint = true, open_world_hint = false))]
+    #[tool(name = "deluge_get_torrent_status", title = "Get Torrent Status", annotations(read_only_hint = true, open_world_hint = false))]
     async fn get_torrent_status(
         &self,
         Parameters(p): Parameters<TorrentIdParams>,
@@ -389,7 +389,7 @@ impl DelugeServer {
     }
 
     /// Pause a torrent, stopping all upload and download activity.
-    #[tool(title = "Pause Torrent", annotations(destructive_hint = false, idempotent_hint = true, open_world_hint = false))]
+    #[tool(name = "deluge_pause_torrent", title = "Pause Torrent", annotations(destructive_hint = false, idempotent_hint = true, open_world_hint = false))]
     async fn pause_torrent(
         &self,
         Parameters(p): Parameters<TorrentIdParams>,
@@ -403,7 +403,7 @@ impl DelugeServer {
     }
 
     /// Resume a paused torrent. If auto-managed, may re-enter the queue rather than downloading immediately.
-    #[tool(title = "Resume Torrent", annotations(destructive_hint = false, idempotent_hint = true, open_world_hint = false))]
+    #[tool(name = "deluge_resume_torrent", title = "Resume Torrent", annotations(destructive_hint = false, idempotent_hint = true, open_world_hint = false))]
     async fn resume_torrent(
         &self,
         Parameters(p): Parameters<TorrentIdParams>,
@@ -417,7 +417,7 @@ impl DelugeServer {
     }
 
     /// Set per-torrent options (speed limits, ratio targets, completion behavior). Takes effect immediately.
-    #[tool(title = "Set Torrent Options", annotations(destructive_hint = false, idempotent_hint = true, open_world_hint = false))]
+    #[tool(name = "deluge_set_torrent_options", title = "Set Torrent Options", annotations(destructive_hint = false, idempotent_hint = true, open_world_hint = false))]
     async fn set_torrent_options(
         &self,
         Parameters(p): Parameters<SetOptionsParams>,
@@ -472,12 +472,12 @@ impl DelugeServer {
     /// ASYNC: Returns immediately but the file move continues in the background.
     /// The torrent enters Moving state during the operation and returns to its previous state when complete.
     /// Use list_torrents or get_torrent_status to confirm the move has finished (state leaves Moving).
-    #[tool(title = "Move Storage", annotations(destructive_hint = false, open_world_hint = false))]
+    #[tool(name = "deluge_move_storage", title = "Move Storage", annotations(destructive_hint = false, open_world_hint = false))]
     async fn move_storage(
         &self,
         Parameters(p): Parameters<MoveStorageParams>,
     ) -> Result<String, String> {
-        self.tool_gate("move_storage")?;
+        self.tool_gate("deluge_move_storage")?;
         Self::validate_info_hash(&p.info_hash)?;
         self.client
             .call(
@@ -498,12 +498,12 @@ impl DelugeServer {
     /// Best performed on paused torrents. The old folder may remain on disk as an orphan — Deluge
     /// renames the tracked path but does not always remove the original directory.
     /// If renaming causes file path mismatches, follow up with force_recheck to reconcile.
-    #[tool(title = "Rename Folder", annotations(destructive_hint = false, open_world_hint = false))]
+    #[tool(name = "deluge_rename_folder", title = "Rename Folder", annotations(destructive_hint = false, open_world_hint = false))]
     async fn rename_folder(
         &self,
         Parameters(p): Parameters<RenameFolderParams>,
     ) -> Result<String, String> {
-        self.tool_gate("rename_folder")?;
+        self.tool_gate("deluge_rename_folder")?;
         Self::validate_info_hash(&p.info_hash)?;
         self.client
             .call(
@@ -524,12 +524,12 @@ impl DelugeServer {
     /// ASYNC: The rename occurs asynchronously in Deluge.
     /// PREREQUISITE: Call get_torrent_status first to retrieve file indices from the 'files' field.
     /// File indices are zero-based and stable for the lifetime of the torrent in Deluge.
-    #[tool(title = "Rename Files", annotations(destructive_hint = false, open_world_hint = false))]
+    #[tool(name = "deluge_rename_files", title = "Rename Files", annotations(destructive_hint = false, open_world_hint = false))]
     async fn rename_files(
         &self,
         Parameters(p): Parameters<RenameFilesParams>,
     ) -> Result<String, String> {
-        self.tool_gate("rename_files")?;
+        self.tool_gate("deluge_rename_files")?;
         Self::validate_info_hash(&p.info_hash)?;
         let renames = Value::List(
             p.renames
@@ -555,12 +555,12 @@ impl DelugeServer {
 
     /// Force a full hash recheck of a torrent's files. Use after external moves, corruption suspicion, or renames.
     /// ASYNC: Enters Checking state immediately; returns to previous state (including Paused) when done.
-    #[tool(title = "Force Recheck", annotations(destructive_hint = false, idempotent_hint = true, open_world_hint = false))]
+    #[tool(name = "deluge_force_recheck", title = "Force Recheck", annotations(destructive_hint = false, idempotent_hint = true, open_world_hint = false))]
     async fn force_recheck(
         &self,
         Parameters(p): Parameters<TorrentIdParams>,
     ) -> Result<String, String> {
-        self.tool_gate("force_recheck")?;
+        self.tool_gate("deluge_force_recheck")?;
         Self::validate_info_hash(&p.info_hash)?;
         self.client
             .call(
@@ -574,7 +574,7 @@ impl DelugeServer {
     }
 
     /// Get free disk space at a path on the Deluge server. Returns bytes, or error if path is invalid.
-    #[tool(title = "Get Free Space", annotations(read_only_hint = true, open_world_hint = false))]
+    #[tool(name = "deluge_get_free_space", title = "Get Free Space", annotations(read_only_hint = true, open_world_hint = false))]
     async fn get_free_space(&self, Parameters(p): Parameters<PathParams>) -> Result<String, String> {
         self.client
             .call("core.get_free_space", vec![Value::String(p.path)], vec![])
@@ -587,7 +587,7 @@ impl DelugeServer {
     }
 
     /// Get the total size of a file or directory on the Deluge server. Returns bytes, or -1 if inaccessible.
-    #[tool(title = "Get Path Size", annotations(read_only_hint = true, open_world_hint = false))]
+    #[tool(name = "deluge_get_path_size", title = "Get Path Size", annotations(read_only_hint = true, open_world_hint = false))]
     async fn get_path_size(&self, Parameters(p): Parameters<PathParams>) -> Result<String, String> {
         self.client
             .call("core.get_path_size", vec![Value::String(p.path)], vec![])
