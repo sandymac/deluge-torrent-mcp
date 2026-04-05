@@ -15,7 +15,7 @@ use rmcp::{
         ListResourceTemplatesResult, ListToolsResult, PaginatedRequestParams, RawResource,
         RawResourceTemplate, ReadResourceRequestParams, ReadResourceResult, Resource,
         ResourceContents, ResourceTemplate, ResourceUpdatedNotificationParam, ServerInfo,
-        SubscribeRequestParams, Tool, UnsubscribeRequestParams,
+        SetLevelRequestParams, SubscribeRequestParams, Tool, UnsubscribeRequestParams,
     },
     schemars,
     serde_json,
@@ -777,6 +777,7 @@ impl ServerHandler for DelugeServer {
                 .enable_tools()
                 .enable_resources()
                 .enable_resources_subscribe()
+                .enable_logging()
                 .build(),
         )
             .with_server_info(
@@ -809,6 +810,14 @@ impl ServerHandler for DelugeServer {
 
     fn get_tool(&self, name: &str) -> Option<Tool> {
         self.tool_router.get(name).cloned()
+    }
+
+    async fn set_level(
+        &self,
+        _request: SetLevelRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<(), ErrorData> {
+        Ok(())
     }
 
     async fn list_resources(
