@@ -732,7 +732,8 @@ impl DelugeServer {
                     vec![],
                 )
                 .await
-        } else if Self::is_base64_torrent(source) {
+        } else if {
+            // Size guard BEFORE base64 decode to prevent oversized allocation
             const MAX_BASE64_BYTES: usize = 32 * 1024 * 1024; // 32 MB
             if source.len() > MAX_BASE64_BYTES {
                 return Err(format!(
@@ -741,6 +742,8 @@ impl DelugeServer {
                     source.len()
                 ));
             }
+            Self::is_base64_torrent(source)
+        } {
             self.client
                 .call(
                     "core.add_torrent_file",

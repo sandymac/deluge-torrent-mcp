@@ -35,6 +35,7 @@ const CLEANUP_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const REFRESH_GRACE_PERIOD: Duration = Duration::from_secs(30);
 const PENDING_AUTH_TTL: Duration = Duration::from_secs(5 * 60);
 const MAX_CLIENTS: usize = 100;
+const MAX_PENDING_AUTHORIZATIONS: usize = 1000;
 /// Clients that never complete authorization are removed after this period.
 const UNAUTHED_CLIENT_TTL: Duration = Duration::from_secs(15 * 60);
 
@@ -198,6 +199,18 @@ fn verify_pkce(code_verifier: &str, stored_challenge: &str) -> bool {
     computed == stored_challenge
 }
 
+/// Build a token response with Cache-Control: no-store per OAuth 2.1 §5.1.
+fn token_response(resp: TokenResponse) -> Response {
+    (
+        [
+            (axum::http::header::CACHE_CONTROL, "no-store"),
+            (axum::http::header::PRAGMA, "no-cache"),
+        ],
+        Json(resp),
+    )
+        .into_response()
+}
+
 fn oauth_error(status: StatusCode, error: &str, description: &str) -> Response {
     (
         status,
@@ -322,6 +335,15 @@ pub async fn oauth_register(
         );
     }
     for uri in &req.redirect_uris {
+        // OAuth 2.x: redirect_uris must not contain a fragment component
+        if uri.contains('#') {
+            trace!(ip = %ip, uri = %uri, "Registration rejected: redirect_uri contains fragment");
+            return oauth_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_client_metadata",
+                &format!("redirect_uri must not contain a fragment (#): {uri}"),
+            );
+        }
         if !uri.starts_with("http://") && !uri.starts_with("https://") {
             trace!(ip = %ip, uri = %uri, "Registration rejected: invalid URI scheme");
             return oauth_error(
@@ -544,6 +566,23 @@ pub async fn oauth_authorize_get(
 
     let scope = params.scope.unwrap_or_default();
 
+    // Check pending authorization cap before allocating resources
+    {
+        let pending_map = state.pending_authorizations.lock().await;
+        if pending_map.len() >= MAX_PENDING_AUTHORIZATIONS {
+            warn!(ip = %ip, limit = MAX_PENDING_AUTHORIZATIONS, "Authorization request rejected: pending authorization limit reached");
+            let url = build_redirect_url(
+                &redirect_uri,
+                &[
+                    ("error", "server_error"),
+                    ("error_description", "too many pending authorization requests"),
+                    ("state", &state_param),
+                ],
+            );
+            return Redirect::to(&url).into_response();
+        }
+    }
+
     // Generate a nonce to tie the consent form POST back to this request
     let nonce = generate_random_hex(32);
 
@@ -721,6 +760,7 @@ pub struct TokenRequest {
     // refresh_token fields
     #[serde(default)]
     refresh_token: Option<String>,
+    #[allow(dead_code)] // accepted per spec but intentionally ignored to prevent scope escalation
     #[serde(default)]
     scope: Option<String>,
     #[allow(dead_code)]
@@ -892,14 +932,13 @@ async fn handle_authorization_code(state: &OAuthState, ip: &str, req: TokenReque
 
     debug!(ip = %ip, client_id = %client_id, "Issued access token via authorization_code grant");
 
-    Json(TokenResponse {
+    token_response(TokenResponse {
         access_token,
         token_type: "Bearer",
         expires_in: ACCESS_TOKEN_TTL.as_secs(),
         refresh_token: Some(refresh_token),
         scope: code_info.scope,
     })
-    .into_response()
 }
 
 async fn handle_refresh_token(state: &OAuthState, ip: &str, req: TokenRequest) -> Response {
@@ -978,10 +1017,9 @@ async fn handle_refresh_token(state: &OAuthState, ip: &str, req: TokenRequest) -
     }
 
     let old_access_token = refresh_info.access_token.clone();
-    let scope = req
-        .scope
-        .clone()
-        .unwrap_or_else(|| refresh_info.scope.clone());
+    // Always use the originally granted scope — ignore req.scope to prevent
+    // scope escalation (OAuth 2.1: refresh must not exceed original grant).
+    let scope = refresh_info.scope.clone();
 
     // Mark old refresh token as superseded (don't delete — grace period)
     refresh_tokens
@@ -1030,14 +1068,13 @@ async fn handle_refresh_token(state: &OAuthState, ip: &str, req: TokenRequest) -
 
     debug!(ip = %ip, client_id = %client_id, "Issued access token via refresh_token grant");
 
-    Json(TokenResponse {
+    token_response(TokenResponse {
         access_token: new_access,
         token_type: "Bearer",
         expires_in: ACCESS_TOKEN_TTL.as_secs(),
         refresh_token: Some(new_refresh),
         scope,
     })
-    .into_response()
 }
 
 // ---------------------------------------------------------------------------

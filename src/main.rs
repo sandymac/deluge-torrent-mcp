@@ -406,14 +406,15 @@ async fn main() -> anyhow::Result<()> {
                     },
                 );
 
-                // Protected MCP routes
+                // Protected MCP routes — CORS permissive only on /mcp
                 let mcp_router = Router::new()
                     .nest_service("/mcp", mcp_service)
-                    .layer(auth_middleware);
+                    .layer(auth_middleware)
+                    .layer(CorsLayer::permissive());
 
+                // OAuth endpoints get no CORS (browser-to-browser calls are not needed)
                 oauth_router
                     .merge(mcp_router)
-                    .layer(CorsLayer::permissive())
                     .layer(TraceLayer::new_for_http())
             } else {
                 // --- Static Bearer token mode (existing behavior) ---
