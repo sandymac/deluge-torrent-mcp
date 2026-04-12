@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::extract::{Form, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::Json;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -26,7 +26,7 @@ use rand::Rng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
-use tracing::debug;
+use tracing::{debug, trace, warn};
 
 const CODE_TTL: Duration = Duration::from_secs(10 * 60);
 const ACCESS_TOKEN_TTL: Duration = Duration::from_secs(60 * 60);
@@ -120,7 +120,9 @@ impl OAuthState {
 
     pub async fn validate_token(&self, token: &str) -> bool {
         let tokens = self.access_tokens.lock().await;
-        matches!(tokens.get(token), Some(info) if info.expires_at > Instant::now())
+        let valid = matches!(tokens.get(token), Some(info) if info.expires_at > Instant::now());
+        trace!(valid, "Bearer token validation");
+        valid
     }
 
     pub fn spawn_cleanup_task(self: &Arc<Self>) {
@@ -130,31 +132,51 @@ impl OAuthState {
             loop {
                 interval.tick().await;
                 let now = Instant::now();
-                state.codes.lock().await.retain(|_, v| v.expires_at > now);
-                state
-                    .access_tokens
-                    .lock()
-                    .await
-                    .retain(|_, v| v.expires_at > now);
+
+                let mut n = 0usize;
+                state.codes.lock().await.retain(|_, v| {
+                    if v.expires_at > now { true } else { n += 1; false }
+                });
+                if n > 0 { debug!(count = n, "Swept expired authorization codes"); }
+
+                n = 0;
+                state.access_tokens.lock().await.retain(|_, v| {
+                    if v.expires_at > now { true } else { n += 1; false }
+                });
+                if n > 0 { debug!(count = n, "Swept expired access tokens"); }
+
+                n = 0;
                 state.refresh_tokens.lock().await.retain(|_, v| {
                     if v.expires_at <= now {
+                        n += 1;
                         return false;
                     }
                     if let Some(superseded) = v.superseded_at {
-                        return now.duration_since(superseded) < REFRESH_GRACE_PERIOD;
+                        if now.duration_since(superseded) >= REFRESH_GRACE_PERIOD {
+                            n += 1;
+                            return false;
+                        }
                     }
                     true
                 });
-                state
-                    .pending_authorizations
-                    .lock()
-                    .await
-                    .retain(|_, v| v.expires_at > now);
-                // Sweep clients that never completed authorization
-                state.clients.lock().await.retain(|_, v| {
-                    v.authorized
-                        || now.duration_since(v.created_at) < UNAUTHED_CLIENT_TTL
+                if n > 0 { debug!(count = n, "Swept expired/superseded refresh tokens"); }
+
+                n = 0;
+                state.pending_authorizations.lock().await.retain(|_, v| {
+                    if v.expires_at > now { true } else { n += 1; false }
                 });
+                if n > 0 { debug!(count = n, "Swept expired pending authorizations"); }
+
+                n = 0;
+                state.clients.lock().await.retain(|_, v| {
+                    if v.authorized || now.duration_since(v.created_at) < UNAUTHED_CLIENT_TTL {
+                        true
+                    } else {
+                        n += 1;
+                        false
+                    }
+                });
+                if n > 0 { debug!(count = n, "Swept unauthorized expired client registrations"); }
             }
         });
     }
@@ -219,7 +241,9 @@ fn is_localhost_uri(uri: &str) -> bool {
 
 pub async fn protected_resource_metadata(
     State(state): State<Arc<OAuthState>>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
+    trace!(ip = %client_ip(&headers), "GET /.well-known/oauth-protected-resource");
     Json(serde_json::json!({
         "resource": state.resource,
         "authorization_servers": [&state.issuer],
@@ -232,7 +256,11 @@ pub async fn protected_resource_metadata(
 // GET /.well-known/oauth-authorization-server  (RFC 8414)
 // ---------------------------------------------------------------------------
 
-pub async fn oauth_metadata(State(state): State<Arc<OAuthState>>) -> impl IntoResponse {
+pub async fn oauth_metadata(
+    State(state): State<Arc<OAuthState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    trace!(ip = %client_ip(&headers), "GET /.well-known/oauth-authorization-server");
     Json(serde_json::json!({
         "issuer": state.issuer,
         "authorization_endpoint": format!("{}/authorize", state.issuer),
@@ -279,10 +307,14 @@ pub struct RegisterResponse {
 
 pub async fn oauth_register(
     State(state): State<Arc<OAuthState>>,
+    headers: HeaderMap,
     Json(req): Json<RegisterRequest>,
 ) -> Response {
+    let ip = client_ip(&headers);
+    trace!(ip = %ip, client_name = ?req.client_name, "POST /register");
     // Validate redirect_uris
     if req.redirect_uris.is_empty() {
+        trace!(ip = %ip, "Registration rejected: empty redirect_uris");
         return oauth_error(
             StatusCode::BAD_REQUEST,
             "invalid_client_metadata",
@@ -291,6 +323,7 @@ pub async fn oauth_register(
     }
     for uri in &req.redirect_uris {
         if !uri.starts_with("http://") && !uri.starts_with("https://") {
+            trace!(ip = %ip, uri = %uri, "Registration rejected: invalid URI scheme");
             return oauth_error(
                 StatusCode::BAD_REQUEST,
                 "invalid_client_metadata",
@@ -299,6 +332,7 @@ pub async fn oauth_register(
         }
         // Enforce https for non-localhost URIs
         if uri.starts_with("http://") && !is_localhost_uri(uri) {
+            trace!(ip = %ip, uri = %uri, "Registration rejected: non-localhost http URI");
             return oauth_error(
                 StatusCode::BAD_REQUEST,
                 "invalid_client_metadata",
@@ -312,6 +346,7 @@ pub async fn oauth_register(
     // Only public clients (token_endpoint_auth_method = "none")
     if let Some(ref method) = req.token_endpoint_auth_method {
         if method != "none" {
+            trace!(ip = %ip, method = %method, "Registration rejected: unsupported auth method");
             return oauth_error(
                 StatusCode::BAD_REQUEST,
                 "invalid_client_metadata",
@@ -337,6 +372,7 @@ pub async fn oauth_register(
 
     let mut clients = state.clients.lock().await;
     if clients.len() >= MAX_CLIENTS {
+        warn!(ip = %ip, limit = MAX_CLIENTS, "Registration rejected: client limit reached");
         return oauth_error(
             StatusCode::BAD_REQUEST,
             "invalid_client_metadata",
@@ -346,7 +382,7 @@ pub async fn oauth_register(
     clients.insert(client_id.clone(), info);
     drop(clients);
 
-    debug!(client_id = %client_id, "Registered OAuth client");
+    debug!(ip = %ip, client_id = %client_id, client_name = ?req.client_name, "Registered OAuth client");
 
     let resp = RegisterResponse {
         client_id,
@@ -381,13 +417,16 @@ pub struct AuthorizeParams {
 
 pub async fn oauth_authorize_get(
     State(state): State<Arc<OAuthState>>,
+    headers: HeaderMap,
     Query(params): Query<AuthorizeParams>,
 ) -> Response {
+    let ip = client_ip(&headers);
     // --- Validate client_id and redirect_uri BEFORE redirecting ---
 
     let client_id = match params.client_id {
         Some(ref id) if !id.is_empty() => id.clone(),
         _ => {
+            trace!(ip = %ip, "Authorization request missing client_id");
             return oauth_error(
                 StatusCode::BAD_REQUEST,
                 "invalid_request",
@@ -399,6 +438,7 @@ pub async fn oauth_authorize_get(
     let redirect_uri = match params.redirect_uri {
         Some(ref uri) if !uri.is_empty() => uri.clone(),
         _ => {
+            trace!(ip = %ip, client_id = %client_id, "Authorization request missing redirect_uri");
             return oauth_error(
                 StatusCode::BAD_REQUEST,
                 "invalid_request",
@@ -412,6 +452,7 @@ pub async fn oauth_authorize_get(
     let client = match clients.get(&client_id) {
         Some(c) => c,
         None => {
+            debug!(ip = %ip, client_id = %client_id, "Authorization request for unknown client");
             return oauth_error(
                 StatusCode::BAD_REQUEST,
                 "invalid_request",
@@ -422,6 +463,12 @@ pub async fn oauth_authorize_get(
 
     // Exact match on redirect_uri (OAuth 2.1 requirement)
     if !client.redirect_uris.iter().any(|u| u == &redirect_uri) {
+        debug!(
+            ip = %ip,
+            client_id = %client_id,
+            redirect_uri = %redirect_uri,
+            "Authorization request redirect_uri not in registered list"
+        );
         return oauth_error(
             StatusCode::BAD_REQUEST,
             "invalid_request",
@@ -439,7 +486,13 @@ pub async fn oauth_authorize_get(
     // Validate response_type
     match params.response_type.as_deref() {
         Some("code") => {}
-        _ => {
+        other => {
+            debug!(
+                ip = %ip,
+                client_id = %client_id,
+                response_type = ?other,
+                "Authorization request unsupported response_type"
+            );
             let url = build_redirect_url(
                 &redirect_uri,
                 &[
@@ -456,6 +509,7 @@ pub async fn oauth_authorize_get(
     let code_challenge = match params.code_challenge {
         Some(ref c) if !c.is_empty() => c.clone(),
         _ => {
+            debug!(ip = %ip, client_id = %client_id, "Authorization request missing code_challenge");
             let url = build_redirect_url(
                 &redirect_uri,
                 &[
@@ -469,7 +523,13 @@ pub async fn oauth_authorize_get(
     };
     match params.code_challenge_method.as_deref() {
         Some("S256") => {}
-        _ => {
+        other => {
+            debug!(
+                ip = %ip,
+                client_id = %client_id,
+                method = ?other,
+                "Authorization request unsupported code_challenge_method"
+            );
             let url = build_redirect_url(
                 &redirect_uri,
                 &[
@@ -488,7 +548,7 @@ pub async fn oauth_authorize_get(
     let nonce = generate_random_hex(32);
 
     let pending = PendingAuth {
-        client_id,
+        client_id: client_id.clone(),
         redirect_uri,
         code_challenge,
         scope,
@@ -500,6 +560,13 @@ pub async fn oauth_authorize_get(
         .lock()
         .await
         .insert(nonce.clone(), pending);
+
+    debug!(
+        ip = %ip,
+        client_id = %client_id,
+        client_name = ?client_name,
+        "Showing consent page"
+    );
 
     // Render the consent page
     let display_name = client_name.as_deref().unwrap_or("An MCP client");
@@ -552,8 +619,10 @@ pub struct AuthorizeConsent {
 
 pub async fn oauth_authorize_post(
     State(state): State<Arc<OAuthState>>,
+    headers: HeaderMap,
     Form(consent): Form<AuthorizeConsent>,
 ) -> Response {
+    let ip = client_ip(&headers);
     // Look up and consume the pending authorization
     let pending = match state
         .pending_authorizations
@@ -563,6 +632,7 @@ pub async fn oauth_authorize_post(
     {
         Some(p) => p,
         None => {
+            warn!(ip = %ip, "Consent POST with invalid or missing nonce");
             return oauth_error(
                 StatusCode::BAD_REQUEST,
                 "invalid_request",
@@ -572,6 +642,7 @@ pub async fn oauth_authorize_post(
     };
 
     if pending.expires_at <= Instant::now() {
+        warn!(ip = %ip, client_id = %pending.client_id, "Consent session expired");
         return oauth_error(
             StatusCode::BAD_REQUEST,
             "invalid_request",
@@ -581,6 +652,7 @@ pub async fn oauth_authorize_post(
 
     // If the user denied, redirect with error
     if consent.action != "allow" {
+        debug!(ip = %ip, client_id = %pending.client_id, "User denied authorization");
         let url = build_redirect_url(
             &pending.redirect_uri,
             &[
@@ -596,6 +668,7 @@ pub async fn oauth_authorize_post(
     if let Some(ref expected) = state.admin_secret {
         let provided = consent.password.as_deref().unwrap_or("");
         if provided != expected {
+            warn!(ip = %ip, client_id = %pending.client_id, "Consent rejected: incorrect access code");
             let url = build_redirect_url(
                 &pending.redirect_uri,
                 &[
@@ -612,13 +685,15 @@ pub async fn oauth_authorize_post(
     let code = generate_random_hex(32);
 
     let code_info = CodeInfo {
-        client_id: pending.client_id,
+        client_id: pending.client_id.clone(),
         redirect_uri: pending.redirect_uri.clone(),
         code_challenge: pending.code_challenge,
         scope: pending.scope,
         expires_at: Instant::now() + CODE_TTL,
     };
     state.codes.lock().await.insert(code.clone(), code_info);
+
+    debug!(ip = %ip, client_id = %pending.client_id, "Authorization code issued");
 
     let url = build_redirect_url(
         &pending.redirect_uri,
@@ -665,48 +740,59 @@ struct TokenResponse {
 
 pub async fn oauth_token(
     State(state): State<Arc<OAuthState>>,
+    headers: HeaderMap,
     Form(req): Form<TokenRequest>,
 ) -> Response {
+    let ip = client_ip(&headers);
     match req.grant_type.as_str() {
-        "authorization_code" => handle_authorization_code(&state, req).await,
-        "refresh_token" => handle_refresh_token(&state, req).await,
-        _ => oauth_error(
-            StatusCode::BAD_REQUEST,
-            "unsupported_grant_type",
-            &format!("unsupported grant_type: {}", req.grant_type),
-        ),
+        "authorization_code" => handle_authorization_code(&state, &ip, req).await,
+        "refresh_token" => handle_refresh_token(&state, &ip, req).await,
+        other => {
+            debug!(ip = %ip, grant_type = %other, "Token request with unsupported grant_type");
+            oauth_error(
+                StatusCode::BAD_REQUEST,
+                "unsupported_grant_type",
+                &format!("unsupported grant_type: {other}"),
+            )
+        }
     }
 }
 
-async fn handle_authorization_code(state: &OAuthState, req: TokenRequest) -> Response {
+async fn handle_authorization_code(state: &OAuthState, ip: &str, req: TokenRequest) -> Response {
     let code_str = match req.code {
         Some(ref c) if !c.is_empty() => c.clone(),
-        _ => return oauth_error(StatusCode::BAD_REQUEST, "invalid_request", "missing code"),
+        _ => {
+            trace!(ip = %ip, "Token request (authorization_code) missing code");
+            return oauth_error(StatusCode::BAD_REQUEST, "invalid_request", "missing code");
+        }
     };
     let client_id = match req.client_id {
         Some(ref c) if !c.is_empty() => c.clone(),
         _ => {
-            return oauth_error(StatusCode::BAD_REQUEST, "invalid_request", "missing client_id")
+            trace!(ip = %ip, "Token request (authorization_code) missing client_id");
+            return oauth_error(StatusCode::BAD_REQUEST, "invalid_request", "missing client_id");
         }
     };
     let redirect_uri = match req.redirect_uri {
         Some(ref u) if !u.is_empty() => u.clone(),
         _ => {
+            trace!(ip = %ip, client_id = %client_id, "Token request (authorization_code) missing redirect_uri");
             return oauth_error(
                 StatusCode::BAD_REQUEST,
                 "invalid_request",
                 "missing redirect_uri",
-            )
+            );
         }
     };
     let code_verifier = match req.code_verifier {
         Some(ref v) if !v.is_empty() => v.clone(),
         _ => {
+            trace!(ip = %ip, client_id = %client_id, "Token request (authorization_code) missing code_verifier");
             return oauth_error(
                 StatusCode::BAD_REQUEST,
                 "invalid_request",
                 "missing code_verifier",
-            )
+            );
         }
     };
 
@@ -714,15 +800,17 @@ async fn handle_authorization_code(state: &OAuthState, req: TokenRequest) -> Res
     let code_info = match state.codes.lock().await.remove(&code_str) {
         Some(info) => info,
         None => {
+            debug!(ip = %ip, client_id = %client_id, "Token request: invalid or already-used authorization code");
             return oauth_error(
                 StatusCode::BAD_REQUEST,
                 "invalid_grant",
                 "invalid or already-used authorization code",
-            )
+            );
         }
     };
 
     if code_info.expires_at <= Instant::now() {
+        debug!(ip = %ip, client_id = %client_id, "Token request: authorization code expired");
         return oauth_error(
             StatusCode::BAD_REQUEST,
             "invalid_grant",
@@ -731,6 +819,12 @@ async fn handle_authorization_code(state: &OAuthState, req: TokenRequest) -> Res
     }
 
     if code_info.client_id != client_id {
+        warn!(
+            ip = %ip,
+            expected = %code_info.client_id,
+            got = %client_id,
+            "Token request: client_id mismatch"
+        );
         return oauth_error(
             StatusCode::BAD_REQUEST,
             "invalid_grant",
@@ -739,6 +833,7 @@ async fn handle_authorization_code(state: &OAuthState, req: TokenRequest) -> Res
     }
 
     if code_info.redirect_uri != redirect_uri {
+        warn!(ip = %ip, client_id = %client_id, "Token request: redirect_uri mismatch");
         return oauth_error(
             StatusCode::BAD_REQUEST,
             "invalid_grant",
@@ -747,6 +842,7 @@ async fn handle_authorization_code(state: &OAuthState, req: TokenRequest) -> Res
     }
 
     if !verify_pkce(&code_verifier, &code_info.code_challenge) {
+        warn!(ip = %ip, client_id = %client_id, "Token request: PKCE verification failed");
         return oauth_error(
             StatusCode::BAD_REQUEST,
             "invalid_grant",
@@ -760,6 +856,7 @@ async fn handle_authorization_code(state: &OAuthState, req: TokenRequest) -> Res
         match clients.get_mut(&client_id) {
             Some(client) => client.authorized = true,
             None => {
+                warn!(ip = %ip, client_id = %client_id, "Token request: client has been revoked");
                 return oauth_error(
                     StatusCode::BAD_REQUEST,
                     "invalid_grant",
@@ -785,7 +882,7 @@ async fn handle_authorization_code(state: &OAuthState, req: TokenRequest) -> Res
     state.refresh_tokens.lock().await.insert(
         refresh_token.clone(),
         RefreshInfo {
-            client_id,
+            client_id: client_id.clone(),
             scope: code_info.scope.clone(),
             access_token: access_token.clone(),
             expires_at: Instant::now() + REFRESH_TOKEN_TTL,
@@ -793,7 +890,7 @@ async fn handle_authorization_code(state: &OAuthState, req: TokenRequest) -> Res
         },
     );
 
-    debug!("Issued access token via authorization_code grant");
+    debug!(ip = %ip, client_id = %client_id, "Issued access token via authorization_code grant");
 
     Json(TokenResponse {
         access_token,
@@ -805,21 +902,23 @@ async fn handle_authorization_code(state: &OAuthState, req: TokenRequest) -> Res
     .into_response()
 }
 
-async fn handle_refresh_token(state: &OAuthState, req: TokenRequest) -> Response {
+async fn handle_refresh_token(state: &OAuthState, ip: &str, req: TokenRequest) -> Response {
     let refresh_token_str = match req.refresh_token {
         Some(ref t) if !t.is_empty() => t.clone(),
         _ => {
+            trace!(ip = %ip, "Token request (refresh_token) missing refresh_token");
             return oauth_error(
                 StatusCode::BAD_REQUEST,
                 "invalid_request",
                 "missing refresh_token",
-            )
+            );
         }
     };
     let client_id = match req.client_id {
         Some(ref c) if !c.is_empty() => c.clone(),
         _ => {
-            return oauth_error(StatusCode::BAD_REQUEST, "invalid_request", "missing client_id")
+            trace!(ip = %ip, "Token request (refresh_token) missing client_id");
+            return oauth_error(StatusCode::BAD_REQUEST, "invalid_request", "missing client_id");
         }
     };
 
@@ -830,15 +929,17 @@ async fn handle_refresh_token(state: &OAuthState, req: TokenRequest) -> Response
     let refresh_info = match refresh_tokens.get(&refresh_token_str) {
         Some(info) => info,
         None => {
+            debug!(ip = %ip, client_id = %client_id, "Refresh request: invalid or unknown refresh token");
             return oauth_error(
                 StatusCode::BAD_REQUEST,
                 "invalid_grant",
                 "invalid or already-used refresh token",
-            )
+            );
         }
     };
 
     if refresh_info.expires_at <= now {
+        debug!(ip = %ip, client_id = %client_id, "Refresh request: refresh token expired");
         refresh_tokens.remove(&refresh_token_str);
         return oauth_error(
             StatusCode::BAD_REQUEST,
@@ -850,6 +951,7 @@ async fn handle_refresh_token(state: &OAuthState, req: TokenRequest) -> Response
     // Check if this token has been superseded (rotated out)
     if let Some(superseded) = refresh_info.superseded_at {
         if now.duration_since(superseded) >= REFRESH_GRACE_PERIOD {
+            warn!(ip = %ip, client_id = %client_id, "Refresh request: superseded token past grace period");
             refresh_tokens.remove(&refresh_token_str);
             return oauth_error(
                 StatusCode::BAD_REQUEST,
@@ -858,9 +960,16 @@ async fn handle_refresh_token(state: &OAuthState, req: TokenRequest) -> Response
             );
         }
         // Within grace period — allow reuse (network retry scenario)
+        debug!(ip = %ip, client_id = %client_id, "Refresh request: reusing superseded token within grace period");
     }
 
     if refresh_info.client_id != client_id {
+        warn!(
+            ip = %ip,
+            expected = %refresh_info.client_id,
+            got = %client_id,
+            "Refresh request: client_id mismatch"
+        );
         return oauth_error(
             StatusCode::BAD_REQUEST,
             "invalid_grant",
@@ -884,6 +993,7 @@ async fn handle_refresh_token(state: &OAuthState, req: TokenRequest) -> Response
 
     // Verify client still exists in registry
     if !state.clients.lock().await.contains_key(&client_id) {
+        warn!(ip = %ip, client_id = %client_id, "Refresh request: client has been revoked");
         return oauth_error(
             StatusCode::BAD_REQUEST,
             "invalid_grant",
@@ -910,7 +1020,7 @@ async fn handle_refresh_token(state: &OAuthState, req: TokenRequest) -> Response
     state.refresh_tokens.lock().await.insert(
         new_refresh.clone(),
         RefreshInfo {
-            client_id,
+            client_id: client_id.clone(),
             scope: scope.clone(),
             access_token: new_access.clone(),
             expires_at: Instant::now() + REFRESH_TOKEN_TTL,
@@ -918,7 +1028,7 @@ async fn handle_refresh_token(state: &OAuthState, req: TokenRequest) -> Response
         },
     );
 
-    debug!("Issued access token via refresh_token grant");
+    debug!(ip = %ip, client_id = %client_id, "Issued access token via refresh_token grant");
 
     Json(TokenResponse {
         access_token: new_access,
@@ -933,6 +1043,30 @@ async fn handle_refresh_token(state: &OAuthState, req: TokenRequest) -> Response
 // ---------------------------------------------------------------------------
 // HTML helpers
 // ---------------------------------------------------------------------------
+
+/// Extract the best-available client IP from request headers.
+///
+/// Checks `X-Real-IP` first (set by nginx `proxy_set_header X-Real-IP $remote_addr`),
+/// then the first address in `X-Forwarded-For`, then falls back to `"unknown"`.
+fn client_ip(headers: &HeaderMap) -> String {
+    // X-Real-IP — single trusted IP set by nginx
+    if let Some(val) = headers.get("x-real-ip").and_then(|v| v.to_str().ok()) {
+        let ip = val.trim().to_string();
+        if !ip.is_empty() {
+            return ip;
+        }
+    }
+    // X-Forwarded-For — may be a comma-separated list; take the first (client) entry
+    if let Some(val) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
+        if let Some(first) = val.split(',').next() {
+            let ip = first.trim().to_string();
+            if !ip.is_empty() {
+                return ip;
+            }
+        }
+    }
+    "unknown".to_string()
+}
 
 /// Minimal HTML entity escaping for safe interpolation into HTML content.
 fn html_escape(s: &str) -> String {
