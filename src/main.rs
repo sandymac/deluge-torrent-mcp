@@ -11,6 +11,7 @@ use serde_json;
 use tracing::{info, warn};
 
 mod deluge;
+mod oauth;
 mod rencode;
 mod tools;
 
@@ -85,6 +86,13 @@ struct Cli {
     /// Bearer token required for HTTP transport requests (recommended)
     #[arg(long, env = "DELUGE_API_TOKEN")]
     api_token: Option<String>,
+
+    /// Base URL of this server as the OAuth 2.1 issuer (enables OAuth mode).
+    /// Example: http://localhost:8080  or  https://mcp.example.com
+    /// When set, OAuth 2.1 endpoints are activated and MCP requests require OAuth tokens.
+    /// Can be combined with --api-token to also accept static tokens as a fallback.
+    #[arg(long, env = "DELUGE_OAUTH_ISSUER")]
+    oauth_issuer: Option<String>,
 
     /// List all tools with their default enabled/disabled state and exit
     #[arg(long, default_value_t = false)]
@@ -292,6 +300,7 @@ async fn main() -> anyhow::Result<()> {
             use axum::http::StatusCode;
             use axum::middleware::{self, Next};
             use axum::response::Response;
+            use axum::routing::{get, post};
             use rmcp::transport::streamable_http_server::{
                 StreamableHttpService, StreamableHttpServerConfig,
             };
@@ -299,9 +308,9 @@ async fn main() -> anyhow::Result<()> {
             use tower_http::cors::CorsLayer;
             use tower_http::trace::TraceLayer;
 
-            if cli.api_token.is_none() {
+            if cli.api_token.is_none() && cli.oauth_issuer.is_none() {
                 tracing::warn!(
-                    "HTTP transport started without --api-token. \
+                    "HTTP transport started without --api-token or --oauth-issuer. \
                      Anyone who can reach this port can control Deluge."
                 );
             }
@@ -319,38 +328,127 @@ async fn main() -> anyhow::Result<()> {
                 )
             };
 
-            // Bearer token auth middleware
-            let api_token = cli.api_token.clone();
-            let auth_middleware = middleware::from_fn_with_state(
-                api_token,
-                |State(token): State<Option<String>>,
-                 request: Request,
-                 next: Next| async move {
-                    if let Some(expected) = token {
-                        let authorized = request
+            let app = if let Some(ref oauth_issuer) = cli.oauth_issuer {
+                // --- OAuth 2.1 mode ---
+                let issuer = oauth_issuer.trim_end_matches('/').to_string();
+                let resource = format!("{issuer}/mcp");
+
+                let oauth_state = Arc::new(oauth::OAuthState::new(
+                    issuer.clone(),
+                    resource,
+                    cli.api_token.clone(),
+                ));
+                oauth_state.spawn_cleanup_task();
+
+                info!(
+                    issuer = %issuer,
+                    "OAuth 2.1 enabled. Metadata: {issuer}/.well-known/oauth-authorization-server"
+                );
+
+                // Unprotected OAuth routes
+                let oauth_router = Router::new()
+                    .route(
+                        "/.well-known/oauth-protected-resource",
+                        get(oauth::protected_resource_metadata),
+                    )
+                    .route(
+                        "/.well-known/oauth-authorization-server",
+                        get(oauth::oauth_metadata),
+                    )
+                    .route("/register", post(oauth::oauth_register))
+                    .route(
+                        "/authorize",
+                        get(oauth::oauth_authorize_get).post(oauth::oauth_authorize_post),
+                    )
+                    .route("/token", post(oauth::oauth_token))
+                    .with_state(oauth_state.clone());
+
+                // OAuth-aware auth middleware
+                let api_token = cli.api_token.clone();
+                let auth_middleware = middleware::from_fn_with_state(
+                    (oauth_state.clone(), api_token),
+                    |State((oauth_state, api_token)): State<(Arc<oauth::OAuthState>, Option<String>)>,
+                     request: Request,
+                     next: Next| async move {
+                        let bearer = request
                             .headers()
                             .get(axum::http::header::AUTHORIZATION)
                             .and_then(|v| v.to_str().ok())
-                            .and_then(|v| v.strip_prefix("Bearer "))
-                            .map(|t| t == expected)
-                            .unwrap_or(false);
+                            .and_then(|v| v.strip_prefix("Bearer "));
+
+                        let authorized = match bearer {
+                            Some(token) => {
+                                // Check static api_token first (fast path)
+                                if api_token.as_ref().is_some_and(|t| t == token) {
+                                    true
+                                } else {
+                                    oauth_state.validate_token(token).await
+                                }
+                            }
+                            None => false,
+                        };
 
                         if !authorized {
+                            let resource_metadata_url = format!(
+                                "{}/.well-known/oauth-protected-resource",
+                                oauth_state.issuer,
+                            );
                             return Response::builder()
                                 .status(StatusCode::UNAUTHORIZED)
+                                .header(
+                                    "WWW-Authenticate",
+                                    format!("Bearer resource_metadata=\"{resource_metadata_url}\""),
+                                )
                                 .body(axum::body::Body::from("Unauthorized"))
                                 .unwrap();
                         }
-                    }
-                    next.run(request).await
-                },
-            );
+                        next.run(request).await
+                    },
+                );
 
-            let app = Router::new()
-                .nest_service("/mcp", mcp_service)
-                .layer(auth_middleware)
-                .layer(CorsLayer::permissive())
-                .layer(TraceLayer::new_for_http());
+                // Protected MCP routes
+                let mcp_router = Router::new()
+                    .nest_service("/mcp", mcp_service)
+                    .layer(auth_middleware);
+
+                oauth_router
+                    .merge(mcp_router)
+                    .layer(CorsLayer::permissive())
+                    .layer(TraceLayer::new_for_http())
+            } else {
+                // --- Static Bearer token mode (existing behavior) ---
+                let api_token = cli.api_token.clone();
+                let auth_middleware = middleware::from_fn_with_state(
+                    api_token,
+                    |State(token): State<Option<String>>,
+                     request: Request,
+                     next: Next| async move {
+                        if let Some(expected) = token {
+                            let authorized = request
+                                .headers()
+                                .get(axum::http::header::AUTHORIZATION)
+                                .and_then(|v| v.to_str().ok())
+                                .and_then(|v| v.strip_prefix("Bearer "))
+                                .map(|t| t == expected)
+                                .unwrap_or(false);
+
+                            if !authorized {
+                                return Response::builder()
+                                    .status(StatusCode::UNAUTHORIZED)
+                                    .body(axum::body::Body::from("Unauthorized"))
+                                    .unwrap();
+                            }
+                        }
+                        next.run(request).await
+                    },
+                );
+
+                Router::new()
+                    .nest_service("/mcp", mcp_service)
+                    .layer(auth_middleware)
+                    .layer(CorsLayer::permissive())
+                    .layer(TraceLayer::new_for_http())
+            };
 
             let listener = tokio::net::TcpListener::bind(&cli.http_bind).await?;
             info!("Listening on http://{}/mcp", cli.http_bind);
