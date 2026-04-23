@@ -30,6 +30,14 @@ const ALL_TOOLS: &[&str] = &[
     "deluge_rename_files",
     "deluge_force_recheck",
     "deluge_remove_torrent",
+    "deluge_list_labels",
+    "deluge_create_label",
+    "deluge_delete_label",
+    "deluge_set_torrent_label",
+    "deluge_pause_label",
+    "deluge_resume_label",
+    "deluge_get_label_options",
+    "deluge_set_label_options",
 ];
 
 /// Tools that are disabled unless explicitly enabled via --enable.
@@ -39,6 +47,22 @@ const DEFAULT_DISABLED: &[&str] = &[
     "deluge_rename_files",
     "deluge_force_recheck",
     "deluge_remove_torrent",
+    "deluge_create_label",
+    "deluge_delete_label",
+    "deluge_set_label_options",
+];
+
+/// Tools that depend on the Deluge Label plugin being enabled on the daemon.
+/// Hidden from `tools/list` whenever the plugin is inactive, regardless of CLI flags.
+const PLUGIN_GATED_LABEL_TOOLS: &[&str] = &[
+    "deluge_list_labels",
+    "deluge_create_label",
+    "deluge_delete_label",
+    "deluge_set_torrent_label",
+    "deluge_pause_label",
+    "deluge_resume_label",
+    "deluge_get_label_options",
+    "deluge_set_label_options",
 ];
 
 #[derive(Parser, Debug)]
@@ -211,15 +235,21 @@ async fn main() -> anyhow::Result<()> {
 
     // Handle --list-tools before clap parsing so credentials aren't required.
     if std::env::args().any(|a| a == "--list-tools") {
-        eprintln!("{:<22} {:<10} {}", "TOOL", "STATUS", "DEFAULT");
-        eprintln!("{}", "-".repeat(46));
+        eprintln!("{:<28} {:<10} {:<10} {}", "TOOL", "STATUS", "DEFAULT", "PLUGIN");
+        eprintln!("{}", "-".repeat(64));
         for &tool in ALL_TOOLS {
             let status = if enabled_tools.contains(tool) { "visible" } else { "hidden" };
             let default = if DEFAULT_DISABLED.contains(&tool) { "disabled" } else { "enabled" };
-            eprintln!("{:<22} {:<10} {}", tool, status, default);
+            let plugin = if PLUGIN_GATED_LABEL_TOOLS.contains(&tool) { "Label" } else { "-" };
+            eprintln!("{:<28} {:<10} {:<10} {}", tool, status, default, plugin);
         }
         eprintln!();
         eprintln!("Visible tools are reported to the MCP client. Hidden tools are not.");
+        eprintln!(
+            "Tools in the PLUGIN column require that Deluge plugin to be enabled on the \
+             daemon — they are hidden from tools/list whenever the plugin is inactive, \
+             and reappear automatically when it is re-enabled."
+        );
         return Ok(());
     }
 
@@ -257,6 +287,22 @@ async fn main() -> anyhow::Result<()> {
     .await?;
     info!(auth_level, "Authenticated with Deluge daemon");
 
+    // Probe whether the Label plugin is currently active. The plugin watcher
+    // (spawned per DelugeServer below) keeps this value live thereafter.
+    let initial_label_plugin_active =
+        tools::probe_label_plugin(&client).await.unwrap_or(false);
+    if initial_label_plugin_active {
+        info!("Deluge Label plugin is enabled — label tools are available");
+    } else {
+        info!(
+            "Deluge Label plugin is not enabled — label tools are hidden until the user enables it"
+        );
+    }
+    let plugin_gated_tools: HashSet<String> = PLUGIN_GATED_LABEL_TOOLS
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
     if cli.test_connection {
         use crate::rencode::Value;
 
@@ -289,7 +335,13 @@ async fn main() -> anyhow::Result<()> {
     match cli.transport {
         Transport::Stdio => {
             info!("Starting MCP server on stdio");
-            let server = tools::DelugeServer::new(client, enabled_tools);
+            let server = tools::DelugeServer::new(
+                client,
+                enabled_tools,
+                plugin_gated_tools,
+                initial_label_plugin_active,
+            );
+            server.spawn_plugin_watcher();
             let service = server.serve(rmcp::transport::stdio()).await?;
             service.waiting().await?;
         }
@@ -316,12 +368,24 @@ async fn main() -> anyhow::Result<()> {
 
             info!(bind = %cli.http_bind, "Starting MCP server on HTTP");
 
-            // Build the MCP service — factory creates a DelugeServer per session
+            // Build the MCP service — factory creates a DelugeServer per session.
+            // Each session spawns its own plugin watcher so it gets independent
+            // tools/list_changed delivery to its own peer.
             let mcp_service = {
                 let client = client.clone();
                 let enabled_tools = enabled_tools.clone();
+                let plugin_gated_tools = plugin_gated_tools.clone();
                 StreamableHttpService::new(
-                    move || Ok(tools::DelugeServer::new(client.clone(), enabled_tools.clone())),
+                    move || {
+                        let server = tools::DelugeServer::new(
+                            client.clone(),
+                            enabled_tools.clone(),
+                            plugin_gated_tools.clone(),
+                            initial_label_plugin_active,
+                        );
+                        server.spawn_plugin_watcher();
+                        Ok(server)
+                    },
                     Arc::new(LocalSessionManager::default()),
                     StreamableHttpServerConfig::default(),
                 )

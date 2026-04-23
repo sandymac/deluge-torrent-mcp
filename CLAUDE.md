@@ -2,9 +2,9 @@
 
 ## Project Overview
 
-An MCP server written in Rust that bridges AI assistants to a running Deluge torrent daemon (`deluged`). Built with the [Model Context Protocol Rust SDK](https://github.com/modelcontextprotocol/rust-sdk), it exposes 13 tools covering torrent management (add, remove, list, pause, resume, status), file operations (move storage, rename folders/files, force recheck), and server queries (free space, path size).
+An MCP server written in Rust that bridges AI assistants to a running Deluge torrent daemon (`deluged`). Built with the [Model Context Protocol Rust SDK](https://github.com/modelcontextprotocol/rust-sdk), it exposes 21 tools covering torrent management (add, remove, list, pause, resume, status), file operations (move storage, rename folders/files, force recheck), Label-plugin operations (list/create/delete labels, get/set per-label options, assign labels to torrents, pause/resume by label), and server queries (free space, path size).
 
-Supports both **stdio** (Claude Desktop) and **HTTP/SSE** (remote/agentic) transports. Includes tiered safety gates to guard against LLM hallucination, and configurable TLS certificate handling for Deluge's default self-signed certificates.
+Supports both **stdio** (Claude Desktop) and **HTTP/SSE** (remote/agentic) transports. Includes tiered safety gates to guard against LLM hallucination, and configurable TLS certificate handling for Deluge's default self-signed certificates. Tools that depend on Deluge plugins (currently the Label plugin) are dynamically shown or hidden based on whether the plugin is enabled on the daemon — toggling the plugin in any Deluge client is reflected in the MCP `tools/list` within seconds via Deluge's `PluginEnabledEvent` / `PluginDisabledEvent` push events.
 
 ## Tech Stack
 Rust for the code
@@ -66,24 +66,50 @@ Deluge exposes a custom binary RPC protocol over TCP (default port 58846). The d
 | `force_recheck` | `core.force_recheck` | Force a hash recheck of one or more torrents' files |
 | `get_free_space` | `core.get_free_space` | Get free disk space for a given path |
 | `get_path_size` | `core.get_path_size` | Get the size of a path on the server |
+| `list_labels` | `label.get_labels` | List all labels defined on the daemon (requires Label plugin) |
+| `create_label` | `label.add` | Create a new label on the daemon (requires Label plugin) |
+| `delete_label` | `label.remove` | Delete a label; assigned torrents become unlabeled (requires Label plugin) |
+| `set_torrent_label` | `label.set_torrent` | Assign a label to one or more torrents — empty string or `"No Label"` clears (requires Label plugin) |
+| `pause_label` | `core.get_torrents_status` + `core.pause_torrents` | Pause every torrent assigned the given label (requires Label plugin) |
+| `resume_label` | `core.get_torrents_status` + `core.resume_torrents` | Resume every torrent assigned the given label (requires Label plugin) |
+| `get_label_options` | `label.get_options` | Get a label's default options (speed caps, ratio handling, etc.) (requires Label plugin) |
+| `set_label_options` | `label.set_options` | Set a label's default options; applied to every torrent carrying the label (requires Label plugin) |
+
+`list_torrents` also accepts a `label` filter and, when the Label plugin is active, includes each torrent's `label` in the returned status fields.
 
 Torrents are identified by their **info hash** (40-character hex string / SHA-1).
 
 ### Safety Gates
 
-Tools have two default states. Five tools are **disabled by default** to guard against LLM hallucination:
+Tools have two default states. Eight tools are **disabled by default** to guard against LLM hallucination:
 
 | Tool | Default | Reason |
 |---|---|---|
 | `add_torrent`, `list_torrents`, `get_torrent_status`, `pause_torrent`, `resume_torrent`, `set_torrent_options`, `get_free_space`, `get_path_size` | enabled | Safe read/write operations |
+| `list_labels`, `get_label_options`, `set_torrent_label`, `pause_label`, `resume_label` | enabled (when Label plugin is active) | Read labels or apply/act on existing labels — non-destructive |
 | `move_storage`, `rename_folder`, `rename_files`, `force_recheck` | disabled | Modifies filesystem paths or interrupts downloads |
+| `create_label`, `delete_label`, `set_label_options` | disabled | Mutates label state — must require explicit operator opt-in |
 | `remove_torrent` | disabled | Can permanently delete downloaded data |
 
 Tools are enabled or disabled via `--enable-tool <PATTERN>` / `--disable-tool <PATTERN>`. Patterns are matched as case-sensitive substrings of tool names (minimum 3 characters). Both singular (`--enable-tool`) and plural (`--enable-tools`) forms are accepted. Flags are processed in CLI order — later flags override earlier ones.
 
-`--list-tools` prints all tools with their default state and exits without requiring credentials.
+`--list-tools` prints all tools with their current visibility, default state, and any plugin gating, and exits without requiring credentials.
 
-When a disabled tool is called, the server returns an error to the LLM with the exact `--enable-tool` flag needed to enable it.
+When a disabled tool is called, the server returns an error to the LLM. The hint distinguishes between CLI-disabled tools (suggests `--enable-tool=<name>`) and plugin-gated tools (suggests enabling the plugin in Deluge).
+
+### Label Plugin Gating
+
+Eight tools (`list_labels`, `create_label`, `delete_label`, `set_torrent_label`, `pause_label`, `resume_label`, `get_label_options`, `set_label_options`) require Deluge's built-in **Label** plugin to be enabled on the daemon. Visibility rule:
+
+> A label tool is visible to MCP clients **iff** (it is enabled — by default or by `--enable-tool`) **AND** (the Label plugin is currently active on the daemon).
+
+Plugin gating is absolute — `--enable-tool` cannot make a label tool visible if the plugin is inactive. The MCP server detects plugin state via:
+
+1. A one-time probe of `core.get_enabled_plugins` after authentication.
+2. Subscription to the daemon's `PluginEnabledEvent` and `PluginDisabledEvent` push events (the same mechanism Deluge's GTK and Web UIs use). Toggling the plugin from any Deluge client — GTK preferences, Web UI, `deluge-console plugin --enable Label` — propagates to the MCP server within seconds.
+3. Re-probing on reconnect and on broadcast lag (belt-and-suspenders against missed events).
+
+When the plugin state flips, the MCP server fires `notifications/tools/list_changed` to every connected MCP peer so conforming clients refresh their tool list.
 
 ### Wire Format
 
@@ -123,7 +149,7 @@ Implemented via `native-tls` with `danger_accept_invalid_certs(true)`. After the
 | `src/main.rs` | Entry point — CLI arg parsing, transport selection, server startup, HTTP auth middleware. |
 | `src/rencode.rs` | Internal rencode serializer/deserializer (Deluge wire format). |
 | `src/deluge/mod.rs` | Deluge RPC client — TLS connection, cert fingerprint logging/pinning, auth, request multiplexing, zlib framing. |
-| `src/tools/mod.rs` | MCP tool implementations — all 13 tools, safety gate helpers, Value→JSON conversion. |
+| `src/tools/mod.rs` | MCP tool implementations — all 21 tools, safety gate helpers, plugin watcher, Value→JSON conversion. |
 | `tests/` | Integration tests. |
 
 ## Commands

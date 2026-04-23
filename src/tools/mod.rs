@@ -1,8 +1,8 @@
 // Copyright (c) 2026 Sandy McArthur, Jr.
 // SPDX-License-Identifier: MIT
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, RwLock as StdRwLock};
 
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use rmcp::{
@@ -11,11 +11,12 @@ use rmcp::{
     handler::server::tool::ToolCallContext,
     handler::server::wrapper::Parameters,
     model::{
-        CallToolRequestParams, CallToolResult, Icon, Implementation, ListResourcesResult,
-        ListResourceTemplatesResult, ListToolsResult, PaginatedRequestParams, RawResource,
-        RawResourceTemplate, ReadResourceRequestParams, ReadResourceResult, Resource,
-        ResourceContents, ResourceTemplate, ResourceUpdatedNotificationParam, ServerInfo,
-        SetLevelRequestParams, SubscribeRequestParams, Tool, UnsubscribeRequestParams,
+        CallToolRequestParams, CallToolResult, Icon, Implementation, InitializeRequestParams,
+        InitializeResult, ListResourcesResult, ListResourceTemplatesResult, ListToolsResult,
+        PaginatedRequestParams, RawResource, RawResourceTemplate, ReadResourceRequestParams,
+        ReadResourceResult, Resource, ResourceContents, ResourceTemplate,
+        ResourceUpdatedNotificationParam, ServerInfo, SetLevelRequestParams,
+        SubscribeRequestParams, Tool, UnsubscribeRequestParams,
     },
     schemars,
     serde_json,
@@ -24,7 +25,7 @@ use rmcp::{
     ErrorData, RoleServer,
 };
 use tokio::sync::{broadcast::error::RecvError, RwLock};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 const ICON_SVG: &[u8] = include_bytes!("../../assets/deluge-mcp-icon.svg");
 const ICON_48: &[u8] = include_bytes!("../../assets/deluge-mcp-icon-48x48.png");
@@ -41,11 +42,25 @@ use crate::rencode::Value;
 #[derive(Clone)]
 pub struct DelugeServer {
     client: Arc<DelugeClient>,
-    enabled_tools: std::collections::HashSet<String>,
+    /// Tools currently visible in `tools/list` and callable via `call_tool`.
+    /// Computed as `user_intent_tools` minus any tools whose required plugin
+    /// is not active on the daemon. Updated live by the plugin watcher.
+    enabled_tools: Arc<StdRwLock<HashSet<String>>>,
+    /// Tools the user has authorised (via defaults or `--enable-tool`).
+    /// Plugin gating is applied on top to produce `enabled_tools`.
+    user_intent_tools: Arc<HashSet<String>>,
+    /// Tools that require the Deluge Label plugin to be enabled on the daemon.
+    plugin_gated_tools: Arc<HashSet<String>>,
+    /// Whether the Label plugin is currently active on the daemon.
+    /// Updated by the plugin watcher; used by `tool_gate` for accurate hints.
+    label_plugin_active: Arc<StdRwLock<bool>>,
     tool_router: ToolRouter<Self>,
     /// Active resource subscriptions: resource URI → connected peer.
     /// One subscriber per URI — last `subscribe` call wins.
     subscribers: Arc<RwLock<HashMap<String, Peer<RoleServer>>>>,
+    /// All connected MCP peers, captured on `initialize`.
+    /// Used to fan out `notifications/tools/list_changed` when plugin state flips.
+    connected_peers: Arc<RwLock<Vec<Peer<RoleServer>>>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -160,6 +175,9 @@ enum TorrentState {
 struct ListTorrentsParams {
     /// Filter by torrent state. Omit to return all torrents.
     state: Option<TorrentState>,
+    /// Filter by Deluge label. Requires the Label plugin to be enabled on the daemon.
+    /// Pass the empty string to filter for unlabeled torrents.
+    label: Option<String>,
     /// Max torrents per page (default: 100).
     limit: Option<usize>,
     /// Torrents to skip (default: 0). Use next_offset from previous response to paginate.
@@ -170,6 +188,64 @@ struct ListTorrentsParams {
 struct PathParams {
     /// Absolute path (file or directory) on the Deluge server to query.
     path: String,
+}
+
+/// Label names use a restricted character set: lowercase letters, digits, '_', '-', and '.'.
+/// Mixed-case input is normalized to lowercase before being sent to Deluge.
+#[derive(Deserialize, schemars::JsonSchema)]
+struct LabelNameParams {
+    /// Label name. Allowed characters: a-z, 0-9, '_', '-', '.'. Will be lowercased.
+    label: String,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+struct SetTorrentLabelParams {
+    /// Torrent info_hashes to apply the label to.
+    #[schemars(length(min = 1))]
+    info_hashes: Vec<InfoHash>,
+    /// Label to assign. Pass an empty string or "No Label" to clear the torrent's label.
+    /// Otherwise must already exist on the daemon — use deluge_create_label first if it does not.
+    label: String,
+}
+
+/// Per-label default options that Deluge applies to every torrent carrying the label.
+/// Speed values are in KiB/s. Use -1 for unlimited on any numeric field. Omit fields you don't want to change.
+/// Each `apply_*` flag toggles whether the corresponding group of options takes effect:
+/// `apply_max` gates max_download_speed/max_upload_speed/max_connections/max_upload_slots,
+/// `apply_queue` gates is_auto_managed/stop_at_ratio/stop_ratio/remove_at_ratio,
+/// `apply_move_completed` gates move_completed/move_completed_path.
+#[derive(Deserialize, schemars::JsonSchema)]
+struct SetLabelOptionsParams {
+    /// Label to configure. Must already exist on the daemon.
+    label: String,
+    /// Enable the max_* speed and connection limits for torrents carrying this label.
+    apply_max: Option<bool>,
+    /// Max download speed in KiB/s.
+    max_download_speed: Option<f64>,
+    /// Max upload speed in KiB/s.
+    max_upload_speed: Option<f64>,
+    /// Max simultaneous peer connections.
+    max_connections: Option<i64>,
+    /// Max simultaneous upload slots.
+    max_upload_slots: Option<i64>,
+    /// Enable the queue-related options (is_auto_managed, stop/remove-at-ratio).
+    apply_queue: Option<bool>,
+    /// Whether Deluge's queue manager controls the torrent's start/stop state.
+    is_auto_managed: Option<bool>,
+    /// Stop the torrent when its ratio reaches stop_ratio.
+    stop_at_ratio: Option<bool>,
+    /// Seed ratio limit at which the torrent stops (e.g. 2.0 = 200%).
+    stop_ratio: Option<f64>,
+    /// Remove the torrent once stop_ratio is reached.
+    remove_at_ratio: Option<bool>,
+    /// Enable the move-completed options.
+    apply_move_completed: Option<bool>,
+    /// Move files to move_completed_path when download finishes.
+    move_completed: Option<bool>,
+    /// Destination path when move_completed is true.
+    move_completed_path: Option<String>,
+    /// Download first and last pieces first (useful for media previews).
+    prioritize_first_last: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -261,21 +337,33 @@ impl DelugeServer {
         let limit = p.limit.unwrap_or(100).max(1);
         let offset = p.offset.unwrap_or(0);
 
-        let filter = match p.state {
-            Some(ref s) => {
-                let state_str = serde_json::to_value(s)
-                    .ok()
-                    .and_then(|v| v.as_str().map(|s| s.to_string()))
-                    .unwrap_or_default();
-                Value::Dict(vec![(
-                    Value::String("state".into()),
-                    Value::String(state_str),
-                )])
-            }
-            None => Value::Dict(vec![]),
-        };
+        let label_plugin_active = *self.label_plugin_active.read().unwrap();
 
-        let keys = Value::List(vec![
+        if p.label.is_some() && !label_plugin_active {
+            return Err(
+                "Cannot filter by label: the Label plugin is not enabled on the Deluge daemon.\n\
+                 [Hint: Ask the user to enable the Label plugin in Deluge's Preferences \u{2192} Plugins.]"
+                    .to_string(),
+            );
+        }
+
+        let mut filter_pairs: Vec<(Value, Value)> = Vec::new();
+        if let Some(ref s) = p.state {
+            let state_str = serde_json::to_value(s)
+                .ok()
+                .and_then(|v| v.as_str().map(|s| s.to_string()))
+                .unwrap_or_default();
+            filter_pairs.push((Value::String("state".into()), Value::String(state_str)));
+        }
+        if let Some(ref label) = p.label {
+            filter_pairs.push((
+                Value::String("label".into()),
+                Value::String(label.clone()),
+            ));
+        }
+        let filter = Value::Dict(filter_pairs);
+
+        let mut keys_list = vec![
             Value::String("name".into()),
             Value::String("state".into()),
             Value::String("progress".into()),
@@ -284,7 +372,11 @@ impl DelugeServer {
             Value::String("upload_payload_rate".into()),
             Value::String("eta".into()),
             Value::String("save_path".into()),
-        ]);
+        ];
+        if label_plugin_active {
+            keys_list.push(Value::String("label".into()));
+        }
+        let keys = Value::List(keys_list);
 
         let result = self.client
             .call("core.get_torrents_status", vec![filter, keys], vec![])
@@ -604,6 +696,209 @@ impl DelugeServer {
             })
             .map_err(Self::enrich_client_error)
     }
+
+    /// Create a new label on the Deluge daemon. Labels are used to group and bulk-operate on torrents.
+    #[tool(name = "deluge_create_label", title = "Create Label", annotations(destructive_hint = false, open_world_hint = false))]
+    async fn create_label(
+        &self,
+        Parameters(p): Parameters<LabelNameParams>,
+    ) -> Result<String, String> {
+        self.tool_gate("deluge_create_label")?;
+        let label = Self::validate_label_name(&p.label)?;
+        self.client
+            .call("label.add", vec![Value::String(label)], vec![])
+            .await
+            .map(|_| "ok".to_string())
+            .map_err(Self::enrich_label_error)
+    }
+
+    /// Delete a label from the Deluge daemon. Torrents previously assigned this label become unlabeled.
+    /// The torrents themselves and their data are not affected.
+    #[tool(name = "deluge_delete_label", title = "Delete Label", annotations(destructive_hint = true, idempotent_hint = false, open_world_hint = false))]
+    async fn delete_label(
+        &self,
+        Parameters(p): Parameters<LabelNameParams>,
+    ) -> Result<String, String> {
+        self.tool_gate("deluge_delete_label")?;
+        let label = Self::validate_label_name(&p.label)?;
+        self.client
+            .call("label.remove", vec![Value::String(label)], vec![])
+            .await
+            .map(|_| "ok".to_string())
+            .map_err(Self::enrich_label_error)
+    }
+
+    /// Assign a label to one or more torrents. A torrent can only have one label at a time.
+    /// PREREQUISITE: The label must already exist — use deluge_create_label first if needed.
+    #[tool(name = "deluge_set_torrent_label", title = "Set Torrent Label", annotations(destructive_hint = false, idempotent_hint = true, open_world_hint = false))]
+    async fn set_torrent_label(
+        &self,
+        Parameters(p): Parameters<SetTorrentLabelParams>,
+    ) -> Result<String, String> {
+        self.tool_gate("deluge_set_torrent_label")?;
+        Self::validate_info_hashes(&p.info_hashes)?;
+        let label = Self::normalize_label_for_set(&p.label)?;
+
+        let create_label_hint = self.create_label_hint();
+        let mut results = serde_json::Map::new();
+        for hash in &p.info_hashes {
+            let result = self
+                .client
+                .call(
+                    "label.set_torrent",
+                    vec![Value::String(hash.0.clone()), Value::String(label.clone())],
+                    vec![],
+                )
+                .await;
+            match result {
+                Ok(_) => {
+                    results.insert(hash.0.clone(), serde_json::json!("ok"));
+                }
+                Err(e) => {
+                    let msg = Self::enrich_label_set_error(e, &label, create_label_hint.as_deref());
+                    results.insert(hash.0.clone(), serde_json::json!({ "error": msg }));
+                }
+            }
+        }
+        if results.len() == 1 {
+            let (_, v) = results.into_iter().next().unwrap();
+            if let Some(s) = v.as_str() {
+                return Ok(s.to_string());
+            }
+            return Err(v["error"].as_str().unwrap_or("unknown error").to_string());
+        }
+        Ok(serde_json::to_string_pretty(&serde_json::Value::Object(results)).unwrap_or_default())
+    }
+
+    /// Pause every torrent assigned the given label. Errors if no torrents currently have this label.
+    #[tool(name = "deluge_pause_label", title = "Pause Label", annotations(destructive_hint = false, idempotent_hint = true, open_world_hint = false))]
+    async fn pause_label(
+        &self,
+        Parameters(p): Parameters<LabelNameParams>,
+    ) -> Result<String, String> {
+        self.tool_gate("deluge_pause_label")?;
+        let label = Self::validate_label_name(&p.label)?;
+        self.bulk_act_on_label(&label, "core.pause_torrents", "paused").await
+    }
+
+    /// Resume every paused torrent assigned the given label. Errors if no torrents currently have this label.
+    #[tool(name = "deluge_resume_label", title = "Resume Label", annotations(destructive_hint = false, idempotent_hint = true, open_world_hint = false))]
+    async fn resume_label(
+        &self,
+        Parameters(p): Parameters<LabelNameParams>,
+    ) -> Result<String, String> {
+        self.tool_gate("deluge_resume_label")?;
+        let label = Self::validate_label_name(&p.label)?;
+        self.bulk_act_on_label(&label, "core.resume_torrents", "resumed").await
+    }
+
+    /// List all labels defined on the Deluge daemon. Returns a JSON array of label names.
+    #[tool(name = "deluge_list_labels", title = "List Labels", annotations(read_only_hint = true, open_world_hint = false))]
+    async fn list_labels(&self) -> Result<String, String> {
+        self.tool_gate("deluge_list_labels")?;
+        let result = self
+            .client
+            .call("label.get_labels", vec![], vec![])
+            .await
+            .map_err(Self::enrich_label_error)?;
+        Ok(Self::value_to_json_string(result))
+    }
+
+    /// Get a label's default options (speed caps, ratio handling, move-completed path, etc.).
+    /// These defaults are applied to every torrent assigned this label.
+    #[tool(name = "deluge_get_label_options", title = "Get Label Options", annotations(read_only_hint = true, open_world_hint = false))]
+    async fn get_label_options(
+        &self,
+        Parameters(p): Parameters<LabelNameParams>,
+    ) -> Result<String, String> {
+        self.tool_gate("deluge_get_label_options")?;
+        let label = Self::validate_label_name(&p.label)?;
+        let result = self
+            .client
+            .call("label.get_options", vec![Value::String(label)], vec![])
+            .await
+            .map_err(Self::enrich_label_error)?;
+        Ok(Self::value_to_json_string(result))
+    }
+
+    /// Set default options on a label. Options are applied to every torrent currently carrying
+    /// the label and to any new torrents assigned the label going forward.
+    #[tool(name = "deluge_set_label_options", title = "Set Label Options", annotations(destructive_hint = false, idempotent_hint = true, open_world_hint = false))]
+    async fn set_label_options(
+        &self,
+        Parameters(p): Parameters<SetLabelOptionsParams>,
+    ) -> Result<String, String> {
+        self.tool_gate("deluge_set_label_options")?;
+        let label = Self::validate_label_name(&p.label)?;
+
+        let mut opts: Vec<(Value, Value)> = Vec::new();
+        if let Some(v) = p.apply_max {
+            opts.push((Value::String("apply_max".into()), Value::Bool(v)));
+        }
+        if let Some(v) = p.max_download_speed {
+            opts.push((Value::String("max_download_speed".into()), Value::Float64(v)));
+        }
+        if let Some(v) = p.max_upload_speed {
+            opts.push((Value::String("max_upload_speed".into()), Value::Float64(v)));
+        }
+        if let Some(v) = p.max_connections {
+            opts.push((Value::String("max_connections".into()), Value::Int(v)));
+        }
+        if let Some(v) = p.max_upload_slots {
+            opts.push((Value::String("max_upload_slots".into()), Value::Int(v)));
+        }
+        if let Some(v) = p.apply_queue {
+            opts.push((Value::String("apply_queue".into()), Value::Bool(v)));
+        }
+        if let Some(v) = p.is_auto_managed {
+            opts.push((Value::String("is_auto_managed".into()), Value::Bool(v)));
+        }
+        if let Some(v) = p.stop_at_ratio {
+            opts.push((Value::String("stop_at_ratio".into()), Value::Bool(v)));
+        }
+        if let Some(v) = p.stop_ratio {
+            opts.push((Value::String("stop_ratio".into()), Value::Float64(v)));
+        }
+        if let Some(v) = p.remove_at_ratio {
+            opts.push((Value::String("remove_at_ratio".into()), Value::Bool(v)));
+        }
+        if let Some(v) = p.apply_move_completed {
+            opts.push((
+                Value::String("apply_move_completed".into()),
+                Value::Bool(v),
+            ));
+        }
+        if let Some(v) = p.move_completed {
+            opts.push((Value::String("move_completed".into()), Value::Bool(v)));
+        }
+        if let Some(v) = p.move_completed_path {
+            opts.push((
+                Value::String("move_completed_path".into()),
+                Value::String(v),
+            ));
+        }
+        if let Some(v) = p.prioritize_first_last {
+            opts.push((
+                Value::String("prioritize_first_last".into()),
+                Value::Bool(v),
+            ));
+        }
+        if opts.is_empty() {
+            return Err(
+                "No options provided. Set at least one option field (e.g. stop_at_ratio, max_download_speed, move_completed_path).".to_string(),
+            );
+        }
+
+        self.client
+            .call(
+                "label.set_options",
+                vec![Value::String(label), Value::Dict(opts)],
+                vec![],
+            )
+            .await
+            .map(|_| "ok".to_string())
+            .map_err(Self::enrich_label_error)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -613,8 +908,13 @@ impl DelugeServer {
 impl DelugeServer {
     pub fn new(
         client: Arc<DelugeClient>,
-        enabled_tools: std::collections::HashSet<String>,
+        user_intent_tools: HashSet<String>,
+        plugin_gated_tools: HashSet<String>,
+        initial_label_plugin_active: bool,
     ) -> Self {
+        let initial_enabled =
+            compute_enabled(&user_intent_tools, &plugin_gated_tools, initial_label_plugin_active);
+
         let subscribers: Arc<RwLock<HashMap<String, Peer<RoleServer>>>> =
             Arc::new(RwLock::new(HashMap::new()));
 
@@ -667,15 +967,108 @@ impl DelugeServer {
 
         Self {
             client,
-            enabled_tools,
+            enabled_tools: Arc::new(StdRwLock::new(initial_enabled)),
+            user_intent_tools: Arc::new(user_intent_tools),
+            plugin_gated_tools: Arc::new(plugin_gated_tools),
+            label_plugin_active: Arc::new(StdRwLock::new(initial_label_plugin_active)),
             tool_router: Self::tool_router(),
             subscribers,
+            connected_peers: Arc::new(RwLock::new(Vec::new())),
         }
     }
 
+    /// Spawn the plugin watcher. Listens for Deluge `PluginEnabled`/`PluginDisabled`
+    /// events for the Label plugin and updates `enabled_tools` accordingly.
+    /// On reconnect or broadcast lag it re-probes via `core.get_enabled_plugins`
+    /// to recover the authoritative state.
+    pub fn spawn_plugin_watcher(&self) {
+        let client = self.client.clone();
+        let user_intent = self.user_intent_tools.clone();
+        let plugin_gated = self.plugin_gated_tools.clone();
+        let enabled_tools = self.enabled_tools.clone();
+        let label_active = self.label_plugin_active.clone();
+        let connected_peers = self.connected_peers.clone();
+        let mut event_rx = client.subscribe_events();
+
+        tokio::spawn(async move {
+            loop {
+                match event_rx.recv().await {
+                    Ok(DelugeEvent::PluginEnabled { name }) if name == "Label" => {
+                        apply_label_state(
+                            true,
+                            &user_intent,
+                            &plugin_gated,
+                            &enabled_tools,
+                            &label_active,
+                            &connected_peers,
+                        )
+                        .await;
+                    }
+                    Ok(DelugeEvent::PluginDisabled { name }) if name == "Label" => {
+                        apply_label_state(
+                            false,
+                            &user_intent,
+                            &plugin_gated,
+                            &enabled_tools,
+                            &label_active,
+                            &connected_peers,
+                        )
+                        .await;
+                    }
+                    Ok(DelugeEvent::Reconnected) => {
+                        // Re-seed from the daemon — the previous state may be stale
+                        // and `set_event_interest` was just re-issued, so we may have
+                        // missed transitions while disconnected.
+                        if let Some(active) = probe_label_plugin(&client).await {
+                            apply_label_state(
+                                active,
+                                &user_intent,
+                                &plugin_gated,
+                                &enabled_tools,
+                                &label_active,
+                                &connected_peers,
+                            )
+                            .await;
+                        }
+                    }
+                    Err(RecvError::Lagged(n)) => {
+                        warn!(
+                            "Plugin watcher lagged by {n} events — re-probing plugin state"
+                        );
+                        if let Some(active) = probe_label_plugin(&client).await {
+                            apply_label_state(
+                                active,
+                                &user_intent,
+                                &plugin_gated,
+                                &enabled_tools,
+                                &label_active,
+                                &connected_peers,
+                            )
+                            .await;
+                        }
+                    }
+                    Err(RecvError::Closed) => break,
+                    _ => {}
+                }
+            }
+        });
+    }
+
     fn tool_gate(&self, tool_name: &str) -> Result<(), String> {
-        if self.enabled_tools.contains(tool_name) {
-            Ok(())
+        if self.enabled_tools.read().unwrap().contains(tool_name) {
+            return Ok(());
+        }
+        // Disabled — pick the right hint based on why.
+        let plugin_gated = self.plugin_gated_tools.contains(tool_name);
+        let plugin_active = *self.label_plugin_active.read().unwrap();
+        if plugin_gated && !plugin_active {
+            Err(format!(
+                "Tool '{tool_name}' is currently unavailable because the Label plugin is not \
+                 enabled on the Deluge daemon.\n\
+                 [Hint: Ask the user to enable the Label plugin in Deluge's \
+                 Preferences \u{2192} Plugins, or via `deluge-console plugin --enable Label`. \
+                 Once enabled the tool becomes available without restarting the MCP server.]"
+            ))
         } else {
             Err(format!(
                 "Tool '{tool_name}' is disabled. Use --enable-tool={tool_name} to enable it.\n\
@@ -865,6 +1258,172 @@ impl DelugeServer {
     fn value_to_json_string(v: Value) -> String {
         serde_json::to_string(&crate::rencode::value_to_json(v)).unwrap_or_default()
     }
+
+    /// Validate and normalize a Deluge label name. Lowercases the input and rejects
+    /// empty strings or characters outside `[a-z0-9_\-\.]`.
+    fn validate_label_name(label: &str) -> Result<String, String> {
+        let trimmed = label.trim();
+        if trimmed.is_empty() {
+            return Err("Label name must not be empty.".to_string());
+        }
+        let lowered = trimmed.to_lowercase();
+        let valid = lowered.chars().all(|c| {
+            c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '_' | '-' | '.')
+        });
+        if !valid {
+            return Err(format!(
+                "Invalid label name '{label}'. Allowed characters: a-z, 0-9, '_', '-', '.'."
+            ));
+        }
+        Ok(lowered)
+    }
+
+    /// Normalize a label for `label.set_torrent`. Empty string and the literal
+    /// sentinel `"No Label"` are passed through unchanged — both clear the torrent's
+    /// label on the daemon. Any other value is validated as a normal label name.
+    fn normalize_label_for_set(label: &str) -> Result<String, String> {
+        if label.is_empty() || label == "No Label" {
+            return Ok(label.to_string());
+        }
+        Self::validate_label_name(label)
+    }
+
+    /// Build a hint that points the LLM to deluge_create_label, but only if that
+    /// tool is currently enabled. Returns `None` otherwise.
+    fn create_label_hint(&self) -> Option<String> {
+        let enabled = self.enabled_tools.read().unwrap();
+        if enabled.contains("deluge_create_label") {
+            Some(
+                "If the label does not exist, create it first with deluge_create_label."
+                    .to_string(),
+            )
+        } else {
+            None
+        }
+    }
+
+    /// Common implementation of pause_label / resume_label. Looks up the torrents
+    /// carrying the label via a server-side filter, errors if none, then forwards
+    /// the hash list to the supplied core action.
+    async fn bulk_act_on_label(
+        &self,
+        label: &str,
+        action_method: &str,
+        action_past_tense: &str,
+    ) -> Result<String, String> {
+        let filter = Value::Dict(vec![(
+            Value::String("label".into()),
+            Value::String(label.to_string()),
+        )]);
+        let keys = Value::List(vec![Value::String("label".into())]);
+        let status = self
+            .client
+            .call("core.get_torrents_status", vec![filter, keys], vec![])
+            .await
+            .map_err(Self::enrich_client_error)?;
+
+        let hashes: Vec<String> = match status {
+            Value::Dict(pairs) => pairs
+                .into_iter()
+                .filter_map(|(k, _)| match k {
+                    Value::String(s) => Some(s),
+                    _ => None,
+                })
+                .collect(),
+            other => {
+                return Err(format!(
+                    "Unexpected response from core.get_torrents_status: {other:?}"
+                ));
+            }
+        };
+
+        if hashes.is_empty() {
+            return Err(format!(
+                "No torrents have label '{label}'.\n\
+                 [Hint: Use deluge_list_torrents to see which labels are in use, \
+                 or pick a different label.]"
+            ));
+        }
+
+        let count = hashes.len();
+        let hash_values: Vec<Value> =
+            hashes.iter().cloned().map(Value::String).collect();
+
+        self.client
+            .call(action_method, vec![Value::List(hash_values)], vec![])
+            .await
+            .map_err(Self::enrich_client_error)?;
+
+        let out = serde_json::json!({
+            "label": label,
+            "action": action_past_tense,
+            "count": count,
+            "info_hashes": hashes,
+        });
+        Ok(serde_json::to_string_pretty(&out).unwrap_or_default())
+    }
+
+    /// Map common label.* RPC errors to actionable messages. Keeps the raw exception
+    /// text so the LLM has full context, then appends a [Hint: ...] for known cases.
+    fn enrich_label_error(e: anyhow::Error) -> String {
+        let msg = e.to_string();
+        let hint = if msg.contains("Unknown Label") {
+            Some(
+                "The label does not exist on the Deluge daemon. \
+                 Use deluge_list_torrents to discover labels in use, or create the label first.",
+            )
+        } else if msg.contains("Label already exists") {
+            Some(
+                "A label with this name already exists. \
+                 No action needed if you intended to use the existing label.",
+            )
+        } else if msg.contains("Empty Label") || msg.contains("Invalid label") {
+            Some(
+                "Deluge rejected the label name. \
+                 Allowed characters: a-z, 0-9, '_', '-', '.'.",
+            )
+        } else if msg.contains("KeyError")
+            && (msg.contains("label.") || msg.contains("'label.'"))
+        {
+            Some(
+                "The Label plugin appears to be disabled on the Deluge daemon — \
+                 the label.* RPC methods are unregistered. \
+                 The MCP server will hide label tools shortly.",
+            )
+        } else {
+            None
+        };
+        match hint {
+            Some(h) => format!("{msg}\n[Hint: {h}]"),
+            None => msg,
+        }
+    }
+
+    /// Specialized error handling for `label.set_torrent`. If the label is missing
+    /// and `deluge_create_label` is currently enabled, suggest using it.
+    fn enrich_label_set_error(
+        e: anyhow::Error,
+        label: &str,
+        create_hint: Option<&str>,
+    ) -> String {
+        let msg = e.to_string();
+        if msg.contains("Unknown Label") {
+            let mut out = format!(
+                "Label '{label}' does not exist on the Deluge daemon. ({msg})"
+            );
+            if let Some(hint) = create_hint {
+                out.push_str(&format!("\n[Hint: {hint}]"));
+            } else {
+                out.push_str(
+                    "\n[Hint: Ask the user to create the label in Deluge first, \
+                     or to enable the create_label MCP tool.]",
+                );
+            }
+            out
+        } else {
+            Self::enrich_label_error(e)
+        }
+    }
 }
 
 /// Map a Deluge push event to the resource URIs that should be notified.
@@ -882,8 +1441,92 @@ fn event_to_resource_uris(event: &DelugeEvent) -> Vec<String> {
         DelugeEvent::TorrentStorageMoved { info_hash, .. } => with_list(info_hash),
         DelugeEvent::TorrentFileRenamed { info_hash, .. } => vec![torrent_uri(info_hash)],
         DelugeEvent::TorrentFolderRenamed { info_hash, .. } => vec![torrent_uri(info_hash)],
-        DelugeEvent::Unknown { .. } => vec![],
+        DelugeEvent::PluginEnabled { .. }
+        | DelugeEvent::PluginDisabled { .. }
+        | DelugeEvent::Reconnected
+        | DelugeEvent::Unknown { .. } => vec![],
     }
+}
+
+// ---------------------------------------------------------------------------
+// Plugin watcher helpers
+// ---------------------------------------------------------------------------
+
+/// Compute the set of tools currently enabled given user intent and plugin state.
+fn compute_enabled(
+    user_intent: &HashSet<String>,
+    plugin_gated: &HashSet<String>,
+    label_plugin_active: bool,
+) -> HashSet<String> {
+    let mut out = user_intent.clone();
+    if !label_plugin_active {
+        for t in plugin_gated {
+            out.remove(t);
+        }
+    }
+    out
+}
+
+/// Probe the Deluge daemon for whether the Label plugin is currently enabled.
+/// Returns `None` on RPC failure (caller should keep the previous state).
+pub async fn probe_label_plugin(client: &Arc<DelugeClient>) -> Option<bool> {
+    match client.call("core.get_enabled_plugins", vec![], vec![]).await {
+        Ok(Value::List(items)) => Some(items.iter().any(
+            |v| matches!(v, Value::String(s) if s == "Label"),
+        )),
+        Ok(other) => {
+            warn!("core.get_enabled_plugins returned unexpected shape: {other:?}");
+            None
+        }
+        Err(e) => {
+            warn!("core.get_enabled_plugins failed: {e}");
+            None
+        }
+    }
+}
+
+/// Apply a new Label-plugin state. If it actually changes the visible tool set,
+/// updates the lock-protected state and fans out `tools/list_changed` to every
+/// connected peer. Stale peers (those whose send fails) are pruned.
+async fn apply_label_state(
+    active: bool,
+    user_intent: &Arc<HashSet<String>>,
+    plugin_gated: &Arc<HashSet<String>>,
+    enabled_tools: &Arc<StdRwLock<HashSet<String>>>,
+    label_active: &Arc<StdRwLock<bool>>,
+    connected_peers: &Arc<RwLock<Vec<Peer<RoleServer>>>>,
+) {
+    let new_set = compute_enabled(user_intent, plugin_gated, active);
+
+    let changed = {
+        let mut current_active = label_active.write().unwrap();
+        let mut current_set = enabled_tools.write().unwrap();
+        let active_changed = *current_active != active;
+        let set_changed = *current_set != new_set;
+        *current_active = active;
+        *current_set = new_set;
+        active_changed || set_changed
+    };
+
+    if !changed {
+        return;
+    }
+
+    info!(
+        "Label plugin is now {} on the Deluge daemon — tool list updated",
+        if active { "enabled" } else { "disabled" }
+    );
+
+    // Fan out tools/list_changed. Prune peers whose notify fails (closed sessions).
+    let peers_snapshot: Vec<Peer<RoleServer>> = connected_peers.read().await.clone();
+    let mut survivors: Vec<Peer<RoleServer>> = Vec::with_capacity(peers_snapshot.len());
+    for peer in peers_snapshot {
+        match peer.notify_tool_list_changed().await {
+            Ok(()) => survivors.push(peer),
+            Err(e) => debug!("notify_tool_list_changed failed for a peer: {e}"),
+        }
+    }
+    *connected_peers.write().await = survivors;
 }
 
 // ---------------------------------------------------------------------------
@@ -906,6 +1549,7 @@ impl ServerHandler for DelugeServer {
         ServerInfo::new(
             rmcp::model::ServerCapabilities::builder()
                 .enable_tools()
+                .enable_tool_list_changed()
                 .enable_resources()
                 .enable_resources_subscribe()
                 .enable_logging()
@@ -917,16 +1561,30 @@ impl ServerHandler for DelugeServer {
             )
     }
 
+    async fn initialize(
+        &self,
+        request: InitializeRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<InitializeResult, ErrorData> {
+        if context.peer.peer_info().is_none() {
+            context.peer.set_peer_info(request);
+        }
+        // Track this peer so the plugin watcher can deliver tools/list_changed.
+        self.connected_peers.write().await.push(context.peer.clone());
+        Ok(self.get_info())
+    }
+
     async fn list_tools(
         &self,
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
+        let enabled = self.enabled_tools.read().unwrap().clone();
         let tools: Vec<Tool> = self
             .tool_router
             .list_all()
             .into_iter()
-            .filter(|t| self.enabled_tools.contains(t.name.as_ref()))
+            .filter(|t| enabled.contains(t.name.as_ref()))
             .collect();
         Ok(ListToolsResult { tools, meta: None, next_cursor: None })
     }
@@ -1161,5 +1819,43 @@ mod tests {
         assert!(!DelugeServer::looks_like_file_path("magnet:?xt=urn:btih:abc"));
         assert!(!DelugeServer::looks_like_file_path("aGVsbG8="));
         assert!(!DelugeServer::looks_like_file_path("some random string"));
+    }
+
+    #[test]
+    fn validate_label_name_accepts_valid_labels() {
+        assert_eq!(DelugeServer::validate_label_name("movies").unwrap(), "movies");
+        assert_eq!(DelugeServer::validate_label_name("tv.shows").unwrap(), "tv.shows");
+        assert_eq!(
+            DelugeServer::validate_label_name("2024_backup").unwrap(),
+            "2024_backup"
+        );
+        assert_eq!(DelugeServer::validate_label_name("a-b-c").unwrap(), "a-b-c");
+        // Lowercased
+        assert_eq!(DelugeServer::validate_label_name("Movies").unwrap(), "movies");
+        // Trimmed
+        assert_eq!(DelugeServer::validate_label_name("  movies  ").unwrap(), "movies");
+    }
+
+    #[test]
+    fn validate_label_name_rejects_invalid_labels() {
+        assert!(DelugeServer::validate_label_name("").is_err());
+        assert!(DelugeServer::validate_label_name("   ").is_err());
+        // Space is not allowed — "No Label" lowercases to "no label" which still has a space
+        assert!(DelugeServer::validate_label_name("No Label").is_err());
+        assert!(DelugeServer::validate_label_name("has space").is_err());
+        assert!(DelugeServer::validate_label_name("emoji\u{1F3AC}").is_err());
+        assert!(DelugeServer::validate_label_name("slash/here").is_err());
+    }
+
+    #[test]
+    fn normalize_label_for_set_passes_clear_sentinels() {
+        assert_eq!(DelugeServer::normalize_label_for_set("").unwrap(), "");
+        assert_eq!(
+            DelugeServer::normalize_label_for_set("No Label").unwrap(),
+            "No Label"
+        );
+        // Anything else goes through normal validation
+        assert_eq!(DelugeServer::normalize_label_for_set("Movies").unwrap(), "movies");
+        assert!(DelugeServer::normalize_label_for_set("bad name").is_err());
     }
 }
