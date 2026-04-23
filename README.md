@@ -10,6 +10,7 @@ By integrating this server, your AI assistant can seamlessly manage your torrent
 
 - **Native RPC Integration**: Uses Deluge's native binary protocol (rencode/zlib over TLS) rather than relying on the WebUI API.
 - **Granular Safety Gates**: Prevents LLM hallucinations from accidentally deleting or moving your files. Risky tools are disabled by default and enabled individually via `--enable-tool`.
+- **Dynamic Label Plugin Support**: Exposes tools for Deluge's built-in Label plugin — create, delete, and list labels; assign labels to torrents; pause/resume by label; read and write per-label option defaults. Tools appear and disappear automatically as the plugin is enabled or disabled on the daemon, with no MCP server restart needed.
 - **Flexible TLS Handling**: Seamlessly handles Deluge's default self-signed certificates with a secure, copy-paste pinning mechanism.
 - **Dual Transports**: Supports stdio (for local Claude Desktop use) and HTTP/SSE (for remote agentic frameworks).
 
@@ -79,7 +80,7 @@ deluge-torrent-mcp --host 192.168.1.50 --port 58846 -u admin -p secret [OPTIONS]
 
 ## Safety Gates
 
-By default, the server runs in **Safe Mode** — the AI can list, add, pause, and resume torrents, but cannot alter the filesystem or remove torrents. Five tools are disabled by default:
+By default, the server runs in **Safe Mode** — the AI can list, add, pause, and resume torrents, but cannot alter the filesystem, remove torrents, or mutate the label set. Eight tools are disabled by default:
 
 | Tool | Reason |
 |---|---|
@@ -88,6 +89,9 @@ By default, the server runs in **Safe Mode** — the AI can list, add, pause, an
 | `rename_files` | Modifies filesystem paths |
 | `force_recheck` | Interrupts active downloads |
 | `remove_torrent` | Can permanently delete downloaded data |
+| `create_label` | Mutates label set on the daemon |
+| `delete_label` | Removes labels (destructive) |
+| `set_label_options` | Rewrites per-label default options (speed caps, move-completed path, etc.) |
 
 Use `--list-tools` to see the full list and current defaults:
 
@@ -112,6 +116,27 @@ deluge-torrent-mcp -u admin -p secret --enable-tools=move_storage,rename_folder,
 ```
 
 When a disabled tool is called, the server returns an error to the AI describing the exact flag needed to enable it.
+
+## Label Plugin
+
+Deluge ships a built-in **Label** plugin for grouping and bulk-operating on torrents. When the plugin is enabled on the daemon, the MCP server exposes eight label-aware tools:
+
+| Tool | Default |
+|---|---|
+| `list_labels` | enabled |
+| `get_label_options` | enabled |
+| `set_torrent_label` | enabled |
+| `pause_label` | enabled |
+| `resume_label` | enabled |
+| `create_label` | disabled — requires `--enable-tool=create_label` |
+| `delete_label` | disabled — requires `--enable-tool=delete_label` |
+| `set_label_options` | disabled — requires `--enable-tool=set_label_options` |
+
+`list_torrents` also accepts an optional `label` filter and, when the plugin is active, includes each torrent's `label` in the returned status fields.
+
+Because `--enable-tool` matches any substring of a tool name, a single `--enable-tool=label` enables every label tool at once (including the default-disabled `create_label`, `delete_label`, and `set_label_options`). Use more specific patterns — e.g. `--enable-tool=create_label` — to enable only one.
+
+**Dynamic visibility.** Label tools appear in `tools/list` only when the Label plugin is enabled on the daemon. The server subscribes to Deluge's `PluginEnabledEvent` / `PluginDisabledEvent` push events (the same mechanism the GTK and Web UIs use) — toggling the plugin in any Deluge client propagates to connected MCP peers within seconds via `notifications/tools/list_changed`. No MCP server restart is needed. `--enable-tool` cannot make a label tool visible if the plugin is inactive on the daemon.
 
 ## HTTP Transport
 
