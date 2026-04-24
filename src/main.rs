@@ -235,20 +235,24 @@ async fn main() -> anyhow::Result<()> {
 
     // Handle --list-tools before clap parsing so credentials aren't required.
     if std::env::args().any(|a| a == "--list-tools") {
-        eprintln!("{:<28} {:<10} {:<10} {}", "TOOL", "STATUS", "DEFAULT", "PLUGIN");
+        eprintln!("{:<28} {:<10} {:<10} {}", "TOOL", "CLI", "DEFAULT", "PLUGIN");
         eprintln!("{}", "-".repeat(64));
         for &tool in ALL_TOOLS {
-            let status = if enabled_tools.contains(tool) { "visible" } else { "hidden" };
+            let cli = if enabled_tools.contains(tool) { "enabled" } else { "disabled" };
             let default = if DEFAULT_DISABLED.contains(&tool) { "disabled" } else { "enabled" };
             let plugin = if PLUGIN_GATED_LABEL_TOOLS.contains(&tool) { "Label" } else { "-" };
-            eprintln!("{:<28} {:<10} {:<10} {}", tool, status, default, plugin);
+            eprintln!("{:<28} {:<10} {:<10} {}", tool, cli, default, plugin);
         }
         eprintln!();
-        eprintln!("Visible tools are reported to the MCP client. Hidden tools are not.");
         eprintln!(
-            "Tools in the PLUGIN column require that Deluge plugin to be enabled on the \
-             daemon — they are hidden from tools/list whenever the plugin is inactive, \
-             and reappear automatically when it is re-enabled."
+            "CLI 'enabled' tools pass the server-side safety gate. 'disabled' tools are \
+             rejected and excluded from tools/list."
+        );
+        eprintln!(
+            "Tools in the PLUGIN column additionally require that Deluge plugin to be \
+             enabled on the daemon — they are hidden from tools/list whenever the plugin \
+             is inactive (regardless of CLI state) and reappear automatically when it is \
+             re-enabled."
         );
         return Ok(());
     }

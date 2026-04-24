@@ -991,6 +991,23 @@ impl DelugeServer {
         let mut event_rx = client.subscribe_events();
 
         tokio::spawn(async move {
+            // Seed from an authoritative probe. The constructor's
+            // `initial_label_plugin_active` may be stale (e.g. captured at
+            // process start but the plugin toggled before this HTTP session
+            // opened), and the broadcast receiver was created above — any
+            // events that arrive between here and the loop will be buffered.
+            if let Some(active) = probe_label_plugin(&client).await {
+                apply_label_state(
+                    active,
+                    &user_intent,
+                    &plugin_gated,
+                    &enabled_tools,
+                    &label_active,
+                    &connected_peers,
+                )
+                .await;
+            }
+
             loop {
                 match event_rx.recv().await {
                     Ok(DelugeEvent::PluginEnabled { name }) if name == "Label" => {
@@ -1058,7 +1075,19 @@ impl DelugeServer {
         if self.enabled_tools.read().unwrap().contains(tool_name) {
             return Ok(());
         }
-        // Disabled — pick the right hint based on why.
+        // Disabled — pick the right hint based on why. CLI intent wins: if the
+        // operator did not opt into this tool via defaults or `--enable-tool`,
+        // the plugin hint is misleading (enabling the plugin alone won't make
+        // the tool visible).
+        if !self.user_intent_tools.contains(tool_name) {
+            return Err(format!(
+                "Tool '{tool_name}' is disabled. Use --enable-tool={tool_name} to enable it.\n\
+                 [Hint: This tool has been administratively disabled on this server. \
+                 Do not attempt this operation by other means — inform the user that the \
+                 server must be restarted with --enable-tool={tool_name} to allow this action.]"
+            ));
+        }
+        // User intended this tool; it must be gated by an inactive plugin.
         let plugin_gated = self.plugin_gated_tools.contains(tool_name);
         let plugin_active = *self.label_plugin_active.read().unwrap();
         if plugin_gated && !plugin_active {
@@ -1517,16 +1546,28 @@ async fn apply_label_state(
         if active { "enabled" } else { "disabled" }
     );
 
-    // Fan out tools/list_changed. Prune peers whose notify fails (closed sessions).
+    // Fan out tools/list_changed. Prune peers whose notify fails (closed
+    // sessions) while preserving any peers added concurrently via initialize()
+    // between the snapshot and the prune. `connected_peers` is append-only
+    // outside this function, so positions 0..snapshot_len correspond to the
+    // snapshot and positions >= snapshot_len are new arrivals we must keep.
     let peers_snapshot: Vec<Peer<RoleServer>> = connected_peers.read().await.clone();
-    let mut survivors: Vec<Peer<RoleServer>> = Vec::with_capacity(peers_snapshot.len());
-    for peer in peers_snapshot {
+    let snapshot_len = peers_snapshot.len();
+    let mut success = vec![false; snapshot_len];
+    for (i, peer) in peers_snapshot.iter().enumerate() {
         match peer.notify_tool_list_changed().await {
-            Ok(()) => survivors.push(peer),
+            Ok(()) => success[i] = true,
             Err(e) => debug!("notify_tool_list_changed failed for a peer: {e}"),
         }
     }
-    *connected_peers.write().await = survivors;
+
+    let mut peers = connected_peers.write().await;
+    let current = std::mem::take(&mut *peers);
+    for (i, peer) in current.into_iter().enumerate() {
+        if i >= snapshot_len || success[i] {
+            peers.push(peer);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
