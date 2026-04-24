@@ -2,11 +2,15 @@
 // SPDX-License-Identifier: MIT
 
 use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use rand::Rng;
 use tokio::sync::Mutex;
-use tracing::trace;
+use tracing::{info, trace};
+
+use super::persist;
 
 pub const CODE_TTL: Duration = Duration::from_secs(10 * 60);
 pub const ACCESS_TOKEN_TTL: Duration = Duration::from_secs(60 * 60);
@@ -84,21 +88,117 @@ pub struct OAuthState {
     access_tokens: Mutex<HashMap<String, TokenInfo>>,
     refresh_tokens: Mutex<HashMap<String, RefreshInfo>>,
     pending_authorizations: Mutex<HashMap<String, PendingAuth>>,
+    persist_path: Option<PathBuf>,
+    dirty: AtomicBool,
 }
 
 impl OAuthState {
-    pub fn new(issuer: String, api_token: Option<String>) -> Self {
+    /// Construct with an optional persistence file. If `persist_path` is set
+    /// and the file exists, its contents seed the clients/access/refresh maps.
+    /// A missing file is treated as empty — no error.
+    pub async fn new_with_persistence(
+        issuer: String,
+        api_token: Option<String>,
+        persist_path: Option<PathBuf>,
+    ) -> anyhow::Result<Self> {
+        let (clients, access_tokens, refresh_tokens) = match persist_path.as_deref() {
+            Some(path) => {
+                let loaded = persist::load(path).await?;
+                let (c, a, r) = loaded.into_runtime();
+                info!(
+                    path = %path.display(),
+                    clients = c.len(),
+                    access_tokens = a.len(),
+                    refresh_tokens = r.len(),
+                    "Loaded persisted OAuth state",
+                );
+                (c, a, r)
+            }
+            None => (HashMap::new(), HashMap::new(), HashMap::new()),
+        };
+        Ok(Self::from_parts(
+            issuer,
+            api_token,
+            persist_path,
+            clients,
+            access_tokens,
+            refresh_tokens,
+        ))
+    }
+
+    fn from_parts(
+        issuer: String,
+        api_token: Option<String>,
+        persist_path: Option<PathBuf>,
+        clients: HashMap<String, ClientInfo>,
+        access_tokens: HashMap<String, TokenInfo>,
+        refresh_tokens: HashMap<String, RefreshInfo>,
+    ) -> Self {
         let resource = format!("{issuer}/mcp");
         Self {
             issuer,
             resource,
             api_token,
-            clients: Mutex::new(HashMap::new()),
+            clients: Mutex::new(clients),
             codes: Mutex::new(HashMap::new()),
-            access_tokens: Mutex::new(HashMap::new()),
-            refresh_tokens: Mutex::new(HashMap::new()),
+            access_tokens: Mutex::new(access_tokens),
+            refresh_tokens: Mutex::new(refresh_tokens),
             pending_authorizations: Mutex::new(HashMap::new()),
+            persist_path,
+            dirty: AtomicBool::new(false),
         }
+    }
+
+    pub fn has_persist_path(&self) -> bool {
+        self.persist_path.is_some()
+    }
+
+    fn mark_dirty(&self) {
+        self.dirty.store(true, Ordering::Relaxed);
+    }
+
+    /// Force an immediate flush of persisted maps to disk, regardless of the dirty flag.
+    /// Used on graceful shutdown to capture any mutations from the last flush interval.
+    pub async fn flush(&self) -> anyhow::Result<()> {
+        let Some(path) = self.persist_path.as_deref() else {
+            return Ok(());
+        };
+        self.dirty.store(false, Ordering::Relaxed);
+        let snapshot = {
+            let clients = self.clients.lock().await;
+            let access = self.access_tokens.lock().await;
+            let refresh = self.refresh_tokens.lock().await;
+            persist::PersistedState::from_runtime(&clients, &access, &refresh)
+        };
+        persist::save(path, &snapshot).await
+    }
+
+    /// Flush only if the dirty flag is set. Clears the flag *before* writing so
+    /// concurrent mutations during the write re-mark it for the next tick.
+    pub async fn flush_if_dirty(&self) -> anyhow::Result<()> {
+        if self.persist_path.is_none() {
+            return Ok(());
+        }
+        if !self.dirty.swap(false, Ordering::Relaxed) {
+            return Ok(());
+        }
+        // Re-set dirty on failure so the next tick retries.
+        if let Err(e) = self.flush_inner().await {
+            self.dirty.store(true, Ordering::Relaxed);
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    async fn flush_inner(&self) -> anyhow::Result<()> {
+        let path = self.persist_path.as_deref().expect("flush_inner called without persist_path");
+        let snapshot = {
+            let clients = self.clients.lock().await;
+            let access = self.access_tokens.lock().await;
+            let refresh = self.refresh_tokens.lock().await;
+            persist::PersistedState::from_runtime(&clients, &access, &refresh)
+        };
+        persist::save(path, &snapshot).await
     }
 
     // -- Client operations --
@@ -109,6 +209,7 @@ impl OAuthState {
 
     pub async fn register_client(&self, client_id: String, info: ClientInfo) {
         self.clients.lock().await.insert(client_id, info);
+        self.mark_dirty();
     }
 
     pub async fn get_client_name(&self, client_id: &str) -> Option<Option<String>> {
@@ -128,6 +229,8 @@ impl OAuthState {
         match clients.get_mut(client_id) {
             Some(client) => {
                 client.authorized = true;
+                drop(clients);
+                self.mark_dirty();
                 true
             }
             None => false,
@@ -173,16 +276,22 @@ impl OAuthState {
 
     pub async fn insert_access_token(&self, token: String, info: TokenInfo) {
         self.access_tokens.lock().await.insert(token, info);
+        self.mark_dirty();
     }
 
     pub async fn revoke_access_token(&self, token: &str) {
-        self.access_tokens.lock().await.remove(token);
+        let mut tokens = self.access_tokens.lock().await;
+        if tokens.remove(token).is_some() {
+            drop(tokens);
+            self.mark_dirty();
+        }
     }
 
     // -- Refresh token operations --
 
     pub async fn insert_refresh_token(&self, token: String, info: RefreshInfo) {
         self.refresh_tokens.lock().await.insert(token, info);
+        self.mark_dirty();
     }
 
     /// Look up a refresh token and return a snapshot of its data.
@@ -198,14 +307,24 @@ impl OAuthState {
     }
 
     pub async fn remove_refresh_token(&self, token: &str) {
-        self.refresh_tokens.lock().await.remove(token);
+        let mut tokens = self.refresh_tokens.lock().await;
+        if tokens.remove(token).is_some() {
+            drop(tokens);
+            self.mark_dirty();
+        }
     }
 
     /// Mark a refresh token as superseded. Uses `get_or_insert` so that a
     /// grace-period retry does not bump the timestamp.
     pub async fn mark_refresh_superseded(&self, token: &str, now: Instant) {
-        if let Some(info) = self.refresh_tokens.lock().await.get_mut(token) {
+        let mut tokens = self.refresh_tokens.lock().await;
+        if let Some(info) = tokens.get_mut(token) {
+            let was_fresh = info.superseded_at.is_none();
             info.superseded_at.get_or_insert(now);
+            if was_fresh {
+                drop(tokens);
+                self.mark_dirty();
+            }
         }
     }
 
@@ -249,6 +368,10 @@ impl OAuthState {
                 false
             }
         });
+
+        if result.clients > 0 || result.access_tokens > 0 || result.refresh_tokens > 0 {
+            self.mark_dirty();
+        }
 
         result
     }

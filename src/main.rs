@@ -122,6 +122,13 @@ struct Cli {
     #[arg(long, env = "DELUGE_OAUTH_ISSUER")]
     oauth_issuer: Option<String>,
 
+    /// Path to a JSON file used to persist OAuth client registrations, access tokens,
+    /// and refresh tokens across restarts. Only meaningful with --oauth-issuer.
+    /// When unset, OAuth state is in-memory only and is lost on restart.
+    /// On Unix the file is chmod'd to 0600 because it contains bearer tokens.
+    #[arg(long, env = "DELUGE_OAUTH_STATE_FILE", value_name = "PATH")]
+    oauth_state_file: Option<std::path::PathBuf>,
+
     /// Connect to Deluge, print session status, and exit
     #[arg(long, default_value_t = false)]
     test_connection: bool,
@@ -395,20 +402,30 @@ async fn main() -> anyhow::Result<()> {
                 )
             };
 
+            let mut shutdown_oauth_state: Option<Arc<oauth::OAuthState>> = None;
+
             let app = if let Some(ref oauth_issuer) = cli.oauth_issuer {
                 // --- OAuth 2.1 mode ---
                 let issuer = oauth_issuer.trim_end_matches('/').to_string();
 
-                let oauth_state = Arc::new(oauth::OAuthState::new(
-                    issuer.clone(),
-                    cli.api_token.clone(),
-                ));
+                let oauth_state = Arc::new(
+                    oauth::OAuthState::new_with_persistence(
+                        issuer.clone(),
+                        cli.api_token.clone(),
+                        cli.oauth_state_file.clone(),
+                    )
+                    .await?,
+                );
                 oauth::cleanup::spawn_cleanup(oauth_state.clone());
+                oauth::persist::spawn_persistence(oauth_state.clone());
 
                 info!(
                     issuer = %issuer,
                     "OAuth 2.1 enabled. Metadata: {issuer}/.well-known/oauth-authorization-server"
                 );
+                if let Some(ref path) = cli.oauth_state_file {
+                    info!(path = %path.display(), "OAuth state persistence enabled");
+                }
 
                 let oauth_router = oauth::oauth_routes(oauth_state.clone());
 
@@ -416,6 +433,8 @@ async fn main() -> anyhow::Result<()> {
                     oauth_state.clone(),
                     oauth::middleware::oauth_auth_middleware,
                 );
+
+                shutdown_oauth_state = Some(oauth_state);
 
                 // Protected MCP routes — CORS permissive only on /mcp
                 let mcp_router = Router::new()
@@ -470,11 +489,20 @@ async fn main() -> anyhow::Result<()> {
             info!("Listening on http://{}/mcp", cli.http_bind);
 
             axum::serve(listener, app)
-                .with_graceful_shutdown(async {
+                .with_graceful_shutdown(async move {
                     tokio::signal::ctrl_c()
                         .await
                         .expect("failed to listen for ctrl-c");
                     info!("Shutting down HTTP server");
+                    if let Some(state) = shutdown_oauth_state {
+                        if state.has_persist_path() {
+                            if let Err(e) = state.flush().await {
+                                warn!(error = %e, "Final OAuth state flush failed");
+                            } else {
+                                info!("Flushed OAuth state to disk");
+                            }
+                        }
+                    }
                 })
                 .await?;
         }

@@ -30,7 +30,7 @@ Cargo for package management and build system
 | `tower-http` | CORS and tracing middleware layers for axum |
 | `tracing` | Logging |
 | `tracing-subscriber` | Log output formatting — **must be configured to write to stderr or a file, never stdout**. Any output on stdout corrupts the JSON-RPC framing used by the MCP stdio transport. |
-| `clap` | CLI args (Deluge host/port/credentials, transport selection, `--enable-tool`, `--disable-tool`, `--list-tools`, `--api-token`, `--http-bind`, `--test-connection`) — credentials can also be supplied via environment variables (`DELUGE_HOST`, `DELUGE_PORT`, `DELUGE_USERNAME`, `DELUGE_PASSWORD`, `DELUGE_API_TOKEN`) |
+| `clap` | CLI args (Deluge host/port/credentials, transport selection, `--enable-tool`, `--disable-tool`, `--list-tools`, `--api-token`, `--http-bind`, `--test-connection`, `--oauth-issuer`, `--oauth-state-file`) — credentials and OAuth settings can also be supplied via environment variables (`DELUGE_HOST`, `DELUGE_PORT`, `DELUGE_USERNAME`, `DELUGE_PASSWORD`, `DELUGE_API_TOKEN`, `DELUGE_OAUTH_ISSUER`, `DELUGE_OAUTH_STATE_FILE`) |
 
 rencode serialization is implemented internally as `src/rencode.rs` rather than using a third-party crate.
 
@@ -139,6 +139,21 @@ Deluge daemons use self-signed certificates by default. Certificate verification
 
 Implemented via `native-tls` with `danger_accept_invalid_certs(true)`. After the TLS handshake, the peer certificate is extracted via `peer_certificate()`, its DER bytes are hashed with SHA-256, and the fingerprint is either verified against the pinned value or logged as a WARN with the copy-pasteable `--cert-fingerprint` flag.
 
+### OAuth State Persistence
+
+By default OAuth state is held in memory only — every registered client, access token, and refresh token is lost on restart, so every MCP client has to re-register and re-consent. Passing `--oauth-state-file <PATH>` (or `DELUGE_OAUTH_STATE_FILE=<PATH>`) activates file-backed persistence for long-lived state.
+
+**What is persisted**: `clients` (dynamic client registrations), `access_tokens`, `refresh_tokens`.
+**What is not persisted**: authorization codes (10-min TTL) and pending consent-page sessions (5-min TTL). An in-flight OAuth flow interrupted by a restart simply restarts from the beginning.
+
+**Write strategy**: mutations set a dirty flag; a background task flushes every ~2 s if dirty. A final flush runs on graceful shutdown (Ctrl-C) to capture the last-interval window. Writes are atomic: JSON is written to `<path>.tmp` and then renamed over `<path>`.
+
+**File permissions**: on Unix the file is chmod'd to `0600` before rename because it contains bearer tokens. On Windows the file inherits default ACLs — choose a path inside a user-only directory.
+
+**Missing file on startup**: treated as empty. First-run behavior is unchanged.
+
+**Corrupt / unknown-version file**: logged as a `WARN`, renamed to `<path>.corrupt-<unix_ts>` for recovery, and startup proceeds with empty state rather than crashing. Clients re-register; no data beyond OAuth sessions is affected.
+
 ## File Structure
 
 | Path | Purpose |
@@ -150,6 +165,7 @@ Implemented via `native-tls` with `danger_accept_invalid_certs(true)`. After the
 | `src/rencode.rs` | Internal rencode serializer/deserializer (Deluge wire format). |
 | `src/deluge/mod.rs` | Deluge RPC client — TLS connection, cert fingerprint logging/pinning, auth, request multiplexing, zlib framing. |
 | `src/tools/mod.rs` | MCP tool implementations — all 21 tools, safety gate helpers, plugin watcher, Value→JSON conversion. |
+| `src/oauth/persist.rs` | Optional file-backed persistence for OAuth clients + access/refresh tokens — atomic JSON writes, `Instant` ↔ Unix conversion, debounced background flusher. |
 | `tests/` | Integration tests. |
 
 ## Commands
