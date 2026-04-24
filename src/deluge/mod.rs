@@ -35,7 +35,8 @@ const MAX_DECOMPRESSED_BYTES: usize = MAX_FRAME_BYTES * 4; // 128 MB decompresse
 
 type PendingMap = Mutex<HashMap<i64, oneshot::Sender<Result<Value>>>>;
 
-/// A push event received from the Deluge daemon via the RPC_EVENT wire message.
+/// A push event received from the Deluge daemon via the RPC_EVENT wire message,
+/// plus synthetic local events the client emits for connection lifecycle.
 #[derive(Debug, Clone)]
 pub enum DelugeEvent {
     TorrentAdded { info_hash: String, from_state: bool },
@@ -46,6 +47,11 @@ pub enum DelugeEvent {
     TorrentStorageMoved { info_hash: String, path: String },
     TorrentFileRenamed { info_hash: String, index: i64, name: String },
     TorrentFolderRenamed { info_hash: String, old_name: String, new_name: String },
+    PluginEnabled { name: String },
+    PluginDisabled { name: String },
+    /// Synthetic event fired locally after a (re)connect + event-interest registration.
+    /// Listeners that track server-side state (e.g. plugin enablement) should re-seed.
+    Reconnected,
     Unknown { name: String },
 }
 
@@ -252,6 +258,8 @@ impl DelugeClient {
                 Value::String("TorrentStorageMovedEvent".into()),
                 Value::String("TorrentFileRenamedEvent".into()),
                 Value::String("TorrentFolderRenamedEvent".into()),
+                Value::String("PluginEnabledEvent".into()),
+                Value::String("PluginDisabledEvent".into()),
             ])],
             vec![],
         )
@@ -261,6 +269,10 @@ impl DelugeClient {
         } else {
             debug!("Registered for Deluge push events");
         }
+
+        // Notify subscribers that we're (re)connected and re-subscribed.
+        // Has no effect on initial connect (no subscribers yet).
+        let _ = self.event_tx.send(DelugeEvent::Reconnected);
 
         Ok((LiveConn { generation, writer, pending }, auth_level))
     }
@@ -562,6 +574,8 @@ fn parse_event(name: &str, args: &[Value]) -> DelugeEvent {
             old_name: str_arg(1),
             new_name: str_arg(2),
         },
+        "PluginEnabledEvent" => DelugeEvent::PluginEnabled { name: str_arg(0) },
+        "PluginDisabledEvent" => DelugeEvent::PluginDisabled { name: str_arg(0) },
         _ => DelugeEvent::Unknown { name: name.to_string() },
     }
 }
