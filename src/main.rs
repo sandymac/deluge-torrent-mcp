@@ -99,6 +99,10 @@ struct Cli {
     #[arg(long = "disable-tool", alias = "disable-tools", value_name = "PATTERN", value_delimiter = ',', action = clap::ArgAction::Append)]
     disable: Vec<String>,
 
+    /// List all tools with their default enabled/disabled state and exit
+    #[arg(long, default_value_t = false)]
+    list_tools: bool,
+
     /// MCP transport to use
     #[arg(long, default_value = "stdio")]
     transport: Transport,
@@ -117,10 +121,6 @@ struct Cli {
     /// Can be combined with --api-token to also accept static tokens as a fallback.
     #[arg(long, env = "DELUGE_OAUTH_ISSUER")]
     oauth_issuer: Option<String>,
-
-    /// List all tools with their default enabled/disabled state and exit
-    #[arg(long, default_value_t = false)]
-    list_tools: bool,
 
     /// Connect to Deluge, print session status, and exit
     #[arg(long, default_value_t = false)]
