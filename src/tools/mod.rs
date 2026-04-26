@@ -133,8 +133,13 @@ struct MoveStorageParams {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 struct RenameFolderParams {
-    /// Target torrent info_hash.
-    info_hash: InfoHash,
+    /// Target torrent info_hash. 40-character hex SHA-1. Use deluge_list_torrents to discover valid values.
+    // Inlined as a plain String (not the InfoHash newtype) because schemars emits a bare `$ref`
+    // for scalar newtype fields, which some LLM clients fail to resolve and instead emit a
+    // numeric value derived from the hash's decimal digits. Vec<InfoHash> is fine because the
+    // enclosing array gives explicit type context.
+    #[schemars(regex(pattern = r"^[0-9a-fA-F]{40}$"))]
+    info_hash: String,
     /// Folder path prefix to rename, including the torrent root name and trailing slash (e.g. "MyTorrent/" or "MyTorrent/subfolder/").
     folder: String,
     /// Replacement folder path prefix. May include path separators. Deluge adds a trailing slash automatically.
@@ -584,7 +589,7 @@ impl DelugeServer {
         Parameters(p): Parameters<RenameFolderParams>,
     ) -> Result<String, String> {
         self.tool_gate("deluge_rename_folder")?;
-        Self::validate_info_hash(&p.info_hash.0)?;
+        Self::validate_info_hash(&p.info_hash)?;
         if p.folder.is_empty() {
             return Err(
                 "folder must not be empty.\n\
@@ -603,7 +608,7 @@ impl DelugeServer {
             .call(
                 "core.rename_folder",
                 vec![
-                    Value::String(p.info_hash.0),
+                    Value::String(p.info_hash),
                     Value::String(folder),
                     Value::String(p.new_name),
                 ],
@@ -1898,5 +1903,90 @@ mod tests {
         // Anything else goes through normal validation
         assert_eq!(DelugeServer::normalize_label_for_set("Movies").unwrap(), "movies");
         assert!(DelugeServer::normalize_label_for_set("bad name").is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // RenameFolderParams: regression guard for a bug where the scalar
+    // `info_hash: InfoHash` field generated a bare `$ref` JSON Schema. Some
+    // LLM clients failed to resolve the ref and emitted a numeric value
+    // composed of the hash's decimal digits (e.g. the hash
+    // `d91ebfafb0efc9a47dfb8bbd1560c90cfdc10fdb` became `910947815609010`),
+    // which the strict serde deserializer then rejected. The fix is to
+    // declare `info_hash: String` with an inline regex attribute so the
+    // schema is a self-contained `{"type": "string", "pattern": "..."}`.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn rename_folder_params_deserializes_string_info_hash() {
+        // The user's exact repro payload — must round-trip cleanly.
+        let payload = serde_json::json!({
+            "info_hash": "d91ebfafb0efc9a47dfb8bbd1560c90cfdc10fdb",
+            "folder": "We Have Always Lived in the Castle by Shirley Jackson/",
+            "new_name": "We Have Always Lived in the Castle (Bernadette Dunne)"
+        });
+        let p: RenameFolderParams = serde_json::from_value(payload).expect("must deserialize");
+        assert_eq!(p.info_hash, "d91ebfafb0efc9a47dfb8bbd1560c90cfdc10fdb");
+        assert_eq!(p.folder, "We Have Always Lived in the Castle by Shirley Jackson/");
+        assert_eq!(p.new_name, "We Have Always Lived in the Castle (Bernadette Dunne)");
+    }
+
+    #[test]
+    fn rename_folder_params_rejects_integer_info_hash() {
+        // 910947815609010 is the decimal-digit-only projection of the hash
+        // d91ebfafb0efc9a47dfb8bbd1560c90cfdc10fdb that triggered the bug.
+        // Strict typing must continue to reject it as a defence-in-depth
+        // measure even though the schema fix should keep LLMs from sending it.
+        let payload = serde_json::json!({
+            "info_hash": 910947815609010_u64,
+            "folder": "Foo/",
+            "new_name": "Bar"
+        });
+        let result: Result<RenameFolderParams, _> = serde_json::from_value(payload);
+        let err = match result {
+            Ok(_) => panic!("integer info_hash must be rejected"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("invalid type: integer") && err.contains("expected a string"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn rename_folder_params_schema_inlines_info_hash() {
+        let schema = serde_json::to_value(schemars::schema_for!(RenameFolderParams)).unwrap();
+        let info_hash = schema
+            .pointer("/properties/info_hash")
+            .expect("info_hash property must exist");
+        assert!(
+            info_hash.get("$ref").is_none(),
+            "info_hash must not be a bare $ref — it confuses LLM clients. Schema was: {info_hash:#}"
+        );
+        assert_eq!(
+            info_hash.get("type").and_then(|v| v.as_str()),
+            Some("string"),
+            "info_hash must be type:string. Schema was: {info_hash:#}"
+        );
+        assert_eq!(
+            info_hash.get("pattern").and_then(|v| v.as_str()),
+            Some(r"^[0-9a-fA-F]{40}$"),
+            "info_hash must keep the 40-hex-char pattern. Schema was: {info_hash:#}"
+        );
+    }
+
+    #[test]
+    fn vec_info_hash_schema_keeps_array_type_keyword() {
+        // Sanity check on the working case: Vec<InfoHash> fields generate an
+        // array schema with explicit `"type": "array"`, which is what gives
+        // LLMs the type context that the bare `$ref` form lacked.
+        let schema = serde_json::to_value(schemars::schema_for!(RenameFilesParams)).unwrap();
+        let info_hashes = schema
+            .pointer("/properties/info_hashes")
+            .expect("info_hashes property must exist");
+        assert_eq!(
+            info_hashes.get("type").and_then(|v| v.as_str()),
+            Some("array"),
+            "info_hashes must be type:array. Schema was: {info_hashes:#}"
+        );
     }
 }
