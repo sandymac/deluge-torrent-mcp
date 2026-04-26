@@ -409,7 +409,7 @@ dependencies = [
 
 [[package]]
 name = "deluge-torrent-mcp"
-version = "0.7.4"
+version = "0.7.5"
 dependencies = [
  "anyhow",
  "axum",
