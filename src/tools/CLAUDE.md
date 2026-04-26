@@ -47,6 +47,47 @@ torrent (idempotent)" when `idempotent_hint = true` is set.
   This generates a JSON Schema `enum` constraint, removing the need to list values in prose
   and giving the LLM a machine-readable constraint.
 
+## Wire Shape Robustness
+
+An upstream tool-call serializer between the LLM and the MCP server has been observed
+silently coercing scalar string values that pattern-match as hex/numeric into integers —
+e.g. `info_hash: "d31ebfafb0efc9a47dfb8bbd1560c90cfdc10fdb"` arrived at the server as the
+integer `310947815609010` (decimal digits stripped, alpha chars dropped). The integer is
+on the wire before the server sees it, so no schema-side change (regex pattern, inline
+type, `$ref` removal) can recover the original string. The historical `deluge_rename_folder`
+hit this exact bug.
+
+**Rule:** for any string parameter whose value can pattern-match as a number — torrent
+info_hashes, file hashes, content hashes, all-digit IDs — use a length-1 `Vec` instead of
+a scalar `String`:
+
+```rust
+#[derive(Deserialize, schemars::JsonSchema)]
+struct MyToolParams {
+    /// Exactly one info_hash to operate on.
+    #[schemars(length(min = 1, max = 1))]
+    info_hashes: Vec<InfoHash>,
+    // ...
+}
+```
+
+In the tool body, validate the length and unwrap:
+
+```rust
+Self::validate_info_hashes(&p.info_hashes)?;
+if p.info_hashes.len() != 1 {
+    return Err("my_tool operates on a single torrent. Provide exactly one info_hash.".to_string());
+}
+let hash = p.info_hashes.into_iter().next().unwrap();
+```
+
+The JSON array context locks the element type as string and survives the round trip. Scalar
+strings whose values are obviously non-numeric (paths, names, free-form text) are unaffected
+and stay as `String`.
+
+For tools that genuinely operate on a batch (e.g. `deluge_pause_torrent`), use `Vec<InfoHash>`
+without the length constraint — same shape, same robustness.
+
 ## What Goes Where
 
 | Information | Where to put it |
