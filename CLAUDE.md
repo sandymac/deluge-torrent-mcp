@@ -75,7 +75,7 @@ Deluge exposes a custom binary RPC protocol over TCP (default port 58846). The d
 | `get_label_options` | `label.get_options` | Get a label's default options (speed caps, ratio handling, etc.) (requires Label plugin) |
 | `set_label_options` | `label.set_options` | Set a label's default options; applied to every torrent carrying the label (requires Label plugin) |
 
-`list_torrents` also accepts a `label` filter and, when the Label plugin is active, includes each torrent's `label` in the returned status fields.
+`list_torrents` accepts filters for `state`, `label` (when the Label plugin is active), `name_contains` (case-insensitive substring, pushed to Deluge's native server-side `name` filter), and `save_path_contains` (case-insensitive substring, applied client-side). It also accepts `sort_by` (one of `name`, `save_path`, `progress`, `total_size`, `download_payload_rate`, `upload_payload_rate`, `eta`, `time_added`, `ratio`) and `sort_order` (`asc` or `desc`). Filters apply before pagination so `total` reflects the filtered count. When the Label plugin is active, each returned torrent also includes its `label`.
 
 Torrents are identified by their **info hash** (40-character hex string / SHA-1).
 

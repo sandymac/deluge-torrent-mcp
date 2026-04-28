@@ -176,6 +176,27 @@ enum TorrentState {
     Allocating,
 }
 
+#[derive(Deserialize, schemars::JsonSchema, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum SortField {
+    Name,
+    SavePath,
+    Progress,
+    TotalSize,
+    DownloadPayloadRate,
+    UploadPayloadRate,
+    Eta,
+    TimeAdded,
+    Ratio,
+}
+
+#[derive(Deserialize, schemars::JsonSchema, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum SortOrder {
+    Asc,
+    Desc,
+}
+
 #[derive(Deserialize, schemars::JsonSchema)]
 struct ListTorrentsParams {
     /// Filter by torrent state. Omit to return all torrents.
@@ -183,6 +204,14 @@ struct ListTorrentsParams {
     /// Filter by Deluge label. Requires the Label plugin to be enabled on the daemon.
     /// Pass the empty string to filter for unlabeled torrents.
     label: Option<String>,
+    /// Case-insensitive substring match on torrent name (server-side via Deluge's native filter).
+    name_contains: Option<String>,
+    /// Case-insensitive substring match on save_path.
+    save_path_contains: Option<String>,
+    /// Field to sort by (default: name).
+    sort_by: Option<SortField>,
+    /// Sort direction (default: asc).
+    sort_order: Option<SortOrder>,
     /// Max torrents per page (default: 100).
     limit: Option<usize>,
     /// Torrents to skip (default: 0). Use next_offset from previous response to paginate.
@@ -327,12 +356,13 @@ impl DelugeServer {
         Ok(serde_json::to_string_pretty(&serde_json::Value::Object(results)).unwrap_or_default())
     }
 
-    /// List torrents in Deluge with their current status, with optional state filtering and pagination.
+    /// List torrents in Deluge with their current status, with filtering, sorting, and pagination.
     /// WORKFLOW: Use this first to discover torrents and obtain info_hash values required by all other tools.
     /// Returns a summary header (total, returned, offset, limit, has_more, next_offset) followed by
     /// a 'torrents' object keyed by info_hash. Each torrent contains: name, state, progress (0–100),
     /// total_size (bytes), download_payload_rate (bytes/sec), upload_payload_rate (bytes/sec),
     /// eta (seconds to completion, -1 if not applicable), save_path.
+    /// Filters apply before pagination, so 'total' reflects the filtered count.
     /// If has_more is true, call again with offset=next_offset to retrieve the next page.
     #[tool(name = "deluge_list_torrents", title = "List Torrents", annotations(read_only_hint = true, open_world_hint = false))]
     async fn list_torrents(
@@ -341,6 +371,8 @@ impl DelugeServer {
     ) -> Result<String, String> {
         let limit = p.limit.unwrap_or(100).max(1);
         let offset = p.offset.unwrap_or(0);
+        let sort_by = p.sort_by.unwrap_or(SortField::Name);
+        let sort_order = p.sort_order.unwrap_or(SortOrder::Asc);
 
         let label_plugin_active = *self.label_plugin_active.read().unwrap();
 
@@ -352,6 +384,7 @@ impl DelugeServer {
             );
         }
 
+        // Server-side filters: state, label, name (substring, case-insensitive in Deluge default).
         let mut filter_pairs: Vec<(Value, Value)> = Vec::new();
         if let Some(ref s) = p.state {
             let state_str = serde_json::to_value(s)
@@ -366,22 +399,48 @@ impl DelugeServer {
                 Value::String(label.clone()),
             ));
         }
+        if let Some(ref needle) = p.name_contains {
+            filter_pairs.push((
+                Value::String("name".into()),
+                Value::String(needle.clone()),
+            ));
+        }
         let filter = Value::Dict(filter_pairs);
 
-        let mut keys_list = vec![
-            Value::String("name".into()),
-            Value::String("state".into()),
-            Value::String("progress".into()),
-            Value::String("total_size".into()),
-            Value::String("download_payload_rate".into()),
-            Value::String("upload_payload_rate".into()),
-            Value::String("eta".into()),
-            Value::String("save_path".into()),
+        // Base keys returned to the caller.
+        let base_keys: &[&str] = &[
+            "name",
+            "state",
+            "progress",
+            "total_size",
+            "download_payload_rate",
+            "upload_payload_rate",
+            "eta",
+            "save_path",
         ];
+        let mut keys_set: HashSet<&str> = base_keys.iter().copied().collect();
         if label_plugin_active {
-            keys_list.push(Value::String("label".into()));
+            keys_set.insert("label");
         }
-        let keys = Value::List(keys_list);
+        // Helper keys requested only to support sort. Tracked so we can strip them
+        // from the response if they aren't part of the base set.
+        let mut helper_keys: Vec<&str> = Vec::new();
+        let extra_for_sort: Option<&str> = match sort_by {
+            SortField::TimeAdded => Some("time_added"),
+            SortField::Ratio => Some("ratio"),
+            _ => None,
+        };
+        if let Some(k) = extra_for_sort {
+            if keys_set.insert(k) {
+                helper_keys.push(k);
+            }
+        }
+        let keys = Value::List(
+            keys_set
+                .iter()
+                .map(|k| Value::String((*k).into()))
+                .collect(),
+        );
 
         let result = self.client
             .call("core.get_torrents_status", vec![filter, keys], vec![])
@@ -393,12 +452,44 @@ impl DelugeServer {
             other => return Ok(Self::value_to_json_string(other)),
         };
 
+        // Client-side filter: save_path substring (no Deluge native equivalent).
+        if let Some(ref needle) = p.save_path_contains {
+            let needle = needle.to_lowercase();
+            pairs.retain(|(_, v)| {
+                Self::extract_str(v, "save_path")
+                    .map(|s| s.to_lowercase().contains(&needle))
+                    .unwrap_or(false)
+            });
+        }
+
         let total = pairs.len();
 
-        // Sort by name for deterministic pagination
+        // Primary sort + name-asc tiebreak, so pagination is stable when the primary key has ties.
         pairs.sort_by(|(_, a), (_, b)| {
-            Self::torrent_name(a).cmp(Self::torrent_name(b))
+            use std::cmp::Ordering;
+            let primary = match sort_by {
+                SortField::Name => Self::torrent_name(a).cmp(Self::torrent_name(b)),
+                SortField::SavePath => Self::extract_str(a, "save_path")
+                    .unwrap_or("")
+                    .cmp(Self::extract_str(b, "save_path").unwrap_or("")),
+                SortField::Progress => Self::cmp_num(a, b, "progress"),
+                SortField::TotalSize => Self::cmp_num(a, b, "total_size"),
+                SortField::DownloadPayloadRate => {
+                    Self::cmp_num(a, b, "download_payload_rate")
+                }
+                SortField::UploadPayloadRate => Self::cmp_num(a, b, "upload_payload_rate"),
+                SortField::Eta => Self::cmp_num(a, b, "eta"),
+                SortField::TimeAdded => Self::cmp_num(a, b, "time_added"),
+                SortField::Ratio => Self::cmp_num(a, b, "ratio"),
+            };
+            match primary {
+                Ordering::Equal => Self::torrent_name(a).cmp(Self::torrent_name(b)),
+                other => other,
+            }
         });
+        if matches!(sort_order, SortOrder::Desc) {
+            pairs.reverse();
+        }
 
         let page: Vec<_> = pairs.into_iter().skip(offset).take(limit).collect();
         let returned = page.len();
@@ -415,7 +506,16 @@ impl DelugeServer {
         }
 
         let mut torrents = serde_json::Map::new();
-        for (k, v) in page {
+        for (k, mut v) in page {
+            // Strip helper keys so the response shape stays stable.
+            if !helper_keys.is_empty() {
+                if let Value::Dict(ref mut fields) = v {
+                    fields.retain(|(fk, _)| match fk {
+                        Value::String(s) => !helper_keys.iter().any(|h| h == s),
+                        _ => true,
+                    });
+                }
+            }
             let key = match k {
                 Value::String(s) => s,
                 other => format!("{other:?}"),
@@ -1275,18 +1375,52 @@ impl DelugeServer {
         }
     }
 
-    /// Extract the torrent name from a torrent status Value for sorting purposes.
-    fn torrent_name(v: &Value) -> &str {
+    /// Extract a named field from a torrent status Value (a `Value::Dict`).
+    /// Returns None for non-Dict values or missing keys.
+    fn extract_field<'a>(v: &'a Value, field: &str) -> Option<&'a Value> {
         if let Value::Dict(fields) = v {
             for (k, val) in fields {
-                if matches!(k, Value::String(s) if s == "name") {
-                    if let Value::String(s) = val {
-                        return s.as_str();
-                    }
+                if matches!(k, Value::String(s) if s == field) {
+                    return Some(val);
                 }
             }
         }
-        ""
+        None
+    }
+
+    /// Extract a string field. Non-string or missing fields return None.
+    fn extract_str<'a>(v: &'a Value, field: &str) -> Option<&'a str> {
+        match Self::extract_field(v, field) {
+            Some(Value::String(s)) => Some(s.as_str()),
+            _ => None,
+        }
+    }
+
+    /// Extract a numeric field as f64. Coerces Int, Float32, and Float64.
+    /// Non-numeric or missing fields return None.
+    fn extract_num(v: &Value, field: &str) -> Option<f64> {
+        match Self::extract_field(v, field) {
+            Some(Value::Int(i)) => Some(*i as f64),
+            Some(Value::Float32(f)) => Some(*f as f64),
+            Some(Value::Float64(f)) => Some(*f),
+            _ => None,
+        }
+    }
+
+    /// Extract the torrent name. Used as a stable tie-breaker during sort.
+    fn torrent_name(v: &Value) -> &str {
+        Self::extract_str(v, "name").unwrap_or("")
+    }
+
+    /// Compare two torrent dicts by a numeric field. Missing or non-numeric values
+    /// sort as Equal. Uses partial_cmp; NaN compares as Equal.
+    fn cmp_num(a: &Value, b: &Value, field: &str) -> std::cmp::Ordering {
+        let av = Self::extract_num(a, field);
+        let bv = Self::extract_num(b, field);
+        match (av, bv) {
+            (Some(x), Some(y)) => x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal),
+            _ => std::cmp::Ordering::Equal,
+        }
     }
 
     fn value_to_string(v: Value) -> String {
@@ -1985,5 +2119,131 @@ mod tests {
             schema.pointer("/properties/info_hash").is_none(),
             "info_hash (scalar) must not exist — use info_hashes (array) to avoid upstream coercion."
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // ListTorrentsParams: filter/sort surface (issue #6).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn list_torrents_params_empty_object_uses_defaults() {
+        let p: ListTorrentsParams = serde_json::from_value(serde_json::json!({}))
+            .expect("empty object must deserialize");
+        assert!(p.state.is_none());
+        assert!(p.label.is_none());
+        assert!(p.name_contains.is_none());
+        assert!(p.save_path_contains.is_none());
+        assert!(p.sort_by.is_none());
+        assert!(p.sort_order.is_none());
+        assert!(p.limit.is_none());
+        assert!(p.offset.is_none());
+    }
+
+    #[test]
+    fn list_torrents_params_accepts_all_new_fields() {
+        let payload = serde_json::json!({
+            "state": "Downloading",
+            "label": "movies",
+            "name_contains": "ubuntu",
+            "save_path_contains": "/media/",
+            "sort_by": "total_size",
+            "sort_order": "desc",
+            "limit": 25,
+            "offset": 50,
+        });
+        let p: ListTorrentsParams = serde_json::from_value(payload).expect("must deserialize");
+        assert_eq!(p.name_contains.as_deref(), Some("ubuntu"));
+        assert_eq!(p.save_path_contains.as_deref(), Some("/media/"));
+        assert!(matches!(p.sort_by, Some(SortField::TotalSize)));
+        assert!(matches!(p.sort_order, Some(SortOrder::Desc)));
+        assert_eq!(p.limit, Some(25));
+        assert_eq!(p.offset, Some(50));
+    }
+
+    #[test]
+    fn list_torrents_params_rejects_unknown_sort_field() {
+        let payload = serde_json::json!({ "sort_by": "bogus" });
+        let result: Result<ListTorrentsParams, _> = serde_json::from_value(payload);
+        assert!(result.is_err(), "unknown sort_by variant must be rejected");
+    }
+
+    #[test]
+    fn sort_field_schema_lists_all_variants() {
+        let schema = serde_json::to_value(schemars::schema_for!(ListTorrentsParams)).unwrap();
+        // Resolve the SortField enum either inline or via $ref to $defs.
+        let sort_by = schema
+            .pointer("/properties/sort_by")
+            .expect("sort_by property must exist");
+        let variants = collect_enum_variants(&schema, sort_by);
+        let expected: Vec<&str> = vec![
+            "name",
+            "save_path",
+            "progress",
+            "total_size",
+            "download_payload_rate",
+            "upload_payload_rate",
+            "eta",
+            "time_added",
+            "ratio",
+        ];
+        for v in &expected {
+            assert!(
+                variants.iter().any(|x| x == v),
+                "SortField schema is missing variant {v:?}; got {variants:?}"
+            );
+        }
+        assert_eq!(
+            variants.len(),
+            expected.len(),
+            "SortField schema variant count mismatch — got {variants:?}"
+        );
+    }
+
+    #[test]
+    fn sort_order_schema_lists_asc_desc() {
+        let schema = serde_json::to_value(schemars::schema_for!(ListTorrentsParams)).unwrap();
+        let sort_order = schema
+            .pointer("/properties/sort_order")
+            .expect("sort_order property must exist");
+        let variants = collect_enum_variants(&schema, sort_order);
+        assert_eq!(
+            variants,
+            vec!["asc".to_string(), "desc".to_string()],
+            "SortOrder schema must list exactly [asc, desc]"
+        );
+    }
+
+    /// Walk an enum-typed schema node, following a single $ref into $defs if needed,
+    /// and return the list of string enum variants. Handles schemars' Option<EnumType>
+    /// shape where the Option wraps the enum either inline or via $ref.
+    fn collect_enum_variants(
+        root: &serde_json::Value,
+        node: &serde_json::Value,
+    ) -> Vec<String> {
+        // Direct enum on this node.
+        if let Some(arr) = node.get("enum").and_then(|v| v.as_array()) {
+            return arr
+                .iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect();
+        }
+        // Option<T> shape from schemars: anyOf containing the enum type plus null.
+        if let Some(arr) = node.get("anyOf").and_then(|v| v.as_array()) {
+            for item in arr {
+                let v = collect_enum_variants(root, item);
+                if !v.is_empty() {
+                    return v;
+                }
+            }
+        }
+        // $ref into $defs/<TypeName>.
+        if let Some(reference) = node.get("$ref").and_then(|v| v.as_str()) {
+            // Strip leading "#/" if present.
+            let path = reference.trim_start_matches("#");
+            if let Some(target) = root.pointer(path) {
+                return collect_enum_variants(root, target);
+            }
+        }
+        Vec::new()
     }
 }
