@@ -132,7 +132,7 @@ Deluge ships a built-in **Label** plugin for grouping and bulk-operating on torr
 | `delete_label` | disabled — requires `--enable-tool=delete_label` |
 | `set_label_options` | disabled — requires `--enable-tool=set_label_options` |
 
-`list_torrents` also accepts an optional `label` filter and, when the plugin is active, includes each torrent's `label` in the returned status fields.
+`list_torrents` accepts filters for `state`, `label` (when the plugin is active), `name_contains` (case-insensitive substring, pushed to Deluge's native server-side `name` filter), and `save_path_contains` (case-insensitive substring, applied client-side). It also accepts `sort_by` (one of `name`, `save_path`, `progress`, `total_size`, `download_payload_rate`, `upload_payload_rate`, `eta`, `time_added`, `ratio`) and `sort_order` (`asc` or `desc`). Filters apply before pagination so `total` reflects the filtered count. When the plugin is active, each returned torrent also includes its `label`.
 
 Because `--enable-tool` matches any substring of a tool name, a single `--enable-tool=label` enables every label tool at once (including the default-disabled `create_label`, `delete_label`, and `set_label_options`). Use more specific patterns — e.g. `--enable-tool=create_label` — to enable only one.
 
