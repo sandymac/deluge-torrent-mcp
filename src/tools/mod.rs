@@ -454,42 +454,12 @@ impl DelugeServer {
 
         // Client-side filter: save_path substring (no Deluge native equivalent).
         if let Some(ref needle) = p.save_path_contains {
-            let needle = needle.to_lowercase();
-            pairs.retain(|(_, v)| {
-                Self::extract_str(v, "save_path")
-                    .map(|s| s.to_lowercase().contains(&needle))
-                    .unwrap_or(false)
-            });
+            Self::filter_by_save_path_substring(&mut pairs, needle);
         }
 
         let total = pairs.len();
 
-        // Primary sort + name-asc tiebreak, so pagination is stable when the primary key has ties.
-        pairs.sort_by(|(_, a), (_, b)| {
-            use std::cmp::Ordering;
-            let primary = match sort_by {
-                SortField::Name => Self::torrent_name(a).cmp(Self::torrent_name(b)),
-                SortField::SavePath => Self::extract_str(a, "save_path")
-                    .unwrap_or("")
-                    .cmp(Self::extract_str(b, "save_path").unwrap_or("")),
-                SortField::Progress => Self::cmp_num(a, b, "progress"),
-                SortField::TotalSize => Self::cmp_num(a, b, "total_size"),
-                SortField::DownloadPayloadRate => {
-                    Self::cmp_num(a, b, "download_payload_rate")
-                }
-                SortField::UploadPayloadRate => Self::cmp_num(a, b, "upload_payload_rate"),
-                SortField::Eta => Self::cmp_num(a, b, "eta"),
-                SortField::TimeAdded => Self::cmp_num(a, b, "time_added"),
-                SortField::Ratio => Self::cmp_num(a, b, "ratio"),
-            };
-            match primary {
-                Ordering::Equal => Self::torrent_name(a).cmp(Self::torrent_name(b)),
-                other => other,
-            }
-        });
-        if matches!(sort_order, SortOrder::Desc) {
-            pairs.reverse();
-        }
+        Self::sort_torrent_pairs(&mut pairs, sort_by, sort_order);
 
         let page: Vec<_> = pairs.into_iter().skip(offset).take(limit).collect();
         let returned = page.len();
@@ -507,15 +477,7 @@ impl DelugeServer {
 
         let mut torrents = serde_json::Map::new();
         for (k, mut v) in page {
-            // Strip helper keys so the response shape stays stable.
-            if !helper_keys.is_empty() {
-                if let Value::Dict(ref mut fields) = v {
-                    fields.retain(|(fk, _)| match fk {
-                        Value::String(s) => !helper_keys.iter().any(|h| h == s),
-                        _ => true,
-                    });
-                }
-            }
+            Self::strip_helper_keys(&mut v, &helper_keys);
             let key = match k {
                 Value::String(s) => s,
                 other => format!("{other:?}"),
@@ -1423,6 +1385,67 @@ impl DelugeServer {
         }
     }
 
+    /// Retain only torrent pairs whose `save_path` contains `needle` (case-insensitive).
+    /// Pairs missing a string `save_path` are dropped.
+    fn filter_by_save_path_substring(pairs: &mut Vec<(Value, Value)>, needle: &str) {
+        let needle = needle.to_lowercase();
+        pairs.retain(|(_, v)| {
+            Self::extract_str(v, "save_path")
+                .map(|s| s.to_lowercase().contains(&needle))
+                .unwrap_or(false)
+        });
+    }
+
+    /// Sort torrent pairs by `sort_by` in `sort_order`, with name-asc as a stable
+    /// tiebreaker. The tiebreak is preserved under desc — only the primary
+    /// comparator is inverted, so torrents tied on the primary key still come back
+    /// in name-asc order, giving deterministic pagination in both directions.
+    fn sort_torrent_pairs(
+        pairs: &mut [(Value, Value)],
+        sort_by: SortField,
+        sort_order: SortOrder,
+    ) {
+        pairs.sort_by(|(_, a), (_, b)| {
+            use std::cmp::Ordering;
+            let primary = match sort_by {
+                SortField::Name => Self::torrent_name(a).cmp(Self::torrent_name(b)),
+                SortField::SavePath => Self::extract_str(a, "save_path")
+                    .unwrap_or("")
+                    .cmp(Self::extract_str(b, "save_path").unwrap_or("")),
+                SortField::Progress => Self::cmp_num(a, b, "progress"),
+                SortField::TotalSize => Self::cmp_num(a, b, "total_size"),
+                SortField::DownloadPayloadRate => Self::cmp_num(a, b, "download_payload_rate"),
+                SortField::UploadPayloadRate => Self::cmp_num(a, b, "upload_payload_rate"),
+                SortField::Eta => Self::cmp_num(a, b, "eta"),
+                SortField::TimeAdded => Self::cmp_num(a, b, "time_added"),
+                SortField::Ratio => Self::cmp_num(a, b, "ratio"),
+            };
+            let primary = if matches!(sort_order, SortOrder::Desc) {
+                primary.reverse()
+            } else {
+                primary
+            };
+            match primary {
+                Ordering::Equal => Self::torrent_name(a).cmp(Self::torrent_name(b)),
+                other => other,
+            }
+        });
+    }
+
+    /// Strip helper keys from a torrent status `Value::Dict` in place. No-op for
+    /// non-Dict values or when `helper_keys` is empty.
+    fn strip_helper_keys(v: &mut Value, helper_keys: &[&str]) {
+        if helper_keys.is_empty() {
+            return;
+        }
+        if let Value::Dict(ref mut fields) = v {
+            fields.retain(|(fk, _)| match fk {
+                Value::String(s) => !helper_keys.iter().any(|h| h == s),
+                _ => true,
+            });
+        }
+    }
+
     fn value_to_string(v: Value) -> String {
         serde_json::to_string(&crate::rencode::value_to_json(v)).unwrap_or_default()
     }
@@ -2211,6 +2234,165 @@ mod tests {
             vec!["asc".to_string(), "desc".to_string()],
             "SortOrder schema must list exactly [asc, desc]"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // ListTorrentsParams: runtime behavior — filtering, sorting (incl. the
+    // desc-tiebreak invariant), and helper-key stripping. The schema/deserialize
+    // tests above are not enough on their own: a regression in the live
+    // `list_torrents` output (e.g. flipping the tiebreak under desc) would still
+    // pass them. These tests pin the actual filter/sort/strip behavior.
+    // -----------------------------------------------------------------------
+
+    /// Build a torrent dict with the given fields. Numeric values default to
+    /// `Value::Float64` so they round-trip through `cmp_num` like Deluge's wire
+    /// values.
+    fn td(name: &str, save_path: &str, num_fields: &[(&str, f64)]) -> Value {
+        let mut fields: Vec<(Value, Value)> = vec![
+            (Value::String("name".into()), Value::String(name.into())),
+            (
+                Value::String("save_path".into()),
+                Value::String(save_path.into()),
+            ),
+        ];
+        for (k, v) in num_fields {
+            fields.push((Value::String((*k).into()), Value::Float64(*v)));
+        }
+        Value::Dict(fields)
+    }
+
+    fn pair(hash: &str, dict: Value) -> (Value, Value) {
+        (Value::String(hash.into()), dict)
+    }
+
+    fn names(pairs: &[(Value, Value)]) -> Vec<&str> {
+        pairs
+            .iter()
+            .map(|(_, v)| DelugeServer::torrent_name(v))
+            .collect()
+    }
+
+    #[test]
+    fn filter_by_save_path_substring_is_case_insensitive() {
+        let mut pairs = vec![
+            pair("a", td("AlphaBook", "/srv/Media/audiobooks", &[])),
+            pair("b", td("BetaBook", "/srv/media/ebooks", &[])),
+            pair("c", td("GammaBook", "/srv/data/other", &[])),
+            // Missing save_path: dropped.
+            pair(
+                "d",
+                Value::Dict(vec![(
+                    Value::String("name".into()),
+                    Value::String("DeltaBook".into()),
+                )]),
+            ),
+        ];
+        DelugeServer::filter_by_save_path_substring(&mut pairs, "MEDIA");
+        assert_eq!(names(&pairs), vec!["AlphaBook", "BetaBook"]);
+    }
+
+    #[test]
+    fn filter_by_save_path_substring_empty_needle_keeps_all_with_save_path() {
+        let mut pairs = vec![
+            pair("a", td("Alpha", "/x", &[])),
+            pair("b", td("Beta", "/y", &[])),
+        ];
+        let before = pairs.len();
+        DelugeServer::filter_by_save_path_substring(&mut pairs, "");
+        assert_eq!(pairs.len(), before);
+    }
+
+    #[test]
+    fn sort_torrent_pairs_asc_by_total_size_tiebreaks_by_name() {
+        let mut pairs = vec![
+            pair("a", td("Charlie", "/x", &[("total_size", 100.0)])),
+            pair("b", td("Alpha", "/x", &[("total_size", 100.0)])),
+            pair("c", td("Bravo", "/x", &[("total_size", 50.0)])),
+        ];
+        DelugeServer::sort_torrent_pairs(&mut pairs, SortField::TotalSize, SortOrder::Asc);
+        // 50 first, then the 100s in name-asc order.
+        assert_eq!(names(&pairs), vec!["Bravo", "Alpha", "Charlie"]);
+    }
+
+    #[test]
+    fn sort_torrent_pairs_desc_inverts_primary_only() {
+        // Regression test: under desc the primary comparator must be inverted,
+        // but the name-asc tiebreak must be preserved. A naive `pairs.reverse()`
+        // after an asc sort would invert both, making tied groups come back in
+        // name-desc order.
+        let mut pairs = vec![
+            pair("a", td("Charlie", "/x", &[("total_size", 100.0)])),
+            pair("b", td("Alpha", "/x", &[("total_size", 100.0)])),
+            pair("c", td("Bravo", "/x", &[("total_size", 50.0)])),
+        ];
+        DelugeServer::sort_torrent_pairs(&mut pairs, SortField::TotalSize, SortOrder::Desc);
+        // 100s first (desc on primary), but tied group is still Alpha < Charlie.
+        assert_eq!(names(&pairs), vec!["Alpha", "Charlie", "Bravo"]);
+    }
+
+    #[test]
+    fn sort_torrent_pairs_desc_by_name_is_pure_name_desc() {
+        // When the primary key IS name, desc gives a straight name-desc ordering.
+        let mut pairs = vec![
+            pair("a", td("Alpha", "/x", &[])),
+            pair("b", td("Charlie", "/x", &[])),
+            pair("c", td("Bravo", "/x", &[])),
+        ];
+        DelugeServer::sort_torrent_pairs(&mut pairs, SortField::Name, SortOrder::Desc);
+        assert_eq!(names(&pairs), vec!["Charlie", "Bravo", "Alpha"]);
+    }
+
+    #[test]
+    fn sort_torrent_pairs_missing_numeric_fields_sort_as_equal() {
+        // When neither side has the numeric field, primary is Equal and the
+        // tiebreak (name-asc) decides regardless of asc/desc on the primary.
+        let mut pairs = vec![
+            pair("a", td("Charlie", "/x", &[])),
+            pair("b", td("Alpha", "/x", &[])),
+            pair("c", td("Bravo", "/x", &[])),
+        ];
+        DelugeServer::sort_torrent_pairs(&mut pairs, SortField::Ratio, SortOrder::Desc);
+        assert_eq!(names(&pairs), vec!["Alpha", "Bravo", "Charlie"]);
+    }
+
+    #[test]
+    fn strip_helper_keys_removes_listed_keys_only() {
+        let mut v = td(
+            "Alpha",
+            "/x",
+            &[("total_size", 100.0), ("time_added", 12345.0), ("ratio", 1.5)],
+        );
+        DelugeServer::strip_helper_keys(&mut v, &["time_added", "ratio"]);
+        let Value::Dict(fields) = &v else {
+            panic!("expected Dict");
+        };
+        let keys: Vec<&str> = fields
+            .iter()
+            .filter_map(|(k, _)| match k {
+                Value::String(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(keys.contains(&"name"));
+        assert!(keys.contains(&"save_path"));
+        assert!(keys.contains(&"total_size"));
+        assert!(!keys.contains(&"time_added"));
+        assert!(!keys.contains(&"ratio"));
+    }
+
+    #[test]
+    fn strip_helper_keys_empty_list_is_noop() {
+        let mut v = td("Alpha", "/x", &[("time_added", 12345.0)]);
+        let before = v.clone();
+        DelugeServer::strip_helper_keys(&mut v, &[]);
+        // Field set is identical.
+        let Value::Dict(after_fields) = &v else {
+            panic!("expected Dict");
+        };
+        let Value::Dict(before_fields) = &before else {
+            panic!("expected Dict");
+        };
+        assert_eq!(before_fields.len(), after_fields.len());
     }
 
     /// Walk an enum-typed schema node, following a single $ref into $defs if needed,
