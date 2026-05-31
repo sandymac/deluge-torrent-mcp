@@ -1,15 +1,15 @@
 // Copyright (c) 2026 Sandy McArthur, Jr.
 // SPDX-License-Identifier: MIT
 
-/// Internal rencode serializer/deserializer for the Deluge RPC wire format.
-///
-/// rencode is a compact binary encoding similar to bencoding but supporting
-/// more types. Deluge uses it to serialize RPC request/response tuples before
-/// zlib-compressing and framing them.
-///
-/// Independent Rust implementation of the rencode wire format (no code is
-/// derived from any existing rencode library). Format reference:
-/// <https://github.com/aresch/rencode>
+//! Internal rencode serializer/deserializer for the Deluge RPC wire format.
+//!
+//! rencode is a compact binary encoding similar to bencoding but supporting
+//! more types. Deluge uses it to serialize RPC request/response tuples before
+//! zlib-compressing and framing them.
+//!
+//! Independent Rust implementation of the rencode wire format (no code is
+//! derived from any existing rencode library). Format reference:
+//! <https://github.com/aresch/rencode>
 
 // Type tags
 const CHR_LIST: u8 = 59;
@@ -220,7 +220,7 @@ fn decode_from(data: &[u8], pos: usize, depth: usize) -> Result<(Value, usize), 
     }
 
     // Fixed dict (tags 102–126, must be checked before fixed negative ints which start at 70)
-    if tag >= DICT_FIXED_START && tag < DICT_FIXED_START + DICT_FIXED_COUNT {
+    if (DICT_FIXED_START..DICT_FIXED_START + DICT_FIXED_COUNT).contains(&tag) {
         let count = (tag - DICT_FIXED_START) as usize;
         let mut pairs = Vec::with_capacity(count);
         let mut cur = pos + 1;
@@ -234,7 +234,7 @@ fn decode_from(data: &[u8], pos: usize, depth: usize) -> Result<(Value, usize), 
     }
 
     // Fixed negative integer
-    if tag >= INT_NEG_FIXED_START && tag < INT_NEG_FIXED_START + INT_NEG_FIXED_COUNT {
+    if (INT_NEG_FIXED_START..INT_NEG_FIXED_START + INT_NEG_FIXED_COUNT).contains(&tag) {
         let n = -((tag - INT_NEG_FIXED_START) as i64) - 1;
         return Ok((Value::Int(n), pos + 1));
     }

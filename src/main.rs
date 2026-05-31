@@ -9,7 +9,7 @@ use std::sync::Arc;
 use anyhow::bail;
 use clap::Parser;
 use rmcp::ServiceExt;
-use serde_json;
+
 use tracing::{info, warn};
 
 mod deluge;
@@ -196,7 +196,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Handle --list-tools before clap parsing so credentials aren't required.
     if std::env::args().any(|a| a == "--list-tools") {
-        eprintln!("{:<28} {:<10} {:<10} {}", "TOOL", "CLI", "DEFAULT", "PLUGIN");
+        eprintln!("{:<28} {:<10} {:<10} PLUGIN", "TOOL", "CLI", "DEFAULT");
         eprintln!("{}", "-".repeat(64));
         for spec in registry::TOOLS {
             let cli = if enabled_tools.contains(spec.name) { "enabled" } else { "disabled" };
