@@ -35,6 +35,8 @@ use serde::Deserialize;
 use crate::deluge::{DelugeClient, DelugeEvent};
 use crate::rencode::Value;
 
+pub(crate) mod registry;
+
 // ---------------------------------------------------------------------------
 // Server struct
 // ---------------------------------------------------------------------------
@@ -1987,6 +1989,26 @@ impl ServerHandler for DelugeServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn registry_matches_registered_tools() {
+        // The registry (super::registry::TOOLS) is the single source of truth
+        // for tool policy; the #[tool_router] macro is the source of truth for
+        // what is actually callable. If they drift — a tool added to one but
+        // not the other — gating silently breaks. Pin them together.
+        use std::collections::HashSet;
+        let registered: HashSet<String> = DelugeServer::tool_router()
+            .list_all()
+            .iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        let registry: HashSet<String> =
+            registry::all_names().map(|s| s.to_string()).collect();
+        assert_eq!(
+            registry, registered,
+            "registry::TOOLS and the #[tool_router] tool set must match exactly"
+        );
+    }
 
     #[test]
     fn is_base64_torrent_detects_valid_torrent() {

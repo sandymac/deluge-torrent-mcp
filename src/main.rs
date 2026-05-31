@@ -17,55 +17,12 @@ mod oauth;
 mod rencode;
 mod tools;
 
-/// All tool names exposed by this server, in a stable order used for logging.
-const ALL_TOOLS: &[&str] = &[
-    "deluge_add_torrent",
-    "deluge_list_torrents",
-    "deluge_get_torrent_status",
-    "deluge_pause_torrent",
-    "deluge_resume_torrent",
-    "deluge_set_torrent_options",
-    "deluge_get_free_space",
-    "deluge_get_path_size",
-    "deluge_move_storage",
-    "deluge_rename_folder",
-    "deluge_rename_files",
-    "deluge_force_recheck",
-    "deluge_remove_torrent",
-    "deluge_list_labels",
-    "deluge_create_label",
-    "deluge_delete_label",
-    "deluge_set_torrent_label",
-    "deluge_pause_label",
-    "deluge_resume_label",
-    "deluge_get_label_options",
-    "deluge_set_label_options",
-];
+use tools::registry;
 
-/// Tools that are disabled unless explicitly enabled via --enable.
-const DEFAULT_DISABLED: &[&str] = &[
-    "deluge_move_storage",
-    "deluge_rename_folder",
-    "deluge_rename_files",
-    "deluge_force_recheck",
-    "deluge_remove_torrent",
-    "deluge_create_label",
-    "deluge_delete_label",
-    "deluge_set_label_options",
-];
-
-/// Tools that depend on the Deluge Label plugin being enabled on the daemon.
-/// Hidden from `tools/list` whenever the plugin is inactive, regardless of CLI flags.
-const PLUGIN_GATED_LABEL_TOOLS: &[&str] = &[
-    "deluge_list_labels",
-    "deluge_create_label",
-    "deluge_delete_label",
-    "deluge_set_torrent_label",
-    "deluge_pause_label",
-    "deluge_resume_label",
-    "deluge_get_label_options",
-    "deluge_set_label_options",
-];
+/// Comma-separated list of all tool names, for CLI error messages.
+fn all_tools_list() -> String {
+    registry::all_names().collect::<Vec<_>>().join(", ")
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "deluge-torrent-mcp", about = "MCP server for Deluge torrent daemon", version)]
@@ -185,19 +142,15 @@ fn parse_tool_flags_in_order() -> anyhow::Result<Vec<(bool, String)>> {
                     "Tool pattern '{}' is too short (minimum 3 characters). \
                      Available tools: {}",
                     pattern,
-                    ALL_TOOLS.join(", ")
+                    all_tools_list()
                 );
             }
-            let matches: Vec<&str> = ALL_TOOLS
-                .iter()
-                .filter(|&&t| t.contains(pattern))
-                .copied()
-                .collect();
-            if matches.is_empty() {
+            let any_match = registry::all_names().any(|t| t.contains(pattern));
+            if !any_match {
                 bail!(
                     "No tools match pattern '{}'. Available tools: {}",
                     pattern,
-                    ALL_TOOLS.join(", ")
+                    all_tools_list()
                 );
             }
             result.push((is_enable, pattern.to_string()));
@@ -210,13 +163,12 @@ fn parse_tool_flags_in_order() -> anyhow::Result<Vec<(bool, String)>> {
 /// Apply ordered enable/disable flags to the default tool state.
 /// Last flag wins per tool.
 fn resolve_enabled_tools(ordered_flags: Vec<(bool, String)>) -> HashSet<String> {
-    let mut state: HashMap<&str, bool> = ALL_TOOLS
-        .iter()
-        .map(|&t| (t, !DEFAULT_DISABLED.contains(&t)))
+    let mut state: HashMap<&str, bool> = registry::all_names()
+        .map(|t| (t, registry::is_enabled_by_default(t)))
         .collect();
 
     for (is_enable, pattern) in &ordered_flags {
-        for &tool in ALL_TOOLS.iter().filter(|&&t| t.contains(pattern.as_str())) {
+        for tool in registry::all_names().filter(|t| t.contains(pattern.as_str())) {
             state.insert(tool, *is_enable);
         }
     }
@@ -246,11 +198,11 @@ async fn main() -> anyhow::Result<()> {
     if std::env::args().any(|a| a == "--list-tools") {
         eprintln!("{:<28} {:<10} {:<10} {}", "TOOL", "CLI", "DEFAULT", "PLUGIN");
         eprintln!("{}", "-".repeat(64));
-        for &tool in ALL_TOOLS {
-            let cli = if enabled_tools.contains(tool) { "enabled" } else { "disabled" };
-            let default = if DEFAULT_DISABLED.contains(&tool) { "disabled" } else { "enabled" };
-            let plugin = if PLUGIN_GATED_LABEL_TOOLS.contains(&tool) { "Label" } else { "-" };
-            eprintln!("{:<28} {:<10} {:<10} {}", tool, cli, default, plugin);
+        for spec in registry::TOOLS {
+            let cli = if enabled_tools.contains(spec.name) { "enabled" } else { "disabled" };
+            let default = if spec.default_disabled { "disabled" } else { "enabled" };
+            let plugin = if spec.requires_label_plugin { "Label" } else { "-" };
+            eprintln!("{:<28} {:<10} {:<10} {}", spec.name, cli, default, plugin);
         }
         eprintln!();
         eprintln!(
@@ -269,15 +221,11 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     // Log effective tool permissions at startup
-    let enabled_list: Vec<&str> = ALL_TOOLS
-        .iter()
-        .copied()
-        .filter(|&t| enabled_tools.contains(t))
+    let enabled_list: Vec<&str> = registry::all_names()
+        .filter(|t| enabled_tools.contains(*t))
         .collect();
-    let disabled_list: Vec<&str> = ALL_TOOLS
-        .iter()
-        .copied()
-        .filter(|&t| !enabled_tools.contains(t))
+    let disabled_list: Vec<&str> = registry::all_names()
+        .filter(|t| !enabled_tools.contains(*t))
         .collect();
     info!(enabled = %enabled_list.join(", "), "Enabled tools");
     if !disabled_list.is_empty() {
@@ -311,10 +259,8 @@ async fn main() -> anyhow::Result<()> {
             "Deluge Label plugin is not enabled — label tools are hidden until the user enables it"
         );
     }
-    let plugin_gated_tools: HashSet<String> = PLUGIN_GATED_LABEL_TOOLS
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
+    let plugin_gated_tools: HashSet<String> =
+        registry::plugin_gated_names().map(|s| s.to_string()).collect();
 
     if cli.test_connection {
         use crate::rencode::Value;
