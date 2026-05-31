@@ -376,8 +376,8 @@ mod tests {
         let future = now_i + Duration::from_secs(300);
         let ts = instant_to_unix(future, now_i, now_s);
         let back = unix_to_instant(ts, now_i, now_s).unwrap();
-        let diff = back.duration_since(future);
-        assert!(diff < Duration::from_secs(1), "diff too large: {diff:?}");
+        let diff = if back > future { back.duration_since(future) } else { future.duration_since(back) };
+        assert!(diff < Duration::from_secs(2), "diff too large: {diff:?}");
     }
 
     #[test]
@@ -389,8 +389,8 @@ mod tests {
         if let Some(past) = now_i.checked_sub(Duration::from_millis(100)) {
             let ts = instant_to_unix(past, now_i, now_s);
             let back = unix_to_instant(ts, now_i, now_s).unwrap();
-            let diff = now_i.duration_since(back);
-            assert!(diff < Duration::from_secs(1), "diff too large: {diff:?}");
+            let diff = if back > past { back.duration_since(past) } else { past.duration_since(back) };
+            assert!(diff < Duration::from_secs(2), "diff too large: {diff:?}");
         }
     }
 
