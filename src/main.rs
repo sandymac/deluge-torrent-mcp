@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use anyhow::bail;
 use clap::Parser;
+use git_version::git_version;
 use rmcp::ServiceExt;
 
 use tracing::{info, warn};
@@ -24,8 +25,27 @@ fn all_tools_list() -> String {
     registry::all_names().collect::<Vec<_>>().join(", ")
 }
 
+/// Short git commit the binary was built from — `-dirty` when the worktree had
+/// uncommitted changes, `unknown` when built without git. Captured at compile
+/// time by `git-version` (which also tracks git state for rebuilds, so no
+/// build script is needed). The `--match` that can't match forces `git describe`
+/// to report the bare commit hash rather than a nearby tag.
+const GIT_VERSION: &str = git_version!(
+    args = ["--always", "--abbrev=7", "--dirty=-dirty", "--match=__never_match__"],
+    fallback = "unknown"
+);
+
+/// `--version` string: crate version plus the git commit, e.g. `0.7.6 (e7aa054)`.
+/// Built once and cached; clap needs a `&'static str`.
+fn version() -> &'static str {
+    static VERSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    VERSION
+        .get_or_init(|| format!("{} ({})", env!("CARGO_PKG_VERSION"), GIT_VERSION))
+        .as_str()
+}
+
 #[derive(Parser, Debug)]
-#[command(name = "deluge-torrent-mcp", about = "MCP server for Deluge torrent daemon", version)]
+#[command(name = "deluge-torrent-mcp", about = "MCP server for Deluge torrent daemon", version = version())]
 struct Cli {
     /// Deluge daemon hostname or IP
     #[arg(long, default_value = "127.0.0.1", env = "DELUGE_HOST")]
