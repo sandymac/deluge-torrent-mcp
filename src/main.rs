@@ -90,6 +90,14 @@ struct Cli {
     #[arg(long, default_value = "127.0.0.1:8080")]
     http_bind: String,
 
+    /// Additional Host header value(s) to accept on the HTTP transport, for when the
+    /// server runs behind a reverse proxy that forwards a public hostname (e.g.
+    /// mcp.example.com). The loopback hosts, the --http-bind host, and the --oauth-issuer
+    /// host are always accepted; use this for any other public name. Comma-separated or
+    /// repeated. Without it, rmcp's DNS-rebinding guard rejects proxied requests with 403.
+    #[arg(long = "allowed-host", value_name = "HOST", value_delimiter = ',', action = clap::ArgAction::Append, env = "DELUGE_ALLOWED_HOST")]
+    allowed_host: Vec<String>,
+
     /// Bearer token required for HTTP transport requests (recommended)
     #[arg(long, env = "DELUGE_API_TOKEN")]
     api_token: Option<String>,
@@ -178,6 +186,38 @@ fn parse_tool_flags_in_order() -> anyhow::Result<Vec<(bool, String)>> {
         i += 1;
     }
     Ok(result)
+}
+
+/// Build the HTTP `Host` allow-list for rmcp's DNS-rebinding guard: the loopback
+/// defaults plus the `--http-bind` host, the `--oauth-issuer` host, and any
+/// explicit `--allowed-host` values. Entries are host-only (no port), which rmcp
+/// matches against any port.
+fn build_allowed_hosts(
+    http_bind: &str,
+    oauth_issuer: &Option<String>,
+    extra: &[String],
+) -> Vec<String> {
+    let mut hosts: Vec<String> = vec!["localhost".into(), "127.0.0.1".into(), "::1".into()];
+
+    // The host portion of --http-bind (covers non-loopback binds like 0.0.0.0 or a LAN IP).
+    if let Some(host) = http_bind.rsplit_once(':').map(|(h, _)| h).filter(|h| !h.is_empty()) {
+        hosts.push(host.to_string());
+    }
+
+    // The public hostname clients actually use, taken from the OAuth issuer URL.
+    if let Some(issuer) = oauth_issuer {
+        if let Ok(url) = url::Url::parse(issuer) {
+            if let Some(host) = url.host_str() {
+                hosts.push(host.to_string());
+            }
+        }
+    }
+
+    hosts.extend(extra.iter().cloned());
+
+    hosts.sort();
+    hosts.dedup();
+    hosts
 }
 
 /// Apply ordered enable/disable flags to the default tool state.
@@ -350,6 +390,17 @@ async fn main() -> anyhow::Result<()> {
 
             info!(bind = %cli.http_bind, "Starting MCP server on HTTP");
 
+            // rmcp's streamable-HTTP transport rejects any Host header not on its
+            // allow-list (DNS-rebinding protection), defaulting to loopback only.
+            // Behind a reverse proxy the forwarded Host is the public name, so accept:
+            // the loopback defaults, the --http-bind host, the --oauth-issuer host, and
+            // any operator-supplied --allowed-host. Otherwise proxied requests get 403.
+            let allowed_hosts =
+                build_allowed_hosts(&cli.http_bind, &cli.oauth_issuer, &cli.allowed_host);
+            info!(allowed_hosts = %allowed_hosts.join(", "), "HTTP Host allow-list");
+            let http_config =
+                StreamableHttpServerConfig::default().with_allowed_hosts(allowed_hosts);
+
             // Build the MCP service — factory creates a DelugeServer per session.
             // Each session spawns its own plugin watcher so it gets independent
             // tools/list_changed delivery to its own peer.
@@ -369,7 +420,7 @@ async fn main() -> anyhow::Result<()> {
                         Ok(server)
                     },
                     Arc::new(LocalSessionManager::default()),
-                    StreamableHttpServerConfig::default(),
+                    http_config,
                 )
             };
 
@@ -480,4 +531,39 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_allowed_hosts;
+
+    #[test]
+    fn allowed_hosts_includes_loopback_bind_issuer_and_extra() {
+        let hosts = build_allowed_hosts(
+            "0.0.0.0:10996",
+            &Some("https://mcp.deluge.mcarthur.org".to_string()),
+            &["extra.example.com".to_string()],
+        );
+        for expected in [
+            "localhost",
+            "127.0.0.1",
+            "::1",
+            "0.0.0.0",
+            "mcp.deluge.mcarthur.org",
+            "extra.example.com",
+        ] {
+            assert!(hosts.contains(&expected.to_string()), "missing {expected}: {hosts:?}");
+        }
+    }
+
+    #[test]
+    fn allowed_hosts_default_is_loopback_only_and_has_no_empty_entries() {
+        let hosts = build_allowed_hosts("127.0.0.1:8080", &None, &[]);
+        assert!(hosts.contains(&"localhost".to_string()));
+        assert!(hosts.contains(&"127.0.0.1".to_string()));
+        // The public hostname is absent when no issuer/extra is given.
+        assert!(!hosts.contains(&"mcp.deluge.mcarthur.org".to_string()));
+        // A host-only --http-bind (no ':') must not inject an empty entry.
+        assert!(!hosts.iter().any(|h| h.is_empty()));
+    }
 }
