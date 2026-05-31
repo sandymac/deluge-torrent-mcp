@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, RwLock as StdRwLock};
+use std::sync::Arc;
 
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use rmcp::{
@@ -35,7 +35,10 @@ use serde::Deserialize;
 use crate::deluge::{DelugeClient, DelugeEvent};
 use crate::rencode::Value;
 
+pub(crate) mod gate;
 pub(crate) mod registry;
+
+use gate::ToolGate;
 
 // ---------------------------------------------------------------------------
 // Server struct
@@ -44,18 +47,9 @@ pub(crate) mod registry;
 #[derive(Clone)]
 pub(crate) struct DelugeServer {
     client: Arc<DelugeClient>,
-    /// Tools currently visible in `tools/list` and callable via `call_tool`.
-    /// Computed as `user_intent_tools` minus any tools whose required plugin
-    /// is not active on the daemon. Updated live by the plugin watcher.
-    enabled_tools: Arc<StdRwLock<HashSet<String>>>,
-    /// Tools the user has authorised (via defaults or `--enable-tool`).
-    /// Plugin gating is applied on top to produce `enabled_tools`.
-    user_intent_tools: Arc<HashSet<String>>,
-    /// Tools that require the Deluge Label plugin to be enabled on the daemon.
-    plugin_gated_tools: Arc<HashSet<String>>,
-    /// Whether the Label plugin is currently active on the daemon.
-    /// Updated by the plugin watcher; used by `tool_gate` for accurate hints.
-    label_plugin_active: Arc<StdRwLock<bool>>,
+    /// Tool visibility gating — which tools are callable, given operator intent
+    /// and the live Label-plugin state. Updated by the plugin watcher.
+    gate: Arc<ToolGate>,
     tool_router: ToolRouter<Self>,
     /// Active resource subscriptions: resource URI → connected peer.
     /// One subscriber per URI — last `subscribe` call wins.
@@ -321,7 +315,7 @@ impl DelugeServer {
         &self,
         Parameters(p): Parameters<RemoveTorrentParams>,
     ) -> Result<String, String> {
-        self.tool_gate("deluge_remove_torrent")?;
+        self.gate.check("deluge_remove_torrent")?;
         Self::validate_info_hashes(&p.info_hashes)?;
         let hashes = p.info_hashes;
         let status_word = if p.delete_data { "deleted" } else { "ok" };
@@ -376,7 +370,7 @@ impl DelugeServer {
         let sort_by = p.sort_by.unwrap_or(SortField::Name);
         let sort_order = p.sort_order.unwrap_or(SortOrder::Asc);
 
-        let label_plugin_active = *self.label_plugin_active.read().unwrap();
+        let label_plugin_active = self.gate.label_plugin_active();
 
         if p.label.is_some() && !label_plugin_active {
             return Err(
@@ -626,7 +620,7 @@ impl DelugeServer {
         &self,
         Parameters(p): Parameters<MoveStorageParams>,
     ) -> Result<String, String> {
-        self.tool_gate("deluge_move_storage")?;
+        self.gate.check("deluge_move_storage")?;
         Self::validate_info_hashes(&p.info_hashes)?;
         self.client
             .call(
@@ -652,7 +646,7 @@ impl DelugeServer {
         &self,
         Parameters(p): Parameters<RenameFolderParams>,
     ) -> Result<String, String> {
-        self.tool_gate("deluge_rename_folder")?;
+        self.gate.check("deluge_rename_folder")?;
         Self::validate_info_hashes(&p.info_hashes)?;
         if p.info_hashes.len() != 1 {
             return Err("rename_folder operates on a single torrent. Provide exactly one info_hash.".to_string());
@@ -696,7 +690,7 @@ impl DelugeServer {
         &self,
         Parameters(p): Parameters<RenameFilesParams>,
     ) -> Result<String, String> {
-        self.tool_gate("deluge_rename_files")?;
+        self.gate.check("deluge_rename_files")?;
         Self::validate_info_hashes(&p.info_hashes)?;
         if p.info_hashes.len() != 1 {
             return Err("rename_files operates on a single torrent. Provide exactly one info_hash.".to_string());
@@ -731,7 +725,7 @@ impl DelugeServer {
         &self,
         Parameters(p): Parameters<TorrentIdParams>,
     ) -> Result<String, String> {
-        self.tool_gate("deluge_force_recheck")?;
+        self.gate.check("deluge_force_recheck")?;
         Self::validate_info_hashes(&p.info_hashes)?;
         self.client
             .call(
@@ -776,7 +770,7 @@ impl DelugeServer {
         &self,
         Parameters(p): Parameters<LabelNameParams>,
     ) -> Result<String, String> {
-        self.tool_gate("deluge_create_label")?;
+        self.gate.check("deluge_create_label")?;
         let label = Self::validate_label_name(&p.label)?;
         self.client
             .call("label.add", vec![Value::String(label)], vec![])
@@ -792,7 +786,7 @@ impl DelugeServer {
         &self,
         Parameters(p): Parameters<LabelNameParams>,
     ) -> Result<String, String> {
-        self.tool_gate("deluge_delete_label")?;
+        self.gate.check("deluge_delete_label")?;
         let label = Self::validate_label_name(&p.label)?;
         self.client
             .call("label.remove", vec![Value::String(label)], vec![])
@@ -808,7 +802,7 @@ impl DelugeServer {
         &self,
         Parameters(p): Parameters<SetTorrentLabelParams>,
     ) -> Result<String, String> {
-        self.tool_gate("deluge_set_torrent_label")?;
+        self.gate.check("deluge_set_torrent_label")?;
         Self::validate_info_hashes(&p.info_hashes)?;
         let label = Self::normalize_label_for_set(&p.label)?;
 
@@ -849,7 +843,7 @@ impl DelugeServer {
         &self,
         Parameters(p): Parameters<LabelNameParams>,
     ) -> Result<String, String> {
-        self.tool_gate("deluge_pause_label")?;
+        self.gate.check("deluge_pause_label")?;
         let label = Self::validate_label_name(&p.label)?;
         self.bulk_act_on_label(&label, "core.pause_torrents", "paused").await
     }
@@ -860,7 +854,7 @@ impl DelugeServer {
         &self,
         Parameters(p): Parameters<LabelNameParams>,
     ) -> Result<String, String> {
-        self.tool_gate("deluge_resume_label")?;
+        self.gate.check("deluge_resume_label")?;
         let label = Self::validate_label_name(&p.label)?;
         self.bulk_act_on_label(&label, "core.resume_torrents", "resumed").await
     }
@@ -868,7 +862,7 @@ impl DelugeServer {
     /// List all labels defined on the Deluge daemon. Returns a JSON array of label names.
     #[tool(name = "deluge_list_labels", title = "List Labels", annotations(read_only_hint = true, open_world_hint = false))]
     async fn list_labels(&self) -> Result<String, String> {
-        self.tool_gate("deluge_list_labels")?;
+        self.gate.check("deluge_list_labels")?;
         let result = self
             .client
             .call("label.get_labels", vec![], vec![])
@@ -884,7 +878,7 @@ impl DelugeServer {
         &self,
         Parameters(p): Parameters<LabelNameParams>,
     ) -> Result<String, String> {
-        self.tool_gate("deluge_get_label_options")?;
+        self.gate.check("deluge_get_label_options")?;
         let label = Self::validate_label_name(&p.label)?;
         let result = self
             .client
@@ -901,7 +895,7 @@ impl DelugeServer {
         &self,
         Parameters(p): Parameters<SetLabelOptionsParams>,
     ) -> Result<String, String> {
-        self.tool_gate("deluge_set_label_options")?;
+        self.gate.check("deluge_set_label_options")?;
         let label = Self::validate_label_name(&p.label)?;
 
         let mut opts: Vec<(Value, Value)> = Vec::new();
@@ -985,8 +979,11 @@ impl DelugeServer {
         plugin_gated_tools: HashSet<String>,
         initial_label_plugin_active: bool,
     ) -> Self {
-        let initial_enabled =
-            compute_enabled(&user_intent_tools, &plugin_gated_tools, initial_label_plugin_active);
+        let gate = Arc::new(ToolGate::new(
+            user_intent_tools,
+            plugin_gated_tools,
+            initial_label_plugin_active,
+        ));
 
         let subscribers: Arc<RwLock<HashMap<String, Peer<RoleServer>>>> =
             Arc::new(RwLock::new(HashMap::new()));
@@ -1040,10 +1037,7 @@ impl DelugeServer {
 
         Self {
             client,
-            enabled_tools: Arc::new(StdRwLock::new(initial_enabled)),
-            user_intent_tools: Arc::new(user_intent_tools),
-            plugin_gated_tools: Arc::new(plugin_gated_tools),
-            label_plugin_active: Arc::new(StdRwLock::new(initial_label_plugin_active)),
+            gate,
             tool_router: Self::tool_router(),
             subscribers,
             connected_peers: Arc::new(RwLock::new(Vec::new())),
@@ -1051,15 +1045,12 @@ impl DelugeServer {
     }
 
     /// Spawn the plugin watcher. Listens for Deluge `PluginEnabled`/`PluginDisabled`
-    /// events for the Label plugin and updates `enabled_tools` accordingly.
+    /// events for the Label plugin and updates the [`ToolGate`] accordingly.
     /// On reconnect or broadcast lag it re-probes via `core.get_enabled_plugins`
     /// to recover the authoritative state.
     pub(crate) fn spawn_plugin_watcher(&self) {
         let client = self.client.clone();
-        let user_intent = self.user_intent_tools.clone();
-        let plugin_gated = self.plugin_gated_tools.clone();
-        let enabled_tools = self.enabled_tools.clone();
-        let label_active = self.label_plugin_active.clone();
+        let gate = self.gate.clone();
         let connected_peers = self.connected_peers.clone();
         let mut event_rx = client.subscribe_events();
 
@@ -1070,55 +1061,23 @@ impl DelugeServer {
             // opened), and the broadcast receiver was created above — any
             // events that arrive between here and the loop will be buffered.
             if let Some(active) = probe_label_plugin(&client).await {
-                apply_label_state(
-                    active,
-                    &user_intent,
-                    &plugin_gated,
-                    &enabled_tools,
-                    &label_active,
-                    &connected_peers,
-                )
-                .await;
+                apply_label_state(active, &gate, &connected_peers).await;
             }
 
             loop {
                 match event_rx.recv().await {
                     Ok(DelugeEvent::PluginEnabled { name }) if name == "Label" => {
-                        apply_label_state(
-                            true,
-                            &user_intent,
-                            &plugin_gated,
-                            &enabled_tools,
-                            &label_active,
-                            &connected_peers,
-                        )
-                        .await;
+                        apply_label_state(true, &gate, &connected_peers).await;
                     }
                     Ok(DelugeEvent::PluginDisabled { name }) if name == "Label" => {
-                        apply_label_state(
-                            false,
-                            &user_intent,
-                            &plugin_gated,
-                            &enabled_tools,
-                            &label_active,
-                            &connected_peers,
-                        )
-                        .await;
+                        apply_label_state(false, &gate, &connected_peers).await;
                     }
                     Ok(DelugeEvent::Reconnected) => {
                         // Re-seed from the daemon — the previous state may be stale
                         // and `set_event_interest` was just re-issued, so we may have
                         // missed transitions while disconnected.
                         if let Some(active) = probe_label_plugin(&client).await {
-                            apply_label_state(
-                                active,
-                                &user_intent,
-                                &plugin_gated,
-                                &enabled_tools,
-                                &label_active,
-                                &connected_peers,
-                            )
-                            .await;
+                            apply_label_state(active, &gate, &connected_peers).await;
                         }
                     }
                     Err(RecvError::Lagged(n)) => {
@@ -1126,15 +1085,7 @@ impl DelugeServer {
                             "Plugin watcher lagged by {n} events — re-probing plugin state"
                         );
                         if let Some(active) = probe_label_plugin(&client).await {
-                            apply_label_state(
-                                active,
-                                &user_intent,
-                                &plugin_gated,
-                                &enabled_tools,
-                                &label_active,
-                                &connected_peers,
-                            )
-                            .await;
+                            apply_label_state(active, &gate, &connected_peers).await;
                         }
                     }
                     Err(RecvError::Closed) => break,
@@ -1142,43 +1093,6 @@ impl DelugeServer {
                 }
             }
         });
-    }
-
-    fn tool_gate(&self, tool_name: &str) -> Result<(), String> {
-        if self.enabled_tools.read().unwrap().contains(tool_name) {
-            return Ok(());
-        }
-        // Disabled — pick the right hint based on why. CLI intent wins: if the
-        // operator did not opt into this tool via defaults or `--enable-tool`,
-        // the plugin hint is misleading (enabling the plugin alone won't make
-        // the tool visible).
-        if !self.user_intent_tools.contains(tool_name) {
-            return Err(format!(
-                "Tool '{tool_name}' is disabled. Use --enable-tool={tool_name} to enable it.\n\
-                 [Hint: This tool has been administratively disabled on this server. \
-                 Do not attempt this operation by other means — inform the user that the \
-                 server must be restarted with --enable-tool={tool_name} to allow this action.]"
-            ));
-        }
-        // User intended this tool; it must be gated by an inactive plugin.
-        let plugin_gated = self.plugin_gated_tools.contains(tool_name);
-        let plugin_active = *self.label_plugin_active.read().unwrap();
-        if plugin_gated && !plugin_active {
-            Err(format!(
-                "Tool '{tool_name}' is currently unavailable because the Label plugin is not \
-                 enabled on the Deluge daemon.\n\
-                 [Hint: Ask the user to enable the Label plugin in Deluge's \
-                 Preferences \u{2192} Plugins, or via `deluge-console plugin --enable Label`. \
-                 Once enabled the tool becomes available without restarting the MCP server.]"
-            ))
-        } else {
-            Err(format!(
-                "Tool '{tool_name}' is disabled. Use --enable-tool={tool_name} to enable it.\n\
-                 [Hint: This tool has been administratively disabled on this server. \
-                 Do not attempt this operation by other means — inform the user that the \
-                 server must be restarted with --enable-tool={tool_name} to allow this action.]"
-            ))
-        }
     }
 
     /// Validate that info_hashes is non-empty and each hash is well-formed.
@@ -1488,8 +1402,7 @@ impl DelugeServer {
     /// Build a hint that points the LLM to deluge_create_label, but only if that
     /// tool is currently enabled. Returns `None` otherwise.
     fn create_label_hint(&self) -> Option<String> {
-        let enabled = self.enabled_tools.read().unwrap();
-        if enabled.contains("deluge_create_label") {
+        if self.gate.is_enabled("deluge_create_label") {
             Some(
                 "If the label does not exist, create it first with deluge_create_label."
                     .to_string(),
@@ -1649,21 +1562,6 @@ fn event_to_resource_uris(event: &DelugeEvent) -> Vec<String> {
 // Plugin watcher helpers
 // ---------------------------------------------------------------------------
 
-/// Compute the set of tools currently enabled given user intent and plugin state.
-fn compute_enabled(
-    user_intent: &HashSet<String>,
-    plugin_gated: &HashSet<String>,
-    label_plugin_active: bool,
-) -> HashSet<String> {
-    let mut out = user_intent.clone();
-    if !label_plugin_active {
-        for t in plugin_gated {
-            out.remove(t);
-        }
-    }
-    out
-}
-
 /// Probe the Deluge daemon for whether the Label plugin is currently enabled.
 /// Returns `None` on RPC failure (caller should keep the previous state).
 pub(crate) async fn probe_label_plugin(client: &Arc<DelugeClient>) -> Option<bool> {
@@ -1682,30 +1580,15 @@ pub(crate) async fn probe_label_plugin(client: &Arc<DelugeClient>) -> Option<boo
     }
 }
 
-/// Apply a new Label-plugin state. If it actually changes the visible tool set,
-/// updates the lock-protected state and fans out `tools/list_changed` to every
-/// connected peer. Stale peers (those whose send fails) are pruned.
+/// Apply a new Label-plugin state to the [`ToolGate`]. If it actually changes
+/// the visible tool set, fans out `tools/list_changed` to every connected peer.
+/// Stale peers (those whose send fails) are pruned.
 async fn apply_label_state(
     active: bool,
-    user_intent: &Arc<HashSet<String>>,
-    plugin_gated: &Arc<HashSet<String>>,
-    enabled_tools: &Arc<StdRwLock<HashSet<String>>>,
-    label_active: &Arc<StdRwLock<bool>>,
+    gate: &Arc<ToolGate>,
     connected_peers: &Arc<RwLock<Vec<Peer<RoleServer>>>>,
 ) {
-    let new_set = compute_enabled(user_intent, plugin_gated, active);
-
-    let changed = {
-        let mut current_active = label_active.write().unwrap();
-        let mut current_set = enabled_tools.write().unwrap();
-        let active_changed = *current_active != active;
-        let set_changed = *current_set != new_set;
-        *current_active = active;
-        *current_set = new_set;
-        active_changed || set_changed
-    };
-
-    if !changed {
+    if !gate.set_label_plugin_active(active) {
         return;
     }
 
@@ -1788,7 +1671,7 @@ impl ServerHandler for DelugeServer {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
-        let enabled = self.enabled_tools.read().unwrap().clone();
+        let enabled = self.gate.visible();
         let tools: Vec<Tool> = self
             .tool_router
             .list_all()
