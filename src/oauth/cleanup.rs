@@ -12,7 +12,7 @@ const CLEANUP_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 /// Spawn a background task that periodically sweeps expired tokens, codes,
 /// pending authorizations, and stale client registrations.
-pub fn spawn_cleanup(state: Arc<OAuthState>) {
+pub(crate) fn spawn_cleanup(state: Arc<OAuthState>) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(CLEANUP_INTERVAL);
         loop {

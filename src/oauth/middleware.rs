@@ -15,7 +15,7 @@ use super::state::OAuthState;
 ///
 /// On 401, returns `WWW-Authenticate: Bearer resource_metadata="<url>"` so MCP clients can
 /// discover the OAuth authorization server.
-pub async fn oauth_auth_middleware(
+pub(crate) async fn oauth_auth_middleware(
     State(state): State<Arc<OAuthState>>,
     request: Request,
     next: Next,
@@ -72,7 +72,7 @@ fn unauthorized_response(state: &OAuthState) -> Response {
 ///
 /// Normalizes the result by stripping ports (1.2.3.4:5678 -> 1.2.3.4) and IPv6 brackets
 /// ([2001:db8::1]:443 -> 2001:db8::1).
-pub fn extract_client_ip(headers: &axum::http::HeaderMap) -> String {
+pub(crate) fn extract_client_ip(headers: &axum::http::HeaderMap) -> String {
     // X-Real-IP: single IP set by nginx
     let ip = if let Some(ip) = headers.get("X-Real-IP").and_then(|v| v.to_str().ok()) {
         ip

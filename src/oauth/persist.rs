@@ -21,52 +21,52 @@ use tracing::warn;
 use super::state::{ClientInfo, OAuthState, REFRESH_GRACE_PERIOD, RefreshInfo, TokenInfo, UNAUTHED_CLIENT_TTL};
 
 /// Schema version for the on-disk format. Bump when the JSON shape changes.
-pub const SCHEMA_VERSION: u32 = 1;
+pub(crate) const SCHEMA_VERSION: u32 = 1;
 
 /// How often the background task wakes to flush dirty state.
-pub const FLUSH_INTERVAL: Duration = Duration::from_secs(2);
+pub(crate) const FLUSH_INTERVAL: Duration = Duration::from_secs(2);
 
 // ---------------------------------------------------------------------------
 // On-disk schema
 // ---------------------------------------------------------------------------
 
 #[derive(Serialize, Deserialize, Default)]
-pub struct PersistedState {
-    pub version: u32,
+pub(crate) struct PersistedState {
+    pub(crate) version: u32,
     #[serde(default)]
-    pub clients: HashMap<String, PersistedClient>,
+    pub(crate) clients: HashMap<String, PersistedClient>,
     #[serde(default)]
-    pub access_tokens: HashMap<String, PersistedToken>,
+    pub(crate) access_tokens: HashMap<String, PersistedToken>,
     #[serde(default)]
-    pub refresh_tokens: HashMap<String, PersistedRefresh>,
+    pub(crate) refresh_tokens: HashMap<String, PersistedRefresh>,
 }
 
 #[derive(Serialize, Deserialize)]
-pub struct PersistedClient {
-    pub redirect_uris: Vec<String>,
+pub(crate) struct PersistedClient {
+    pub(crate) redirect_uris: Vec<String>,
     #[serde(default)]
-    pub client_name: Option<String>,
+    pub(crate) client_name: Option<String>,
     #[serde(default)]
-    pub grant_types: Vec<String>,
-    pub created_at_unix: u64,
-    pub authorized: bool,
+    pub(crate) grant_types: Vec<String>,
+    pub(crate) created_at_unix: u64,
+    pub(crate) authorized: bool,
 }
 
 #[derive(Serialize, Deserialize)]
-pub struct PersistedToken {
-    pub client_id: String,
-    pub scope: String,
-    pub expires_at_unix: u64,
+pub(crate) struct PersistedToken {
+    pub(crate) client_id: String,
+    pub(crate) scope: String,
+    pub(crate) expires_at_unix: u64,
 }
 
 #[derive(Serialize, Deserialize)]
-pub struct PersistedRefresh {
-    pub client_id: String,
-    pub scope: String,
-    pub access_token: String,
-    pub expires_at_unix: u64,
+pub(crate) struct PersistedRefresh {
+    pub(crate) client_id: String,
+    pub(crate) scope: String,
+    pub(crate) access_token: String,
+    pub(crate) expires_at_unix: u64,
     #[serde(default)]
-    pub superseded_at_unix: Option<u64>,
+    pub(crate) superseded_at_unix: Option<u64>,
 }
 
 impl PersistedState {
@@ -80,7 +80,7 @@ impl PersistedState {
     }
 
     /// Build a `PersistedState` from current runtime maps.
-    pub fn from_runtime(
+    pub(crate) fn from_runtime(
         clients: &HashMap<String, ClientInfo>,
         access_tokens: &HashMap<String, TokenInfo>,
         refresh_tokens: &HashMap<String, RefreshInfo>,
@@ -146,7 +146,7 @@ impl PersistedState {
 
     /// Hydrate runtime maps from a `PersistedState`. Entries that have already
     /// expired at load time are dropped — they'd be swept seconds later anyway.
-    pub fn into_runtime(
+    pub(crate) fn into_runtime(
         self,
     ) -> (
         HashMap<String, ClientInfo>,
@@ -266,7 +266,7 @@ fn unix_to_instant(ts: u64, now_i: Instant, now_s: SystemTime) -> Option<Instant
 // Disk I/O
 // ---------------------------------------------------------------------------
 
-pub async fn load(path: &Path) -> anyhow::Result<PersistedState> {
+pub(crate) async fn load(path: &Path) -> anyhow::Result<PersistedState> {
     let bytes = match tokio::fs::read(path).await {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(PersistedState::empty()),
@@ -297,7 +297,7 @@ pub async fn load(path: &Path) -> anyhow::Result<PersistedState> {
     }
 }
 
-pub async fn save(path: &Path, state: &PersistedState) -> anyhow::Result<()> {
+pub(crate) async fn save(path: &Path, state: &PersistedState) -> anyhow::Result<()> {
     let json = serde_json::to_vec_pretty(state)?;
     let tmp_path = tmp_sibling(path, ".tmp");
 
@@ -335,7 +335,7 @@ fn tmp_sibling(path: &Path, suffix: &str) -> PathBuf {
 // Background flusher
 // ---------------------------------------------------------------------------
 
-pub fn spawn_persistence(state: Arc<OAuthState>) {
+pub(crate) fn spawn_persistence(state: Arc<OAuthState>) {
     if !state.has_persist_path() {
         return;
     }

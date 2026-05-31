@@ -61,7 +61,7 @@ fn oauth_error(status: StatusCode, error: &str, description: &str) -> Response {
 // ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
-pub struct TokenRequest {
+pub(crate) struct TokenRequest {
     grant_type: String,
     // authorization_code fields
     #[serde(default)]
@@ -93,7 +93,7 @@ struct TokenResponse {
     scope: String,
 }
 
-pub async fn handle_token(
+pub(crate) async fn handle_token(
     State(state): State<Arc<OAuthState>>,
     headers: HeaderMap,
     Form(req): Form<TokenRequest>,

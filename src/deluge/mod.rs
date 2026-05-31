@@ -38,7 +38,7 @@ type PendingMap = Mutex<HashMap<i64, oneshot::Sender<Result<Value>>>>;
 /// A push event received from the Deluge daemon via the RPC_EVENT wire message,
 /// plus synthetic local events the client emits for connection lifecycle.
 #[derive(Debug, Clone)]
-pub enum DelugeEvent {
+pub(crate) enum DelugeEvent {
     TorrentAdded { info_hash: String, from_state: bool },
     TorrentRemoved { info_hash: String },
     TorrentStateChanged { info_hash: String, state: String },
@@ -64,7 +64,7 @@ struct LiveConn {
     pending: Arc<PendingMap>,
 }
 
-pub struct DelugeClient {
+pub(crate) struct DelugeClient {
     // Stored for reconnect
     host: String,
     port: u16,
@@ -84,7 +84,7 @@ impl DelugeClient {
     ///
     /// Returns the client and the granted auth level (0–10).
     /// All parameters are stored for automatic reconnection if the connection drops.
-    pub async fn connect(
+    pub(crate) async fn connect(
         host: &str,
         port: u16,
         cert_fingerprint: Option<String>,
@@ -114,7 +114,7 @@ impl DelugeClient {
     ///
     /// If the connection is dead (e.g. after a laptop sleep), transparently
     /// reconnects with exponential backoff before sending.
-    pub async fn call(
+    pub(crate) async fn call(
         &self,
         method: &str,
         args: Vec<Value>,
@@ -281,7 +281,7 @@ impl DelugeClient {
     /// [`DelugeEvent`] the daemon sends. Lagged receivers (more than
     /// `EVENT_CHANNEL_CAPACITY` events behind) will receive a
     /// `RecvError::Lagged` from the broadcast channel.
-    pub fn subscribe_events(&self) -> broadcast::Receiver<DelugeEvent> {
+    pub(crate) fn subscribe_events(&self) -> broadcast::Receiver<DelugeEvent> {
         self.event_tx.subscribe()
     }
 

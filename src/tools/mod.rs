@@ -40,7 +40,7 @@ use crate::rencode::Value;
 // ---------------------------------------------------------------------------
 
 #[derive(Clone)]
-pub struct DelugeServer {
+pub(crate) struct DelugeServer {
     client: Arc<DelugeClient>,
     /// Tools currently visible in `tools/list` and callable via `call_tool`.
     /// Computed as `user_intent_tools` minus any tools whose required plugin
@@ -977,7 +977,7 @@ impl DelugeServer {
 // ---------------------------------------------------------------------------
 
 impl DelugeServer {
-    pub fn new(
+    pub(crate) fn new(
         client: Arc<DelugeClient>,
         user_intent_tools: HashSet<String>,
         plugin_gated_tools: HashSet<String>,
@@ -1052,7 +1052,7 @@ impl DelugeServer {
     /// events for the Label plugin and updates `enabled_tools` accordingly.
     /// On reconnect or broadcast lag it re-probes via `core.get_enabled_plugins`
     /// to recover the authoritative state.
-    pub fn spawn_plugin_watcher(&self) {
+    pub(crate) fn spawn_plugin_watcher(&self) {
         let client = self.client.clone();
         let user_intent = self.user_intent_tools.clone();
         let plugin_gated = self.plugin_gated_tools.clone();
@@ -1664,7 +1664,7 @@ fn compute_enabled(
 
 /// Probe the Deluge daemon for whether the Label plugin is currently enabled.
 /// Returns `None` on RPC failure (caller should keep the previous state).
-pub async fn probe_label_plugin(client: &Arc<DelugeClient>) -> Option<bool> {
+pub(crate) async fn probe_label_plugin(client: &Arc<DelugeClient>) -> Option<bool> {
     match client.call("core.get_enabled_plugins", vec![], vec![]).await {
         Ok(Value::List(items)) => Some(items.iter().any(
             |v| matches!(v, Value::String(s) if s == "Label"),

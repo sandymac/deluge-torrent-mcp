@@ -45,7 +45,7 @@ const LIST_FIXED_COUNT: u8 = 64; // lengths 0..=63
 use thiserror::Error;
 
 #[derive(Debug, Error)]
-pub enum RencodeError {
+pub(crate) enum RencodeError {
     #[error("unexpected end of input")]
     UnexpectedEof,
     #[error("unknown type tag: {0}")]
@@ -62,7 +62,7 @@ const MAX_DEPTH: usize = 128;
 
 /// A dynamically-typed rencode value.
 #[derive(Debug, Clone, PartialEq)]
-pub enum Value {
+pub(crate) enum Value {
     None,
     Bool(bool),
     Int(i64),
@@ -78,7 +78,7 @@ pub enum Value {
 // Encoding
 // ---------------------------------------------------------------------------
 
-pub fn encode(value: &Value) -> Vec<u8> {
+pub(crate) fn encode(value: &Value) -> Vec<u8> {
     let mut buf = Vec::new();
     encode_into(value, &mut buf);
     buf
@@ -171,7 +171,7 @@ fn encode_bytes(b: &[u8], buf: &mut Vec<u8>) {
 // Decoding
 // ---------------------------------------------------------------------------
 
-pub fn decode(data: &[u8]) -> Result<Value, RencodeError> {
+pub(crate) fn decode(data: &[u8]) -> Result<Value, RencodeError> {
     let (value, _) = decode_from(data, 0, 0)?;
     Ok(value)
 }
@@ -353,7 +353,7 @@ fn decode_from(data: &[u8], pos: usize, depth: usize) -> Result<(Value, usize), 
 /// Convert a rencode [`Value`] to a [`serde_json::Value`].
 /// Dict keys that are not strings are rendered via their `Debug` representation.
 /// Binary byte sequences are base64-encoded.
-pub fn value_to_json(v: Value) -> serde_json::Value {
+pub(crate) fn value_to_json(v: Value) -> serde_json::Value {
     use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
     match v {
         Value::None => serde_json::Value::Null,

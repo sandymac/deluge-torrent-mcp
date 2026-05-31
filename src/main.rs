@@ -1,6 +1,8 @@
 // Copyright (c) 2026 Sandy McArthur, Jr.
 // SPDX-License-Identifier: MIT
 
+#![warn(unreachable_pub)]
+
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -416,8 +418,8 @@ async fn main() -> anyhow::Result<()> {
                     )
                     .await?,
                 );
-                oauth::cleanup::spawn_cleanup(oauth_state.clone());
-                oauth::persist::spawn_persistence(oauth_state.clone());
+                oauth::spawn_cleanup(oauth_state.clone());
+                oauth::spawn_persistence(oauth_state.clone());
 
                 info!(
                     issuer = %issuer,
@@ -431,7 +433,7 @@ async fn main() -> anyhow::Result<()> {
 
                 let auth_middleware = middleware::from_fn_with_state(
                     oauth_state.clone(),
-                    oauth::middleware::oauth_auth_middleware,
+                    oauth::oauth_auth_middleware,
                 );
 
                 shutdown_oauth_state = Some(oauth_state);
