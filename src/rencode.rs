@@ -7,7 +7,7 @@
 /// more types. Deluge uses it to serialize RPC request/response tuples before
 /// zlib-compressing and framing them.
 ///
-/// Reference: https://github.com/aresch/rencode
+/// Reference: <https://github.com/aresch/rencode>
 
 // Type tags
 const CHR_LIST: u8 = 59;

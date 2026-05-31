@@ -75,7 +75,7 @@ struct Cli {
     api_token: Option<String>,
 
     /// Base URL of this server as the OAuth 2.1 issuer (enables OAuth mode).
-    /// Example: http://localhost:8080  or  https://mcp.example.com
+    /// Example: <http://localhost:8080>  or  <https://mcp.example.com>
     /// When set, OAuth 2.1 endpoints are activated and MCP requests require OAuth tokens.
     /// Can be combined with --api-token to also accept static tokens as a fallback.
     #[arg(long, env = "DELUGE_OAUTH_ISSUER")]
