@@ -248,10 +248,11 @@ async fn main() -> anyhow::Result<()> {
     .await?;
     info!(auth_level, "Authenticated with Deluge daemon");
 
+    let api = deluge::DelugeApi::new(client);
+
     // Probe whether the Label plugin is currently active. The plugin watcher
     // (spawned per DelugeServer below) keeps this value live thereafter.
-    let initial_label_plugin_active =
-        tools::probe_label_plugin(&client).await.unwrap_or(false);
+    let initial_label_plugin_active = api.label_plugin_active().await.unwrap_or(false);
     if initial_label_plugin_active {
         info!("Deluge Label plugin is enabled — label tools are available");
     } else {
@@ -266,7 +267,7 @@ async fn main() -> anyhow::Result<()> {
         use crate::rencode::Value;
 
         // daemon.info — returns a string describing the daemon build
-        let info = client.call("daemon.info", vec![], vec![]).await?;
+        let info = api.daemon_info().await?;
         eprintln!("daemon.info: {}", match &info {
             Value::String(s) => s.as_str(),
             _ => "(unexpected type)",
@@ -281,9 +282,7 @@ async fn main() -> anyhow::Result<()> {
             Value::String("num_peers".into()),
             Value::String("dht_nodes".into()),
         ]);
-        let status = client
-            .call("core.get_session_status", vec![keys], vec![])
-            .await?;
+        let status = api.session_status(keys).await?;
         let json = serde_json::to_string_pretty(&crate::rencode::value_to_json(status))
             .unwrap_or_default();
         eprintln!("core.get_session_status:\n{json}");
@@ -295,7 +294,7 @@ async fn main() -> anyhow::Result<()> {
         Transport::Stdio => {
             info!("Starting MCP server on stdio");
             let server = tools::DelugeServer::new(
-                client,
+                api,
                 enabled_tools,
                 plugin_gated_tools,
                 initial_label_plugin_active,
@@ -331,13 +330,13 @@ async fn main() -> anyhow::Result<()> {
             // Each session spawns its own plugin watcher so it gets independent
             // tools/list_changed delivery to its own peer.
             let mcp_service = {
-                let client = client.clone();
+                let api = api.clone();
                 let enabled_tools = enabled_tools.clone();
                 let plugin_gated_tools = plugin_gated_tools.clone();
                 StreamableHttpService::new(
                     move || {
                         let server = tools::DelugeServer::new(
-                            client.clone(),
+                            api.clone(),
                             enabled_tools.clone(),
                             plugin_gated_tools.clone(),
                             initial_label_plugin_active,

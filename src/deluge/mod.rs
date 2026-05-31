@@ -23,6 +23,9 @@ use tracing::{debug, info, warn};
 
 use crate::rencode::{self, Value};
 
+mod api;
+pub(crate) use api::DelugeApi;
+
 const PROTOCOL_VERSION: u8 = 1;
 const RPC_RESPONSE: i64 = 1;
 const RPC_ERROR: i64 = 2;

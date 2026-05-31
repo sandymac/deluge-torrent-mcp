@@ -32,7 +32,7 @@ const ICON_48: &[u8] = include_bytes!("../../assets/deluge-mcp-icon-48x48.png");
 const ICON_96: &[u8] = include_bytes!("../../assets/deluge-mcp-icon-96x96.png");
 use serde::Deserialize;
 
-use crate::deluge::{DelugeClient, DelugeEvent};
+use crate::deluge::{DelugeApi, DelugeEvent};
 use crate::rencode::Value;
 
 pub(crate) mod gate;
@@ -40,13 +40,35 @@ pub(crate) mod registry;
 
 use gate::ToolGate;
 
+/// Flatten validated info hashes into the `Vec<String>` the [`DelugeApi`] bulk
+/// methods accept.
+fn hash_strings(hashes: Vec<InfoHash>) -> Vec<String> {
+    hashes.into_iter().map(|h| h.0).collect()
+}
+
+/// Which bulk action `bulk_act_on_label` applies to a label's torrents.
+#[derive(Clone, Copy)]
+enum LabelAction {
+    Pause,
+    Resume,
+}
+
+impl LabelAction {
+    fn past_tense(self) -> &'static str {
+        match self {
+            LabelAction::Pause => "paused",
+            LabelAction::Resume => "resumed",
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Server struct
 // ---------------------------------------------------------------------------
 
 #[derive(Clone)]
 pub(crate) struct DelugeServer {
-    client: Arc<DelugeClient>,
+    api: DelugeApi,
     /// Tool visibility gating — which tools are callable, given operator intent
     /// and the live Label-plugin state. Updated by the plugin watcher.
     gate: Arc<ToolGate>,
@@ -321,14 +343,7 @@ impl DelugeServer {
         let status_word = if p.delete_data { "deleted" } else { "ok" };
         let mut results = serde_json::Map::new();
         for hash in &hashes {
-            let result = self
-                .client
-                .call(
-                    "core.remove_torrent",
-                    vec![Value::String(hash.0.clone()), Value::Bool(p.delete_data)],
-                    vec![],
-                )
-                .await;
+            let result = self.api.remove_torrent(&hash.0, p.delete_data).await;
             match result {
                 Ok(_) => {
                     results.insert(hash.0.clone(), serde_json::json!(status_word));
@@ -438,8 +453,9 @@ impl DelugeServer {
                 .collect(),
         );
 
-        let result = self.client
-            .call("core.get_torrents_status", vec![filter, keys], vec![])
+        let result = self
+            .api
+            .get_torrents_status(filter, keys)
             .await
             .map_err(Self::enrich_client_error)?;
 
@@ -498,12 +514,8 @@ impl DelugeServer {
         if p.info_hashes.len() == 1 {
             let hash = p.info_hashes.into_iter().next().unwrap();
             let result = self
-                .client
-                .call(
-                    "core.get_torrent_status",
-                    vec![Value::String(hash.0.clone()), Value::List(vec![])],
-                    vec![],
-                )
+                .api
+                .get_torrent_status(&hash.0, Value::List(vec![]))
                 .await
                 .map_err(Self::enrich_client_error)?;
             let mut out = serde_json::Map::new();
@@ -516,8 +528,8 @@ impl DelugeServer {
             Value::String("id".into()),
             Value::List(p.info_hashes.into_iter().map(|h| Value::String(h.0)).collect()),
         )]);
-        self.client
-            .call("core.get_torrents_status", vec![filter, Value::List(vec![])], vec![])
+        self.api
+            .get_torrents_status(filter, Value::List(vec![]))
             .await
             .map(Self::value_to_json_string)
             .map_err(Self::enrich_client_error)
@@ -530,12 +542,8 @@ impl DelugeServer {
         Parameters(p): Parameters<TorrentIdParams>,
     ) -> Result<String, String> {
         Self::validate_info_hashes(&p.info_hashes)?;
-        self.client
-            .call(
-                "core.pause_torrents",
-                vec![Value::List(p.info_hashes.into_iter().map(|h| Value::String(h.0)).collect())],
-                vec![],
-            )
+        self.api
+            .pause(hash_strings(p.info_hashes))
             .await
             .map(|_| "ok".to_string())
             .map_err(Self::enrich_client_error)
@@ -548,12 +556,8 @@ impl DelugeServer {
         Parameters(p): Parameters<TorrentIdParams>,
     ) -> Result<String, String> {
         Self::validate_info_hashes(&p.info_hashes)?;
-        self.client
-            .call(
-                "core.resume_torrents",
-                vec![Value::List(p.info_hashes.into_iter().map(|h| Value::String(h.0)).collect())],
-                vec![],
-            )
+        self.api
+            .resume(hash_strings(p.info_hashes))
             .await
             .map(|_| "ok".to_string())
             .map_err(Self::enrich_client_error)
@@ -597,15 +601,8 @@ impl DelugeServer {
         if opts.is_empty() {
             return Err("No options provided. Set at least one option field (e.g. max_download_speed, ratio_limit).".to_string());
         }
-        self.client
-            .call(
-                "core.set_torrent_options",
-                vec![
-                    Value::List(p.info_hashes.into_iter().map(|h| Value::String(h.0)).collect()),
-                    Value::Dict(opts),
-                ],
-                vec![],
-            )
+        self.api
+            .set_torrent_options(hash_strings(p.info_hashes), opts)
             .await
             .map(|_| "ok".to_string())
             .map_err(Self::enrich_client_error)
@@ -622,15 +619,8 @@ impl DelugeServer {
     ) -> Result<String, String> {
         self.gate.check("deluge_move_storage")?;
         Self::validate_info_hashes(&p.info_hashes)?;
-        self.client
-            .call(
-                "core.move_storage",
-                vec![
-                    Value::List(p.info_hashes.into_iter().map(|h| Value::String(h.0)).collect()),
-                    Value::String(p.dest.clone()),
-                ],
-                vec![],
-            )
+        self.api
+            .move_storage(hash_strings(p.info_hashes), &p.dest)
             .await
             .map(|_| "ok".to_string())
             .map_err(Self::enrich_client_error)
@@ -666,16 +656,8 @@ impl DelugeServer {
         } else {
             format!("{}/", p.folder)
         };
-        self.client
-            .call(
-                "core.rename_folder",
-                vec![
-                    Value::String(hash.0),
-                    Value::String(folder),
-                    Value::String(p.new_name),
-                ],
-                vec![],
-            )
+        self.api
+            .rename_folder(&hash.0, &folder, &p.new_name)
             .await
             .map(|_| "ok".to_string())
             .map_err(Self::enrich_client_error)
@@ -696,23 +678,13 @@ impl DelugeServer {
             return Err("rename_files operates on a single torrent. Provide exactly one info_hash.".to_string());
         }
         let hash = p.info_hashes.into_iter().next().unwrap();
-        let renames = Value::List(
-            p.renames
-                .iter()
-                .map(|r| {
-                    Value::List(vec![
-                        Value::Int(r.index as i64),
-                        Value::String(r.new_name.clone()),
-                    ])
-                })
-                .collect(),
-        );
-        self.client
-            .call(
-                "core.rename_files",
-                vec![Value::String(hash.0), renames],
-                vec![],
-            )
+        let renames = p
+            .renames
+            .into_iter()
+            .map(|r| (r.index as i64, r.new_name))
+            .collect();
+        self.api
+            .rename_files(&hash.0, renames)
             .await
             .map(|_| "ok".to_string())
             .map_err(Self::enrich_client_error)
@@ -727,12 +699,8 @@ impl DelugeServer {
     ) -> Result<String, String> {
         self.gate.check("deluge_force_recheck")?;
         Self::validate_info_hashes(&p.info_hashes)?;
-        self.client
-            .call(
-                "core.force_recheck",
-                vec![Value::List(p.info_hashes.into_iter().map(|h| Value::String(h.0)).collect())],
-                vec![],
-            )
+        self.api
+            .force_recheck(hash_strings(p.info_hashes))
             .await
             .map(|_| "ok".to_string())
             .map_err(Self::enrich_client_error)
@@ -741,8 +709,8 @@ impl DelugeServer {
     /// Get free disk space at a path on the Deluge server. Returns bytes, or error if path is invalid.
     #[tool(name = "deluge_get_free_space", title = "Get Free Space", annotations(read_only_hint = true, open_world_hint = false))]
     async fn get_free_space(&self, Parameters(p): Parameters<PathParams>) -> Result<String, String> {
-        self.client
-            .call("core.get_free_space", vec![Value::String(p.path)], vec![])
+        self.api
+            .get_free_space(&p.path)
             .await
             .map(|v| match v {
                 Value::Int(bytes) => bytes.to_string(),
@@ -754,8 +722,8 @@ impl DelugeServer {
     /// Get the total size of a file or directory on the Deluge server. Returns bytes, or -1 if inaccessible.
     #[tool(name = "deluge_get_path_size", title = "Get Path Size", annotations(read_only_hint = true, open_world_hint = false))]
     async fn get_path_size(&self, Parameters(p): Parameters<PathParams>) -> Result<String, String> {
-        self.client
-            .call("core.get_path_size", vec![Value::String(p.path)], vec![])
+        self.api
+            .get_path_size(&p.path)
             .await
             .map(|v| match v {
                 Value::Int(bytes) => bytes.to_string(),
@@ -772,8 +740,8 @@ impl DelugeServer {
     ) -> Result<String, String> {
         self.gate.check("deluge_create_label")?;
         let label = Self::validate_label_name(&p.label)?;
-        self.client
-            .call("label.add", vec![Value::String(label)], vec![])
+        self.api
+            .label_add(&label)
             .await
             .map(|_| "ok".to_string())
             .map_err(Self::enrich_label_error)
@@ -788,8 +756,8 @@ impl DelugeServer {
     ) -> Result<String, String> {
         self.gate.check("deluge_delete_label")?;
         let label = Self::validate_label_name(&p.label)?;
-        self.client
-            .call("label.remove", vec![Value::String(label)], vec![])
+        self.api
+            .label_remove(&label)
             .await
             .map(|_| "ok".to_string())
             .map_err(Self::enrich_label_error)
@@ -809,14 +777,7 @@ impl DelugeServer {
         let create_label_hint = self.create_label_hint();
         let mut results = serde_json::Map::new();
         for hash in &p.info_hashes {
-            let result = self
-                .client
-                .call(
-                    "label.set_torrent",
-                    vec![Value::String(hash.0.clone()), Value::String(label.clone())],
-                    vec![],
-                )
-                .await;
+            let result = self.api.label_set_torrent(&hash.0, &label).await;
             match result {
                 Ok(_) => {
                     results.insert(hash.0.clone(), serde_json::json!("ok"));
@@ -845,7 +806,7 @@ impl DelugeServer {
     ) -> Result<String, String> {
         self.gate.check("deluge_pause_label")?;
         let label = Self::validate_label_name(&p.label)?;
-        self.bulk_act_on_label(&label, "core.pause_torrents", "paused").await
+        self.bulk_act_on_label(&label, LabelAction::Pause).await
     }
 
     /// Resume every paused torrent assigned the given label. Errors if no torrents currently have this label.
@@ -856,7 +817,7 @@ impl DelugeServer {
     ) -> Result<String, String> {
         self.gate.check("deluge_resume_label")?;
         let label = Self::validate_label_name(&p.label)?;
-        self.bulk_act_on_label(&label, "core.resume_torrents", "resumed").await
+        self.bulk_act_on_label(&label, LabelAction::Resume).await
     }
 
     /// List all labels defined on the Deluge daemon. Returns a JSON array of label names.
@@ -864,8 +825,8 @@ impl DelugeServer {
     async fn list_labels(&self) -> Result<String, String> {
         self.gate.check("deluge_list_labels")?;
         let result = self
-            .client
-            .call("label.get_labels", vec![], vec![])
+            .api
+            .label_get_labels()
             .await
             .map_err(Self::enrich_label_error)?;
         Ok(Self::value_to_json_string(result))
@@ -881,8 +842,8 @@ impl DelugeServer {
         self.gate.check("deluge_get_label_options")?;
         let label = Self::validate_label_name(&p.label)?;
         let result = self
-            .client
-            .call("label.get_options", vec![Value::String(label)], vec![])
+            .api
+            .label_get_options(&label)
             .await
             .map_err(Self::enrich_label_error)?;
         Ok(Self::value_to_json_string(result))
@@ -956,12 +917,8 @@ impl DelugeServer {
             );
         }
 
-        self.client
-            .call(
-                "label.set_options",
-                vec![Value::String(label), Value::Dict(opts)],
-                vec![],
-            )
+        self.api
+            .label_set_options(&label, opts)
             .await
             .map(|_| "ok".to_string())
             .map_err(Self::enrich_label_error)
@@ -974,7 +931,7 @@ impl DelugeServer {
 
 impl DelugeServer {
     pub(crate) fn new(
-        client: Arc<DelugeClient>,
+        api: DelugeApi,
         user_intent_tools: HashSet<String>,
         plugin_gated_tools: HashSet<String>,
         initial_label_plugin_active: bool,
@@ -989,7 +946,7 @@ impl DelugeServer {
             Arc::new(RwLock::new(HashMap::new()));
 
         // Background task: forward Deluge push events to subscribed MCP peers.
-        let mut event_rx = client.subscribe_events();
+        let mut event_rx = api.subscribe_events();
         let subs_for_task = subscribers.clone();
         tokio::spawn(async move {
             loop {
@@ -1036,7 +993,7 @@ impl DelugeServer {
         });
 
         Self {
-            client,
+            api,
             gate,
             tool_router: Self::tool_router(),
             subscribers,
@@ -1049,10 +1006,10 @@ impl DelugeServer {
     /// On reconnect or broadcast lag it re-probes via `core.get_enabled_plugins`
     /// to recover the authoritative state.
     pub(crate) fn spawn_plugin_watcher(&self) {
-        let client = self.client.clone();
+        let api = self.api.clone();
         let gate = self.gate.clone();
         let connected_peers = self.connected_peers.clone();
-        let mut event_rx = client.subscribe_events();
+        let mut event_rx = api.subscribe_events();
 
         tokio::spawn(async move {
             // Seed from an authoritative probe. The constructor's
@@ -1060,7 +1017,7 @@ impl DelugeServer {
             // process start but the plugin toggled before this HTTP session
             // opened), and the broadcast receiver was created above — any
             // events that arrive between here and the loop will be buffered.
-            if let Some(active) = probe_label_plugin(&client).await {
+            if let Some(active) = api.label_plugin_active().await {
                 apply_label_state(active, &gate, &connected_peers).await;
             }
 
@@ -1076,7 +1033,7 @@ impl DelugeServer {
                         // Re-seed from the daemon — the previous state may be stale
                         // and `set_event_interest` was just re-issued, so we may have
                         // missed transitions while disconnected.
-                        if let Some(active) = probe_label_plugin(&client).await {
+                        if let Some(active) = api.label_plugin_active().await {
                             apply_label_state(active, &gate, &connected_peers).await;
                         }
                     }
@@ -1084,7 +1041,7 @@ impl DelugeServer {
                         warn!(
                             "Plugin watcher lagged by {n} events — re-probing plugin state"
                         );
-                        if let Some(active) = probe_label_plugin(&client).await {
+                        if let Some(active) = api.label_plugin_active().await {
                             apply_label_state(active, &gate, &connected_peers).await;
                         }
                     }
@@ -1123,24 +1080,10 @@ impl DelugeServer {
     /// Auto-detect the source type and add a single torrent to Deluge.
     /// Detection order: magnet: → http/https URL → base64 .torrent → server file path.
     async fn add_single_torrent(&self, source: &str) -> Result<String, String> {
-        let opts = Value::Dict(vec![]);
-
         let result = if source.starts_with("magnet:") {
-            self.client
-                .call(
-                    "core.add_torrent_magnet",
-                    vec![Value::String(source.to_string()), opts],
-                    vec![],
-                )
-                .await
+            self.api.add_magnet(source).await
         } else if source.starts_with("http://") || source.starts_with("https://") {
-            self.client
-                .call(
-                    "core.add_torrent_url",
-                    vec![Value::String(source.to_string()), opts],
-                    vec![],
-                )
-                .await
+            self.api.add_url(source).await
         } else if {
             // Size guard BEFORE base64 decode to prevent oversized allocation
             const MAX_BASE64_BYTES: usize = 32 * 1024 * 1024; // 32 MB
@@ -1153,17 +1096,7 @@ impl DelugeServer {
             }
             Self::is_base64_torrent(source)
         } {
-            self.client
-                .call(
-                    "core.add_torrent_file",
-                    vec![
-                        Value::String("upload.torrent".to_string()),
-                        Value::String(source.to_string()),
-                        opts,
-                    ],
-                    vec![],
-                )
-                .await
+            self.api.add_file("upload.torrent", source).await
         } else if Self::looks_like_file_path(source) {
             // Absolute file path on the Deluge server
             if std::path::Path::new(source)
@@ -1183,15 +1116,8 @@ impl DelugeServer {
             let filename = std::path::Path::new(source)
                 .file_name()
                 .and_then(|n| n.to_str())
-                .unwrap_or("file.torrent")
-                .to_string();
-            self.client
-                .call(
-                    "core.add_torrent_file",
-                    vec![Value::String(filename), Value::String(encoded), opts],
-                    vec![],
-                )
-                .await
+                .unwrap_or("file.torrent");
+            self.api.add_file(filename, &encoded).await
         } else {
             return Err(
                 "Unrecognized torrent source format. Each source must be one of: \
@@ -1413,13 +1339,12 @@ impl DelugeServer {
     }
 
     /// Common implementation of pause_label / resume_label. Looks up the torrents
-    /// carrying the label via a server-side filter, errors if none, then forwards
-    /// the hash list to the supplied core action.
+    /// carrying the label via a server-side filter, errors if none, then applies
+    /// the action to the whole set.
     async fn bulk_act_on_label(
         &self,
         label: &str,
-        action_method: &str,
-        action_past_tense: &str,
+        action: LabelAction,
     ) -> Result<String, String> {
         let filter = Value::Dict(vec![(
             Value::String("label".into()),
@@ -1427,8 +1352,8 @@ impl DelugeServer {
         )]);
         let keys = Value::List(vec![Value::String("label".into())]);
         let status = self
-            .client
-            .call("core.get_torrents_status", vec![filter, keys], vec![])
+            .api
+            .get_torrents_status(filter, keys)
             .await
             .map_err(Self::enrich_client_error)?;
 
@@ -1456,17 +1381,15 @@ impl DelugeServer {
         }
 
         let count = hashes.len();
-        let hash_values: Vec<Value> =
-            hashes.iter().cloned().map(Value::String).collect();
-
-        self.client
-            .call(action_method, vec![Value::List(hash_values)], vec![])
-            .await
-            .map_err(Self::enrich_client_error)?;
+        let result = match action {
+            LabelAction::Pause => self.api.pause(hashes.clone()).await,
+            LabelAction::Resume => self.api.resume(hashes.clone()).await,
+        };
+        result.map_err(Self::enrich_client_error)?;
 
         let out = serde_json::json!({
             "label": label,
-            "action": action_past_tense,
+            "action": action.past_tense(),
             "count": count,
             "info_hashes": hashes,
         });
@@ -1561,24 +1484,6 @@ fn event_to_resource_uris(event: &DelugeEvent) -> Vec<String> {
 // ---------------------------------------------------------------------------
 // Plugin watcher helpers
 // ---------------------------------------------------------------------------
-
-/// Probe the Deluge daemon for whether the Label plugin is currently enabled.
-/// Returns `None` on RPC failure (caller should keep the previous state).
-pub(crate) async fn probe_label_plugin(client: &Arc<DelugeClient>) -> Option<bool> {
-    match client.call("core.get_enabled_plugins", vec![], vec![]).await {
-        Ok(Value::List(items)) => Some(items.iter().any(
-            |v| matches!(v, Value::String(s) if s == "Label"),
-        )),
-        Ok(other) => {
-            warn!("core.get_enabled_plugins returned unexpected shape: {other:?}");
-            None
-        }
-        Err(e) => {
-            warn!("core.get_enabled_plugins failed: {e}");
-            None
-        }
-    }
-}
 
 /// Apply a new Label-plugin state to the [`ToolGate`]. If it actually changes
 /// the visible tool set, fans out `tools/list_changed` to every connected peer.
@@ -1765,25 +1670,19 @@ impl ServerHandler for DelugeServer {
         let uri = &request.uri;
 
         if uri == "deluge://torrents" {
+            let keys = Value::List(vec![
+                Value::String("name".into()),
+                Value::String("state".into()),
+                Value::String("progress".into()),
+                Value::String("total_size".into()),
+                Value::String("download_payload_rate".into()),
+                Value::String("upload_payload_rate".into()),
+                Value::String("eta".into()),
+                Value::String("save_path".into()),
+            ]);
             let result = self
-                .client
-                .call(
-                    "core.get_torrents_status",
-                    vec![
-                        Value::Dict(vec![]),
-                        Value::List(vec![
-                            Value::String("name".into()),
-                            Value::String("state".into()),
-                            Value::String("progress".into()),
-                            Value::String("total_size".into()),
-                            Value::String("download_payload_rate".into()),
-                            Value::String("upload_payload_rate".into()),
-                            Value::String("eta".into()),
-                            Value::String("save_path".into()),
-                        ]),
-                    ],
-                    vec![],
-                )
+                .api
+                .get_torrents_status(Value::Dict(vec![]), keys)
                 .await
                 .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
@@ -1802,12 +1701,8 @@ impl ServerHandler for DelugeServer {
                 return Err(ErrorData::invalid_params(e, None));
             }
             let result = self
-                .client
-                .call(
-                    "core.get_torrent_status",
-                    vec![Value::String(hash.to_string()), Value::List(vec![])],
-                    vec![],
-                )
+                .api
+                .get_torrent_status(hash, Value::List(vec![]))
                 .await
                 .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
