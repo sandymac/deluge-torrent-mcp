@@ -4,8 +4,8 @@
 //! Input validation and source-type detection.
 //!
 //! These guard against LLM hallucination: rejecting malformed info hashes and
-//! label names before they reach Deluge, and auto-detecting whether an
-//! `add_torrent` source is base64 .torrent content or a server file path.
+//! label names before they reach Deluge, and detecting whether an `add_torrent`
+//! source is valid base64 .torrent content.
 //! Kept as `pub(super)` methods on [`DelugeServer`] so callers use `Self::…`.
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
@@ -25,13 +25,13 @@ impl DelugeServer {
         Ok(())
     }
 
-    /// Validate a torrent info hash — 40 hex chars (SHA-1).
+    /// Validate a torrent info hash — 40 hex chars (SHA-1) or 64 hex chars (SHA-256).
     pub(super) fn validate_info_hash(hash: &str) -> Result<(), String> {
-        let valid_len = hash.len() == 40;
+        let valid_len = hash.len() == 40 || hash.len() == 64;
         let valid_hex = hash.bytes().all(|b| b.is_ascii_hexdigit());
         if !valid_len || !valid_hex {
             return Err(format!(
-                "invalid info_hash '{hash}': must be 40 hex characters.\n\
+                "invalid info_hash '{hash}': must be 40 or 64 hex characters.\n\
                  [Hint: Do not guess or construct an info_hash. Use list_torrents to find the correct \
                  info_hash for the torrent you want to act on.]"
             ));
@@ -48,19 +48,6 @@ impl DelugeServer {
         // any nested structures. .torrent files nest up to ~3 levels (dict→info dict→files list).
         let mut decoder = bendy::decoding::Decoder::new(&bytes).with_max_depth(100);
         decoder.next_object().is_ok_and(|obj| obj.is_some())
-    }
-
-    /// Check if a string looks like an absolute file path.
-    pub(super) fn looks_like_file_path(s: &str) -> bool {
-        // Unix absolute path
-        s.starts_with('/')
-            // Windows absolute path (e.g. C:\, D:/)
-            || (s.len() >= 3
-                && s.as_bytes()[0].is_ascii_alphabetic()
-                && s.as_bytes()[1] == b':'
-                && (s.as_bytes()[2] == b'\\' || s.as_bytes()[2] == b'/'))
-            // Windows UNC path (e.g. \\server\share)
-            || s.starts_with("\\\\")
     }
 
     /// Validate and normalize a Deluge label name. Lowercases the input and rejects
@@ -119,22 +106,27 @@ mod tests {
     }
 
     #[test]
-    fn looks_like_file_path_detects_absolute_paths() {
-        // Unix
-        assert!(DelugeServer::looks_like_file_path("/srv/torrents/file.torrent"));
-        // Windows backslash
-        assert!(DelugeServer::looks_like_file_path("C:\\Users\\file.torrent"));
-        // Windows forward slash
-        assert!(DelugeServer::looks_like_file_path("C:/Users/file.torrent"));
-        // Windows UNC
-        assert!(DelugeServer::looks_like_file_path("\\\\server\\share\\file.torrent"));
+    fn validate_info_hash_accepts_sha1_and_sha256() {
+        // 40 hex chars (SHA-1)
+        assert!(DelugeServer::validate_info_hash("d91ebfafb0efc9a47dfb8bbd1560c90cfdc10fdb").is_ok());
+        // 64 hex chars (SHA-256, BitTorrent v2)
+        assert!(DelugeServer::validate_info_hash(
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        )
+        .is_ok());
     }
 
     #[test]
-    fn looks_like_file_path_rejects_non_paths() {
-        assert!(!DelugeServer::looks_like_file_path("magnet:?xt=urn:btih:abc"));
-        assert!(!DelugeServer::looks_like_file_path("aGVsbG8="));
-        assert!(!DelugeServer::looks_like_file_path("some random string"));
+    fn validate_info_hash_rejects_bad_length_and_nonhex() {
+        // 39 chars — wrong length
+        assert!(DelugeServer::validate_info_hash("d91ebfafb0efc9a47dfb8bbd1560c90cfdc10fd").is_err());
+        // 64 chars but contains a non-hex character ('g')
+        assert!(DelugeServer::validate_info_hash(
+            "g123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        )
+        .is_err());
+        // 50 chars — between the two valid lengths
+        assert!(DelugeServer::validate_info_hash(&"a".repeat(50)).is_err());
     }
 
     #[test]

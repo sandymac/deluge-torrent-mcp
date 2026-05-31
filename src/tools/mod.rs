@@ -213,14 +213,17 @@ impl DelugeServer {
     }
 
     /// Auto-detect the source type and add a single torrent to Deluge.
-    /// Detection order: magnet: → http/https URL → base64 .torrent → server file path.
+    /// Detection order: magnet: → http/https URL → base64 .torrent content.
     async fn add_single_torrent(&self, source: &str) -> Result<String, String> {
         let result = if source.starts_with("magnet:") {
             self.api.add_magnet(source).await
         } else if source.starts_with("http://") || source.starts_with("https://") {
             self.api.add_url(source).await
-        } else if {
-            // Size guard BEFORE base64 decode to prevent oversized allocation
+        } else {
+            // Otherwise the source must be base64-encoded .torrent file content,
+            // which Deluge decodes via add_torrent_file. Deluge has no RPC that
+            // reads a server-side path, so a path is not an accepted source.
+            // Size guard BEFORE base64 decode to prevent oversized allocation.
             const MAX_BASE64_BYTES: usize = 32 * 1024 * 1024; // 32 MB
             if source.len() > MAX_BASE64_BYTES {
                 return Err(format!(
@@ -229,38 +232,17 @@ impl DelugeServer {
                     source.len()
                 ));
             }
-            Self::is_base64_torrent(source)
-        } {
-            self.api.add_file("upload.torrent", source).await
-        } else if Self::looks_like_file_path(source) {
-            // Absolute file path on the Deluge server
-            if std::path::Path::new(source)
-                .components()
-                .any(|c| c == std::path::Component::ParentDir)
-            {
-                return Err("file path must not contain '..' components".to_string());
+            if Self::is_base64_torrent(source) {
+                self.api.add_file("upload.torrent", source).await
+            } else {
+                return Err(
+                    "Unrecognized torrent source format. Each source must be one of: \
+                     a magnet: URI, an http/https URL, or base64-encoded .torrent file content.\n\
+                     [Hint: Do not fabricate .torrent file content. Use a magnet link or URL. \
+                     To add a .torrent file, read its bytes and pass them base64-encoded.]"
+                        .to_string(),
+                );
             }
-            let bytes = tokio::fs::read(source).await.map_err(|e| {
-                format!(
-                    "Failed to read file: {e}\n\
-                     [Hint: file paths must be absolute paths to .torrent files on the \
-                     Deluge server's filesystem, not on the client machine.]"
-                )
-            })?;
-            let encoded = BASE64.encode(&bytes);
-            let filename = std::path::Path::new(source)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("file.torrent");
-            self.api.add_file(filename, &encoded).await
-        } else {
-            return Err(
-                "Unrecognized torrent source format. Each source must be one of: \
-                 a magnet: URI, an http/https URL, base64-encoded .torrent file content, \
-                 or an absolute file path on the Deluge server.\n\
-                 [Hint: Do not fabricate .torrent file content. Use a magnet link or URL instead.]"
-                    .to_string(),
-            );
         };
 
         result

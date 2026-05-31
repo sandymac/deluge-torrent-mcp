@@ -13,15 +13,15 @@ use serde::Deserialize;
 
 #[derive(Deserialize, schemars::JsonSchema)]
 pub(super) struct AddTorrentParams {
-    /// Torrent sources to add. Each entry is auto-detected: magnet: URIs, http/https URLs, base64-encoded .torrent file content, or absolute file paths on the Deluge server.
+    /// Torrent sources to add. Each entry is auto-detected: magnet: URIs, http/https URLs, or base64-encoded .torrent file content.
     #[schemars(length(min = 1))]
     pub(super) torrent_sources: Vec<String>,
 }
 
-/// 40-character hex SHA-1 torrent info hash. Use deluge_list_torrents to discover valid values.
+/// 40-character (SHA-1) or 64-character (SHA-256) hex torrent info hash. Use deluge_list_torrents to discover valid values.
 #[derive(Deserialize, schemars::JsonSchema)]
 pub(super) struct InfoHash(
-    #[schemars(regex(pattern = r"^[0-9a-fA-F]{40}$"))]
+    #[schemars(regex(pattern = r"^([0-9a-fA-F]{40}|[0-9a-fA-F]{64})$"))]
     pub(super) String,
 );
 

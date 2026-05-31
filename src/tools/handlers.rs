@@ -30,7 +30,8 @@ impl DelugeServer {
 #[tool_router]
 impl DelugeServer {
     /// Add one or more torrents to Deluge. Each source is auto-detected: magnet: URI, http/https URL,
-    /// base64-encoded .torrent file content, or absolute file path on the Deluge server.
+    /// or base64-encoded .torrent file content. To add a .torrent that exists as a file, read its
+    /// bytes and pass them base64-encoded.
     /// Returns the info_hash of each added torrent. URL sources are fetched asynchronously by Deluge.
     #[tool(name = "deluge_add_torrent", title = "Add Torrent", annotations(destructive_hint = false, open_world_hint = true))]
     async fn add_torrent(
