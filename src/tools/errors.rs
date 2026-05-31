@@ -16,7 +16,14 @@ impl DelugeServer {
     /// guidance telling the LLM whether to retry and what to check.
     pub(super) fn enrich_client_error(e: anyhow::Error) -> String {
         let msg = e.to_string();
-        if msg.starts_with("send failed")
+        if msg.starts_with("request timed out") {
+            format!(
+                "{msg}\n[Hint: Deluge did not respond in time. For add_torrent with an \
+                 http/https URL this usually means the tracker was slow or unreachable while \
+                 Deluge fetched the .torrent — verify the URL, or download the file and pass \
+                 it base64-encoded instead. Other torrents in the same batch are unaffected.]"
+            )
+        } else if msg.starts_with("send failed")
             || msg.starts_with("Failed to reconnect")
             || msg.contains("connection lost")
             || msg.starts_with("response channel dropped")

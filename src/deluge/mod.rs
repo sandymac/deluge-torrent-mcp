@@ -35,6 +35,13 @@ const RPC_EVENT: i64 = 3;
 
 const EVENT_CHANNEL_CAPACITY: usize = 64;
 
+/// Maximum time to wait for Deluge to respond to a single RPC call before giving
+/// up. Bounds otherwise-unbounded waits — e.g. `core.add_torrent_url` makes the
+/// daemon fetch the .torrent from a tracker, which can stall indefinitely if the
+/// tracker is slow or unresponsive. Without this, such a call hangs the tool
+/// forever; with it, the caller gets an error it can surface or retry.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+
 const MAX_FRAME_BYTES: usize = 32 * 1024 * 1024; // 32 MB compressed
 const MAX_DECOMPRESSED_BYTES: usize = MAX_FRAME_BYTES * 4; // 128 MB decompressed
 
@@ -110,7 +117,9 @@ impl DelugeClient {
         let (tx, rx) = oneshot::channel();
 
         // Hold the conn lock only during send, not during the response wait.
-        {
+        // Keep a handle to this connection's pending map so a timed-out request
+        // can be evicted (otherwise its slot would linger until a late response).
+        let pending = {
             let mut conn_guard = self.conn.lock().await;
 
             if conn_guard.is_none() {
@@ -137,10 +146,21 @@ impl DelugeClient {
                 *conn_guard = None;
                 return Err(anyhow!("send failed: {e}"));
             }
-        } // conn lock released here — other calls can proceed while we wait
+            conn.pending.clone()
+        }; // conn lock released here — other calls can proceed while we wait
 
-        rx.await
-            .map_err(|_| anyhow!("response channel dropped for request {id}"))?
+        match tokio::time::timeout(REQUEST_TIMEOUT, rx).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(anyhow!("response channel dropped for request {id}")),
+            Err(_) => {
+                // Timed out — drop our pending slot so a late reply is ignored cleanly.
+                pending.lock().unwrap().remove(&id);
+                Err(anyhow!(
+                    "request timed out after {}s waiting for Deluge to respond to {method}",
+                    REQUEST_TIMEOUT.as_secs()
+                ))
+            }
+        }
     }
 
     /// Establish a new TLS connection and authenticate. Used for both initial
