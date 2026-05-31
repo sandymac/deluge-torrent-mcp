@@ -24,7 +24,9 @@ use tracing::{debug, info, warn};
 use crate::rencode::{self, Value};
 
 mod api;
+mod event;
 pub(crate) use api::DelugeApi;
+pub(crate) use event::DelugeEvent;
 
 const PROTOCOL_VERSION: u8 = 1;
 const RPC_RESPONSE: i64 = 1;
@@ -38,25 +40,6 @@ const MAX_DECOMPRESSED_BYTES: usize = MAX_FRAME_BYTES * 4; // 128 MB decompresse
 
 type PendingMap = Mutex<HashMap<i64, oneshot::Sender<Result<Value>>>>;
 
-/// A push event received from the Deluge daemon via the RPC_EVENT wire message,
-/// plus synthetic local events the client emits for connection lifecycle.
-#[derive(Debug, Clone)]
-pub(crate) enum DelugeEvent {
-    TorrentAdded { info_hash: String, from_state: bool },
-    TorrentRemoved { info_hash: String },
-    TorrentStateChanged { info_hash: String, state: String },
-    TorrentFinished { info_hash: String },
-    TorrentResumed { info_hash: String },
-    TorrentStorageMoved { info_hash: String, path: String },
-    TorrentFileRenamed { info_hash: String, index: i64, name: String },
-    TorrentFolderRenamed { info_hash: String, old_name: String, new_name: String },
-    PluginEnabled { name: String },
-    PluginDisabled { name: String },
-    /// Synthetic event fired locally after a (re)connect + event-interest registration.
-    /// Listeners that track server-side state (e.g. plugin enablement) should re-seed.
-    Reconnected,
-    Unknown { name: String },
-}
 
 /// Active TLS connection state — writer half, pending response map, and generation counter.
 /// The generation is used by the read loop cleanup task to avoid nulling out a newer connection
@@ -474,7 +457,7 @@ fn dispatch_frame(
                 Some(Value::List(a)) => a.clone(),
                 _ => vec![],
             };
-            let event = parse_event(&name, &args);
+            let event = event::parse_event(&name, &args);
             debug!("Received Deluge event: {event:?}");
             let _ = event_tx.send(event); // ignore "no receivers" — it's fine
         }
@@ -526,60 +509,6 @@ fn enrich_deluge_error(exc_type: &str, exc_msg: &str) -> String {
     match hint {
         Some(h) => format!("{exc_type}: {exc_msg}\n[Hint: {h}]"),
         None => format!("{exc_type}: {exc_msg}"),
-    }
-}
-
-/// Decode a Deluge push event by name and positional args list into a typed [`DelugeEvent`].
-fn parse_event(name: &str, args: &[Value]) -> DelugeEvent {
-    let str_arg = |i: usize| -> String {
-        match args.get(i) {
-            Some(Value::String(s)) => s.clone(),
-            _ => String::new(),
-        }
-    };
-    let bool_arg = |i: usize| -> bool {
-        match args.get(i) {
-            Some(Value::Int(n)) => *n != 0,
-            Some(Value::Bool(b)) => *b,
-            _ => false,
-        }
-    };
-    let int_arg = |i: usize| -> i64 {
-        match args.get(i) {
-            Some(Value::Int(n)) => *n,
-            _ => 0,
-        }
-    };
-
-    match name {
-        "TorrentAddedEvent" => DelugeEvent::TorrentAdded {
-            info_hash: str_arg(0),
-            from_state: bool_arg(1),
-        },
-        "TorrentRemovedEvent" => DelugeEvent::TorrentRemoved { info_hash: str_arg(0) },
-        "TorrentStateChangedEvent" => DelugeEvent::TorrentStateChanged {
-            info_hash: str_arg(0),
-            state: str_arg(1),
-        },
-        "TorrentFinishedEvent" => DelugeEvent::TorrentFinished { info_hash: str_arg(0) },
-        "TorrentResumedEvent" => DelugeEvent::TorrentResumed { info_hash: str_arg(0) },
-        "TorrentStorageMovedEvent" => DelugeEvent::TorrentStorageMoved {
-            info_hash: str_arg(0),
-            path: str_arg(1),
-        },
-        "TorrentFileRenamedEvent" => DelugeEvent::TorrentFileRenamed {
-            info_hash: str_arg(0),
-            index: int_arg(1),
-            name: str_arg(2),
-        },
-        "TorrentFolderRenamedEvent" => DelugeEvent::TorrentFolderRenamed {
-            info_hash: str_arg(0),
-            old_name: str_arg(1),
-            new_name: str_arg(2),
-        },
-        "PluginEnabledEvent" => DelugeEvent::PluginEnabled { name: str_arg(0) },
-        "PluginDisabledEvent" => DelugeEvent::PluginDisabled { name: str_arg(0) },
-        _ => DelugeEvent::Unknown { name: name.to_string() },
     }
 }
 

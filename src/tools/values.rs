@@ -121,10 +121,7 @@ impl DelugeServer {
         }
     }
 
-    pub(super) fn value_to_string(v: Value) -> String {
-        serde_json::to_string(&crate::rencode::value_to_json(v)).unwrap_or_default()
-    }
-
+    /// Serialize a Deluge [`Value`] to a compact JSON string.
     pub(super) fn value_to_json_string(v: Value) -> String {
         serde_json::to_string(&crate::rencode::value_to_json(v)).unwrap_or_default()
     }

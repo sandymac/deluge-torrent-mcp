@@ -266,7 +266,7 @@ impl DelugeServer {
         result
             .map(|v| match v {
                 Value::String(s) => s,
-                other => Self::value_to_string(other),
+                other => Self::value_to_json_string(other),
             })
             .map_err(Self::enrich_client_error)
     }

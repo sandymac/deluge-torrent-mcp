@@ -437,7 +437,7 @@ impl DelugeServer {
             .await
             .map(|v| match v {
                 Value::Int(bytes) => bytes.to_string(),
-                other => Self::value_to_string(other),
+                other => Self::value_to_json_string(other),
             })
             .map_err(Self::enrich_client_error)
     }
@@ -450,7 +450,7 @@ impl DelugeServer {
             .await
             .map(|v| match v {
                 Value::Int(bytes) => bytes.to_string(),
-                other => Self::value_to_string(other),
+                other => Self::value_to_json_string(other),
             })
             .map_err(Self::enrich_client_error)
     }
