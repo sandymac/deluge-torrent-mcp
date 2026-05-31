@@ -196,7 +196,11 @@ async fn main() -> anyhow::Result<()> {
 
     // Handle --list-tools before clap parsing so credentials aren't required.
     if std::env::args().any(|a| a == "--list-tools") {
-        eprintln!("{:<28} {:<10} {:<10} {}", "TOOL", "CLI", "DEFAULT", "PLUGIN");
+        #[allow(clippy::print_literal)]
+        {
+            // the clippy warning on {} is less readable
+            eprintln!("{:<28} {:<10} {:<10} {}", "TOOL", "CLI", "DEFAULT", "PLUGIN");
+        }
         eprintln!("{}", "-".repeat(64));
         for spec in registry::TOOLS {
             let cli = if enabled_tools.contains(spec.name) { "enabled" } else { "disabled" };
