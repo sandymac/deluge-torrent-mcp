@@ -12,26 +12,32 @@
 //! - Admin password on consent page (when `--api-token` is set)
 //! - Unused client registration expiry (15 minutes)
 
-pub mod authorize;
-pub mod cleanup;
-pub mod discovery;
-pub mod middleware;
-pub mod persist;
-pub mod registration;
-pub mod state;
-pub mod token;
+mod authorize;
+mod cleanup;
+mod discovery;
+mod middleware;
+mod persist;
+mod registration;
+mod state;
+mod token;
 
 use std::sync::Arc;
 
 use axum::Router;
 use axum::routing::{get, post};
 
-pub use state::OAuthState;
+// Curated public facade — the only items `main` needs from this subsystem.
+// Everything else stays internal to `oauth`; sibling modules reach each other
+// through `super::` regardless of these declarations.
+pub(crate) use cleanup::spawn_cleanup;
+pub(crate) use middleware::oauth_auth_middleware;
+pub(crate) use persist::spawn_persistence;
+pub(crate) use state::OAuthState;
 
 /// Build a Router containing all OAuth 2.1 endpoints.
 ///
 /// These routes are unauthenticated — they must NOT be behind the MCP auth middleware.
-pub fn oauth_routes(state: Arc<OAuthState>) -> Router {
+pub(crate) fn oauth_routes(state: Arc<OAuthState>) -> Router {
     Router::new()
         .route(
             "/.well-known/oauth-protected-resource",

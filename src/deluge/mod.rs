@@ -23,6 +23,11 @@ use tracing::{debug, info, warn};
 
 use crate::rencode::{self, Value};
 
+mod api;
+mod event;
+pub(crate) use api::DelugeApi;
+pub(crate) use event::DelugeEvent;
+
 const PROTOCOL_VERSION: u8 = 1;
 const RPC_RESPONSE: i64 = 1;
 const RPC_ERROR: i64 = 2;
@@ -30,30 +35,18 @@ const RPC_EVENT: i64 = 3;
 
 const EVENT_CHANNEL_CAPACITY: usize = 64;
 
+/// Maximum time to wait for Deluge to respond to a single RPC call before giving
+/// up. Bounds otherwise-unbounded waits — e.g. `core.add_torrent_url` makes the
+/// daemon fetch the .torrent from a tracker, which can stall indefinitely if the
+/// tracker is slow or unresponsive. Without this, such a call hangs the tool
+/// forever; with it, the caller gets an error it can surface or retry.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+
 const MAX_FRAME_BYTES: usize = 32 * 1024 * 1024; // 32 MB compressed
 const MAX_DECOMPRESSED_BYTES: usize = MAX_FRAME_BYTES * 4; // 128 MB decompressed
 
 type PendingMap = Mutex<HashMap<i64, oneshot::Sender<Result<Value>>>>;
 
-/// A push event received from the Deluge daemon via the RPC_EVENT wire message,
-/// plus synthetic local events the client emits for connection lifecycle.
-#[derive(Debug, Clone)]
-pub enum DelugeEvent {
-    TorrentAdded { info_hash: String, from_state: bool },
-    TorrentRemoved { info_hash: String },
-    TorrentStateChanged { info_hash: String, state: String },
-    TorrentFinished { info_hash: String },
-    TorrentResumed { info_hash: String },
-    TorrentStorageMoved { info_hash: String, path: String },
-    TorrentFileRenamed { info_hash: String, index: i64, name: String },
-    TorrentFolderRenamed { info_hash: String, old_name: String, new_name: String },
-    PluginEnabled { name: String },
-    PluginDisabled { name: String },
-    /// Synthetic event fired locally after a (re)connect + event-interest registration.
-    /// Listeners that track server-side state (e.g. plugin enablement) should re-seed.
-    Reconnected,
-    Unknown { name: String },
-}
 
 /// Active TLS connection state — writer half, pending response map, and generation counter.
 /// The generation is used by the read loop cleanup task to avoid nulling out a newer connection
@@ -64,7 +57,7 @@ struct LiveConn {
     pending: Arc<PendingMap>,
 }
 
-pub struct DelugeClient {
+pub(crate) struct DelugeClient {
     // Stored for reconnect
     host: String,
     port: u16,
@@ -84,7 +77,7 @@ impl DelugeClient {
     ///
     /// Returns the client and the granted auth level (0–10).
     /// All parameters are stored for automatic reconnection if the connection drops.
-    pub async fn connect(
+    pub(crate) async fn connect(
         host: &str,
         port: u16,
         cert_fingerprint: Option<String>,
@@ -114,7 +107,7 @@ impl DelugeClient {
     ///
     /// If the connection is dead (e.g. after a laptop sleep), transparently
     /// reconnects with exponential backoff before sending.
-    pub async fn call(
+    pub(crate) async fn call(
         &self,
         method: &str,
         args: Vec<Value>,
@@ -124,7 +117,9 @@ impl DelugeClient {
         let (tx, rx) = oneshot::channel();
 
         // Hold the conn lock only during send, not during the response wait.
-        {
+        // Keep a handle to this connection's pending map so a timed-out request
+        // can be evicted (otherwise its slot would linger until a late response).
+        let pending = {
             let mut conn_guard = self.conn.lock().await;
 
             if conn_guard.is_none() {
@@ -151,10 +146,21 @@ impl DelugeClient {
                 *conn_guard = None;
                 return Err(anyhow!("send failed: {e}"));
             }
-        } // conn lock released here — other calls can proceed while we wait
+            conn.pending.clone()
+        }; // conn lock released here — other calls can proceed while we wait
 
-        rx.await
-            .map_err(|_| anyhow!("response channel dropped for request {id}"))?
+        match tokio::time::timeout(REQUEST_TIMEOUT, rx).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(anyhow!("response channel dropped for request {id}")),
+            Err(_) => {
+                // Timed out — drop our pending slot so a late reply is ignored cleanly.
+                pending.lock().unwrap().remove(&id);
+                Err(anyhow!(
+                    "request timed out after {}s waiting for Deluge to respond to {method}",
+                    REQUEST_TIMEOUT.as_secs()
+                ))
+            }
+        }
     }
 
     /// Establish a new TLS connection and authenticate. Used for both initial
@@ -281,7 +287,7 @@ impl DelugeClient {
     /// [`DelugeEvent`] the daemon sends. Lagged receivers (more than
     /// `EVENT_CHANNEL_CAPACITY` events behind) will receive a
     /// `RecvError::Lagged` from the broadcast channel.
-    pub fn subscribe_events(&self) -> broadcast::Receiver<DelugeEvent> {
+    pub(crate) fn subscribe_events(&self) -> broadcast::Receiver<DelugeEvent> {
         self.event_tx.subscribe()
     }
 
@@ -471,7 +477,7 @@ fn dispatch_frame(
                 Some(Value::List(a)) => a.clone(),
                 _ => vec![],
             };
-            let event = parse_event(&name, &args);
+            let event = event::parse_event(&name, &args);
             debug!("Received Deluge event: {event:?}");
             let _ = event_tx.send(event); // ignore "no receivers" — it's fine
         }
@@ -523,60 +529,6 @@ fn enrich_deluge_error(exc_type: &str, exc_msg: &str) -> String {
     match hint {
         Some(h) => format!("{exc_type}: {exc_msg}\n[Hint: {h}]"),
         None => format!("{exc_type}: {exc_msg}"),
-    }
-}
-
-/// Decode a Deluge push event by name and positional args list into a typed [`DelugeEvent`].
-fn parse_event(name: &str, args: &[Value]) -> DelugeEvent {
-    let str_arg = |i: usize| -> String {
-        match args.get(i) {
-            Some(Value::String(s)) => s.clone(),
-            _ => String::new(),
-        }
-    };
-    let bool_arg = |i: usize| -> bool {
-        match args.get(i) {
-            Some(Value::Int(n)) => *n != 0,
-            Some(Value::Bool(b)) => *b,
-            _ => false,
-        }
-    };
-    let int_arg = |i: usize| -> i64 {
-        match args.get(i) {
-            Some(Value::Int(n)) => *n,
-            _ => 0,
-        }
-    };
-
-    match name {
-        "TorrentAddedEvent" => DelugeEvent::TorrentAdded {
-            info_hash: str_arg(0),
-            from_state: bool_arg(1),
-        },
-        "TorrentRemovedEvent" => DelugeEvent::TorrentRemoved { info_hash: str_arg(0) },
-        "TorrentStateChangedEvent" => DelugeEvent::TorrentStateChanged {
-            info_hash: str_arg(0),
-            state: str_arg(1),
-        },
-        "TorrentFinishedEvent" => DelugeEvent::TorrentFinished { info_hash: str_arg(0) },
-        "TorrentResumedEvent" => DelugeEvent::TorrentResumed { info_hash: str_arg(0) },
-        "TorrentStorageMovedEvent" => DelugeEvent::TorrentStorageMoved {
-            info_hash: str_arg(0),
-            path: str_arg(1),
-        },
-        "TorrentFileRenamedEvent" => DelugeEvent::TorrentFileRenamed {
-            info_hash: str_arg(0),
-            index: int_arg(1),
-            name: str_arg(2),
-        },
-        "TorrentFolderRenamedEvent" => DelugeEvent::TorrentFolderRenamed {
-            info_hash: str_arg(0),
-            old_name: str_arg(1),
-            new_name: str_arg(2),
-        },
-        "PluginEnabledEvent" => DelugeEvent::PluginEnabled { name: str_arg(0) },
-        "PluginDisabledEvent" => DelugeEvent::PluginDisabled { name: str_arg(0) },
-        _ => DelugeEvent::Unknown { name: name.to_string() },
     }
 }
 

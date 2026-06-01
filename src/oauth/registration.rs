@@ -20,7 +20,7 @@ use super::state::{ClientInfo, MAX_CLIENTS, OAuthState};
 
 #[derive(Deserialize)]
 #[allow(dead_code)]
-pub struct RegisterRequest {
+pub(crate) struct RegisterRequest {
     redirect_uris: Vec<String>,
     #[serde(default)]
     client_name: Option<String>,
@@ -71,7 +71,7 @@ fn is_localhost_uri(uri: &str) -> bool {
     }
 }
 
-pub async fn handle_register(
+pub(crate) async fn handle_register(
     State(state): State<Arc<OAuthState>>,
     headers: HeaderMap,
     Json(req): Json<RegisterRequest>,

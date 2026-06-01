@@ -1,13 +1,16 @@
 // Copyright (c) 2026 Sandy McArthur, Jr.
 // SPDX-License-Identifier: MIT
 
+#![warn(unreachable_pub)]
+
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::bail;
 use clap::Parser;
+use git_version::git_version;
 use rmcp::ServiceExt;
-use serde_json;
+
 use tracing::{info, warn};
 
 mod deluge;
@@ -15,58 +18,34 @@ mod oauth;
 mod rencode;
 mod tools;
 
-/// All tool names exposed by this server, in a stable order used for logging.
-const ALL_TOOLS: &[&str] = &[
-    "deluge_add_torrent",
-    "deluge_list_torrents",
-    "deluge_get_torrent_status",
-    "deluge_pause_torrent",
-    "deluge_resume_torrent",
-    "deluge_set_torrent_options",
-    "deluge_get_free_space",
-    "deluge_get_path_size",
-    "deluge_move_storage",
-    "deluge_rename_folder",
-    "deluge_rename_files",
-    "deluge_force_recheck",
-    "deluge_remove_torrent",
-    "deluge_list_labels",
-    "deluge_create_label",
-    "deluge_delete_label",
-    "deluge_set_torrent_label",
-    "deluge_pause_label",
-    "deluge_resume_label",
-    "deluge_get_label_options",
-    "deluge_set_label_options",
-];
+use tools::registry;
 
-/// Tools that are disabled unless explicitly enabled via --enable.
-const DEFAULT_DISABLED: &[&str] = &[
-    "deluge_move_storage",
-    "deluge_rename_folder",
-    "deluge_rename_files",
-    "deluge_force_recheck",
-    "deluge_remove_torrent",
-    "deluge_create_label",
-    "deluge_delete_label",
-    "deluge_set_label_options",
-];
+/// Comma-separated list of all tool names, for CLI error messages.
+fn all_tools_list() -> String {
+    registry::all_names().collect::<Vec<_>>().join(", ")
+}
 
-/// Tools that depend on the Deluge Label plugin being enabled on the daemon.
-/// Hidden from `tools/list` whenever the plugin is inactive, regardless of CLI flags.
-const PLUGIN_GATED_LABEL_TOOLS: &[&str] = &[
-    "deluge_list_labels",
-    "deluge_create_label",
-    "deluge_delete_label",
-    "deluge_set_torrent_label",
-    "deluge_pause_label",
-    "deluge_resume_label",
-    "deluge_get_label_options",
-    "deluge_set_label_options",
-];
+/// Short git commit the binary was built from — `-dirty` when the worktree had
+/// uncommitted changes, `unknown` when built without git. Captured at compile
+/// time by `git-version` (which also tracks git state for rebuilds, so no
+/// build script is needed). The `--match` that can't match forces `git describe`
+/// to report the bare commit hash rather than a nearby tag.
+const GIT_VERSION: &str = git_version!(
+    args = ["--always", "--abbrev=7", "--dirty=-dirty", "--match=__never_match__"],
+    fallback = "unknown"
+);
+
+/// `--version` string: crate version plus the git commit, e.g. `0.7.6 (e7aa054)`.
+/// Built once and cached; clap needs a `&'static str`.
+fn version() -> &'static str {
+    static VERSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    VERSION
+        .get_or_init(|| format!("{} ({})", env!("CARGO_PKG_VERSION"), GIT_VERSION))
+        .as_str()
+}
 
 #[derive(Parser, Debug)]
-#[command(name = "deluge-torrent-mcp", about = "MCP server for Deluge torrent daemon", version)]
+#[command(name = "deluge-torrent-mcp", about = "MCP server for Deluge torrent daemon", version = version())]
 struct Cli {
     /// Deluge daemon hostname or IP
     #[arg(long, default_value = "127.0.0.1", env = "DELUGE_HOST")]
@@ -111,12 +90,20 @@ struct Cli {
     #[arg(long, default_value = "127.0.0.1:8080")]
     http_bind: String,
 
+    /// Additional Host header value(s) to accept on the HTTP transport, for when the
+    /// server runs behind a reverse proxy that forwards a public hostname (e.g.
+    /// mcp.example.com). The loopback hosts, the --http-bind host, and the --oauth-issuer
+    /// host are always accepted; use this for any other public name. Comma-separated or
+    /// repeated. Without it, rmcp's DNS-rebinding guard rejects proxied requests with 403.
+    #[arg(long = "allowed-host", value_name = "HOST", value_delimiter = ',', action = clap::ArgAction::Append, env = "DELUGE_ALLOWED_HOST")]
+    allowed_host: Vec<String>,
+
     /// Bearer token required for HTTP transport requests (recommended)
     #[arg(long, env = "DELUGE_API_TOKEN")]
     api_token: Option<String>,
 
     /// Base URL of this server as the OAuth 2.1 issuer (enables OAuth mode).
-    /// Example: http://localhost:8080  or  https://mcp.example.com
+    /// Example: <http://localhost:8080>  or  <https://mcp.example.com>
     /// When set, OAuth 2.1 endpoints are activated and MCP requests require OAuth tokens.
     /// Can be combined with --api-token to also accept static tokens as a fallback.
     #[arg(long, env = "DELUGE_OAUTH_ISSUER")]
@@ -183,19 +170,15 @@ fn parse_tool_flags_in_order() -> anyhow::Result<Vec<(bool, String)>> {
                     "Tool pattern '{}' is too short (minimum 3 characters). \
                      Available tools: {}",
                     pattern,
-                    ALL_TOOLS.join(", ")
+                    all_tools_list()
                 );
             }
-            let matches: Vec<&str> = ALL_TOOLS
-                .iter()
-                .filter(|&&t| t.contains(pattern))
-                .copied()
-                .collect();
-            if matches.is_empty() {
+            let any_match = registry::all_names().any(|t| t.contains(pattern));
+            if !any_match {
                 bail!(
                     "No tools match pattern '{}'. Available tools: {}",
                     pattern,
-                    ALL_TOOLS.join(", ")
+                    all_tools_list()
                 );
             }
             result.push((is_enable, pattern.to_string()));
@@ -205,16 +188,47 @@ fn parse_tool_flags_in_order() -> anyhow::Result<Vec<(bool, String)>> {
     Ok(result)
 }
 
+/// Build the HTTP `Host` allow-list for rmcp's DNS-rebinding guard: the loopback
+/// defaults plus the `--http-bind` host, the `--oauth-issuer` host, and any
+/// explicit `--allowed-host` values. Entries are host-only (no port), which rmcp
+/// matches against any port.
+fn build_allowed_hosts(
+    http_bind: &str,
+    oauth_issuer: &Option<String>,
+    extra: &[String],
+) -> Vec<String> {
+    let mut hosts: Vec<String> = vec!["localhost".into(), "127.0.0.1".into(), "::1".into()];
+
+    // The host portion of --http-bind (covers non-loopback binds like 0.0.0.0 or a LAN IP).
+    if let Some(host) = http_bind.rsplit_once(':').map(|(h, _)| h).filter(|h| !h.is_empty()) {
+        hosts.push(host.to_string());
+    }
+
+    // The public hostname clients actually use, taken from the OAuth issuer URL.
+    if let Some(issuer) = oauth_issuer {
+        if let Ok(url) = url::Url::parse(issuer) {
+            if let Some(host) = url.host_str() {
+                hosts.push(host.to_string());
+            }
+        }
+    }
+
+    hosts.extend(extra.iter().cloned());
+
+    hosts.sort();
+    hosts.dedup();
+    hosts
+}
+
 /// Apply ordered enable/disable flags to the default tool state.
 /// Last flag wins per tool.
 fn resolve_enabled_tools(ordered_flags: Vec<(bool, String)>) -> HashSet<String> {
-    let mut state: HashMap<&str, bool> = ALL_TOOLS
-        .iter()
-        .map(|&t| (t, !DEFAULT_DISABLED.contains(&t)))
+    let mut state: HashMap<&str, bool> = registry::all_names()
+        .map(|t| (t, registry::is_enabled_by_default(t)))
         .collect();
 
     for (is_enable, pattern) in &ordered_flags {
-        for &tool in ALL_TOOLS.iter().filter(|&&t| t.contains(pattern.as_str())) {
+        for tool in registry::all_names().filter(|t| t.contains(pattern.as_str())) {
             state.insert(tool, *is_enable);
         }
     }
@@ -242,13 +256,17 @@ async fn main() -> anyhow::Result<()> {
 
     // Handle --list-tools before clap parsing so credentials aren't required.
     if std::env::args().any(|a| a == "--list-tools") {
-        eprintln!("{:<28} {:<10} {:<10} {}", "TOOL", "CLI", "DEFAULT", "PLUGIN");
+        #[allow(clippy::print_literal)]
+        {
+            // the clippy warning on {} is less readable
+            eprintln!("{:<28} {:<10} {:<10} {}", "TOOL", "CLI", "DEFAULT", "PLUGIN");
+        }
         eprintln!("{}", "-".repeat(64));
-        for &tool in ALL_TOOLS {
-            let cli = if enabled_tools.contains(tool) { "enabled" } else { "disabled" };
-            let default = if DEFAULT_DISABLED.contains(&tool) { "disabled" } else { "enabled" };
-            let plugin = if PLUGIN_GATED_LABEL_TOOLS.contains(&tool) { "Label" } else { "-" };
-            eprintln!("{:<28} {:<10} {:<10} {}", tool, cli, default, plugin);
+        for spec in registry::TOOLS {
+            let cli = if enabled_tools.contains(spec.name) { "enabled" } else { "disabled" };
+            let default = if spec.default_disabled { "disabled" } else { "enabled" };
+            let plugin = if spec.requires_label_plugin { "Label" } else { "-" };
+            eprintln!("{:<28} {:<10} {:<10} {}", spec.name, cli, default, plugin);
         }
         eprintln!();
         eprintln!(
@@ -267,15 +285,11 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     // Log effective tool permissions at startup
-    let enabled_list: Vec<&str> = ALL_TOOLS
-        .iter()
-        .copied()
-        .filter(|&t| enabled_tools.contains(t))
+    let enabled_list: Vec<&str> = registry::all_names()
+        .filter(|t| enabled_tools.contains(*t))
         .collect();
-    let disabled_list: Vec<&str> = ALL_TOOLS
-        .iter()
-        .copied()
-        .filter(|&t| !enabled_tools.contains(t))
+    let disabled_list: Vec<&str> = registry::all_names()
+        .filter(|t| !enabled_tools.contains(*t))
         .collect();
     info!(enabled = %enabled_list.join(", "), "Enabled tools");
     if !disabled_list.is_empty() {
@@ -298,10 +312,11 @@ async fn main() -> anyhow::Result<()> {
     .await?;
     info!(auth_level, "Authenticated with Deluge daemon");
 
+    let api = deluge::DelugeApi::new(client);
+
     // Probe whether the Label plugin is currently active. The plugin watcher
     // (spawned per DelugeServer below) keeps this value live thereafter.
-    let initial_label_plugin_active =
-        tools::probe_label_plugin(&client).await.unwrap_or(false);
+    let initial_label_plugin_active = api.label_plugin_active().await.unwrap_or(false);
     if initial_label_plugin_active {
         info!("Deluge Label plugin is enabled — label tools are available");
     } else {
@@ -309,16 +324,14 @@ async fn main() -> anyhow::Result<()> {
             "Deluge Label plugin is not enabled — label tools are hidden until the user enables it"
         );
     }
-    let plugin_gated_tools: HashSet<String> = PLUGIN_GATED_LABEL_TOOLS
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
+    let plugin_gated_tools: HashSet<String> =
+        registry::plugin_gated_names().map(|s| s.to_string()).collect();
 
     if cli.test_connection {
         use crate::rencode::Value;
 
         // daemon.info — returns a string describing the daemon build
-        let info = client.call("daemon.info", vec![], vec![]).await?;
+        let info = api.daemon_info().await?;
         eprintln!("daemon.info: {}", match &info {
             Value::String(s) => s.as_str(),
             _ => "(unexpected type)",
@@ -333,9 +346,7 @@ async fn main() -> anyhow::Result<()> {
             Value::String("num_peers".into()),
             Value::String("dht_nodes".into()),
         ]);
-        let status = client
-            .call("core.get_session_status", vec![keys], vec![])
-            .await?;
+        let status = api.session_status(keys).await?;
         let json = serde_json::to_string_pretty(&crate::rencode::value_to_json(status))
             .unwrap_or_default();
         eprintln!("core.get_session_status:\n{json}");
@@ -347,7 +358,7 @@ async fn main() -> anyhow::Result<()> {
         Transport::Stdio => {
             info!("Starting MCP server on stdio");
             let server = tools::DelugeServer::new(
-                client,
+                api,
                 enabled_tools,
                 plugin_gated_tools,
                 initial_label_plugin_active,
@@ -379,17 +390,28 @@ async fn main() -> anyhow::Result<()> {
 
             info!(bind = %cli.http_bind, "Starting MCP server on HTTP");
 
+            // rmcp's streamable-HTTP transport rejects any Host header not on its
+            // allow-list (DNS-rebinding protection), defaulting to loopback only.
+            // Behind a reverse proxy the forwarded Host is the public name, so accept:
+            // the loopback defaults, the --http-bind host, the --oauth-issuer host, and
+            // any operator-supplied --allowed-host. Otherwise proxied requests get 403.
+            let allowed_hosts =
+                build_allowed_hosts(&cli.http_bind, &cli.oauth_issuer, &cli.allowed_host);
+            info!(allowed_hosts = %allowed_hosts.join(", "), "HTTP Host allow-list");
+            let http_config =
+                StreamableHttpServerConfig::default().with_allowed_hosts(allowed_hosts);
+
             // Build the MCP service — factory creates a DelugeServer per session.
             // Each session spawns its own plugin watcher so it gets independent
             // tools/list_changed delivery to its own peer.
             let mcp_service = {
-                let client = client.clone();
+                let api = api.clone();
                 let enabled_tools = enabled_tools.clone();
                 let plugin_gated_tools = plugin_gated_tools.clone();
                 StreamableHttpService::new(
                     move || {
                         let server = tools::DelugeServer::new(
-                            client.clone(),
+                            api.clone(),
                             enabled_tools.clone(),
                             plugin_gated_tools.clone(),
                             initial_label_plugin_active,
@@ -398,7 +420,7 @@ async fn main() -> anyhow::Result<()> {
                         Ok(server)
                     },
                     Arc::new(LocalSessionManager::default()),
-                    StreamableHttpServerConfig::default(),
+                    http_config,
                 )
             };
 
@@ -416,8 +438,8 @@ async fn main() -> anyhow::Result<()> {
                     )
                     .await?,
                 );
-                oauth::cleanup::spawn_cleanup(oauth_state.clone());
-                oauth::persist::spawn_persistence(oauth_state.clone());
+                oauth::spawn_cleanup(oauth_state.clone());
+                oauth::spawn_persistence(oauth_state.clone());
 
                 info!(
                     issuer = %issuer,
@@ -431,7 +453,7 @@ async fn main() -> anyhow::Result<()> {
 
                 let auth_middleware = middleware::from_fn_with_state(
                     oauth_state.clone(),
-                    oauth::middleware::oauth_auth_middleware,
+                    oauth::oauth_auth_middleware,
                 );
 
                 shutdown_oauth_state = Some(oauth_state);
@@ -509,4 +531,39 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_allowed_hosts;
+
+    #[test]
+    fn allowed_hosts_includes_loopback_bind_issuer_and_extra() {
+        let hosts = build_allowed_hosts(
+            "0.0.0.0:10996",
+            &Some("https://mcp.deluge.mcarthur.org".to_string()),
+            &["extra.example.com".to_string()],
+        );
+        for expected in [
+            "localhost",
+            "127.0.0.1",
+            "::1",
+            "0.0.0.0",
+            "mcp.deluge.mcarthur.org",
+            "extra.example.com",
+        ] {
+            assert!(hosts.contains(&expected.to_string()), "missing {expected}: {hosts:?}");
+        }
+    }
+
+    #[test]
+    fn allowed_hosts_default_is_loopback_only_and_has_no_empty_entries() {
+        let hosts = build_allowed_hosts("127.0.0.1:8080", &None, &[]);
+        assert!(hosts.contains(&"localhost".to_string()));
+        assert!(hosts.contains(&"127.0.0.1".to_string()));
+        // The public hostname is absent when no issuer/extra is given.
+        assert!(!hosts.contains(&"mcp.deluge.mcarthur.org".to_string()));
+        // A host-only --http-bind (no ':') must not inject an empty entry.
+        assert!(!hosts.iter().any(|h| h.is_empty()));
+    }
 }

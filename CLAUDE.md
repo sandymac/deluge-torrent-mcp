@@ -53,7 +53,7 @@ Deluge exposes a custom binary RPC protocol over TCP (default port 58846). The d
 
 | Tool | Deluge RPC Method | Description |
 |---|---|---|
-| `add_torrent` | `core.add_torrent_magnet` / `core.add_torrent_url` / `core.add_torrent_file` | Add one or more torrents — source type (magnet, URL, base64 .torrent, file path) is auto-detected |
+| `add_torrent` | `core.add_torrent_magnet` / `core.add_torrent_url` / `core.add_torrent_file` | Add one or more torrents — source type (magnet, URL, base64 .torrent content) is auto-detected |
 | `remove_torrent` | `core.remove_torrent` | Remove one or more torrents, optionally deleting data |
 | `list_torrents` | `core.get_torrents_status` | List all torrents with status fields |
 | `get_torrent_status` | `core.get_torrent_status` / `core.get_torrents_status` | Get detailed status for one or more torrents |
@@ -77,7 +77,7 @@ Deluge exposes a custom binary RPC protocol over TCP (default port 58846). The d
 
 `list_torrents` accepts filters for `state`, `label` (when the Label plugin is active), `name_contains` (case-insensitive substring, pushed to Deluge's native server-side `name` filter), and `save_path_contains` (case-insensitive substring, applied client-side). It also accepts `sort_by` (one of `name`, `save_path`, `progress`, `total_size`, `download_payload_rate`, `upload_payload_rate`, `eta`, `time_added`, `ratio`) and `sort_order` (`asc` or `desc`). Filters apply before pagination so `total` reflects the filtered count. When the Label plugin is active, each returned torrent also includes its `label`.
 
-Torrents are identified by their **info hash** (40-character hex string / SHA-1).
+Torrents are identified by their **info hash** (40-character SHA-1 or 64-character SHA-256 hex string).
 
 ### Safety Gates
 

@@ -134,7 +134,7 @@ fn consent_page(client_name: &str, nonce: &str, requires_password: bool, error_m
 // ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
-pub struct AuthorizeQuery {
+pub(crate) struct AuthorizeQuery {
     response_type: Option<String>,
     client_id: Option<String>,
     redirect_uri: Option<String>,
@@ -148,7 +148,7 @@ pub struct AuthorizeQuery {
     resource: Option<String>,
 }
 
-pub async fn handle_authorize_get(
+pub(crate) async fn handle_authorize_get(
     State(state): State<Arc<OAuthState>>,
     headers: HeaderMap,
     Query(params): Query<AuthorizeQuery>,
@@ -261,14 +261,14 @@ pub async fn handle_authorize_get(
 // ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
-pub struct AuthorizeForm {
+pub(crate) struct AuthorizeForm {
     nonce: String,
     action: String,
     #[serde(default)]
     password: Option<String>,
 }
 
-pub async fn handle_authorize_post(
+pub(crate) async fn handle_authorize_post(
     State(state): State<Arc<OAuthState>>,
     headers: HeaderMap,
     Form(consent): Form<AuthorizeForm>,

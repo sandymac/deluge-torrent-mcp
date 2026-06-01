@@ -13,7 +13,7 @@ use super::state::OAuthState;
 // GET /.well-known/oauth-protected-resource  (RFC 9728)
 // ---------------------------------------------------------------------------
 
-pub async fn protected_resource_metadata(
+pub(crate) async fn protected_resource_metadata(
     State(state): State<Arc<OAuthState>>,
 ) -> impl IntoResponse {
     Json(serde_json::json!({
@@ -28,7 +28,7 @@ pub async fn protected_resource_metadata(
 // GET /.well-known/oauth-authorization-server  (RFC 8414)
 // ---------------------------------------------------------------------------
 
-pub async fn authorization_server_metadata(
+pub(crate) async fn authorization_server_metadata(
     State(state): State<Arc<OAuthState>>,
 ) -> impl IntoResponse {
     Json(serde_json::json!({
