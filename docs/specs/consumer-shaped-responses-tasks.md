@@ -117,9 +117,10 @@ T1 ─┬─→ T2 ──→ T3 ─┐
   `handlers.rs` (~lines 55, 91, 225, 247, 522 …) and `mod.rs:324` with `self.shape(value, &ctx)`.
   Add `ctx: RequestContext<RoleServer>` to handlers lacking it (macro supports it; several have
   it). Route every hash-accepting param through `cfg.ids.decode(...)` at handler top (explicit
-  placement, Open Q #2). **Scope guard:** resource reads (`mod.rs:488,508`) and
-  `--test-connection` (`main.rs:350`) stay pretty — leave as-is, add a `// v1: pretty-only`
-  note.
+  placement, Open Q #2). Resource reads (`mod.rs`) and `--test-connection` (`main.rs`) are
+  shaped too (post-review revision): resource reads via their `RequestContext`,
+  `--test-connection` via the parsed `--response-config`. `sparse` is a structural no-op on
+  those shapes; `minified`/`pretty` apply.
 - **Acceptance:** T6 golden tests still pass (default config ⇒ identical bytes); all hash
   handling goes through `decode` (grep audit: no direct `validate_info_hash` left in handler
   bodies except via the seam); full suite + clippy green.

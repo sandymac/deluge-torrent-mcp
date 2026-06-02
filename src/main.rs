@@ -367,8 +367,12 @@ async fn main() -> anyhow::Result<()> {
             Value::String("dht_nodes".into()),
         ]);
         let status = api.session_status(keys).await?;
-        let json = serde_json::to_string_pretty(&crate::rencode::value_to_json(status))
-            .unwrap_or_default();
+        // Honor --response-config here too: the diagnostic doubles as a demonstration that the
+        // shaping switches are in effect.
+        let json = crate::response_config::shape_response(
+            crate::rencode::value_to_json(status),
+            &response_config,
+        );
         eprintln!("core.get_session_status:\n{json}");
 
         return Ok(());

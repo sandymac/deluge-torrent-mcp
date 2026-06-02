@@ -146,8 +146,11 @@ transport call sites (depend on C4) and can be done in parallel. Tests accompany
 - **Hash sites** — route every `validate_info_hash` / hash-accepting param through
   `cfg.ids.decode(...)` at the top of the handler (Open Q #2: explicit placement). For `Full`
   this is behaviorally identical to today.
-- **Scope guard:** resource reads (`mod.rs:488,508`) and `--test-connection` (`main.rs:350`)
-  stay `pretty` in v1 — they have no format/query channel. Note in code + spec.
+- **Resource reads + `--test-connection`:** shaped like tool outputs (revised after review —
+  the original "stay pretty" guard was dropped). Resource reads reach the per-request config via
+  their `RequestContext`; `--test-connection` uses the parsed `--response-config` directly so it
+  also demonstrates the switch works. `sparse` is a structural no-op on these shapes (not the
+  `{"torrents": {...}}` envelope); `minified`/`pretty` apply.
 
 ### C5 — STDIO flag (`src/main.rs`)
 - New `#[arg(long = "response-config", env = "DELUGE_RESPONSE_CONFIG")] response_config:

@@ -491,7 +491,7 @@ impl ServerHandler for DelugeServer {
     async fn read_resource(
         &self,
         request: ReadResourceRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResult, ErrorData> {
         let uri = &request.uri;
 
@@ -512,10 +512,11 @@ impl ServerHandler for DelugeServer {
                 .await
                 .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
-            // v1: MCP resource reads have no format/query channel, so they stay pretty —
-            // response shaping (T7) applies to tool outputs only.
-            let text = serde_json::to_string_pretty(&crate::rencode::value_to_json(result))
-                .unwrap_or_default();
+            // Resource reads honor the same response shaping as tool outputs: on HTTP the
+            // per-request config from /mcp/<format>?<params>, on STDIO the --response-config
+            // default. (`sparse` is a structural no-op here — this resource is a bare
+            // {hash: {...}} map, not the {"torrents": {...}} envelope sparsify looks for.)
+            let text = self.shape(crate::rencode::value_to_json(result), &context);
             Ok(ReadResourceResult::new(vec![
                 ResourceContents::TextResourceContents {
                     uri: uri.clone(),
@@ -534,8 +535,7 @@ impl ServerHandler for DelugeServer {
                 .await
                 .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
-            let text = serde_json::to_string_pretty(&crate::rencode::value_to_json(result))
-                .unwrap_or_default();
+            let text = self.shape(crate::rencode::value_to_json(result), &context);
             Ok(ReadResourceResult::new(vec![
                 ResourceContents::TextResourceContents {
                     uri: uri.clone(),

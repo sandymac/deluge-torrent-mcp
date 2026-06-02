@@ -56,5 +56,8 @@ Resolve the `ResponseConfig` **per request**, not per session:
   clients that opt into nothing see byte-identical output (with one deliberate
   consistency fix: a few read paths that previously emitted minified now default to
   pretty like every other tool).
-- MCP resource reads and `--test-connection` have no format/query channel and stay
-  pretty in v1.
+- Shaping applies to all JSON the server emits: tool outputs, MCP resource reads (which
+  reach the same per-request config via their `RequestContext`), and the `--test-connection`
+  diagnostic (which uses the parsed `--response-config` directly, so it also demonstrates the
+  switch is in effect). `sparse` is a structural no-op on the resource/diagnostic shapes since
+  they are not the `{"torrents": {...}}` envelope `sparsify` targets; `minified`/`pretty` apply.
