@@ -121,6 +121,13 @@ struct Cli {
     /// Connect to Deluge, print session status, and exit
     #[arg(long, default_value_t = false)]
     test_connection: bool,
+
+    /// Shape STDIO tool responses for a token-sensitive (LLM) or byte-sensitive (programmatic)
+    /// consumer. Format `<format>?<params>`, mirroring the HTTP `/mcp/<format>?<params>` path.
+    /// v1: `json?shape=minified`, `json?shape=minified,sparse`, `json?shape=sparse`. Omit for
+    /// today's pretty output. (HTTP transport sets this per-request via the URL instead.)
+    #[arg(long, env = "DELUGE_RESPONSE_CONFIG", value_name = "FORMAT?PARAMS")]
+    response_config: Option<String>,
 }
 
 #[derive(Debug, Clone, clap::ValueEnum)]
@@ -286,6 +293,17 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
 
+    // Validate --response-config before connecting to Deluge — a malformed value is an operator
+    // error that should fail fast. On STDIO this is the process-wide response shaping; on HTTP
+    // it is the fallback default when a request URL carries no per-request config.
+    let response_config = match cli.response_config.as_deref() {
+        Some(s) => match crate::response_config::parse_flag(s) {
+            Ok(cfg) => cfg,
+            Err(e) => bail!("Invalid --response-config '{s}': {e}"),
+        },
+        None => crate::response_config::ResponseConfig::default(),
+    };
+
     // Log effective tool permissions at startup
     let enabled_list: Vec<&str> = registry::all_names()
         .filter(|t| enabled_tools.contains(*t))
@@ -364,8 +382,7 @@ async fn main() -> anyhow::Result<()> {
                 enabled_tools,
                 plugin_gated_tools,
                 initial_label_plugin_active,
-                // T8 replaces this with the parsed --response-config.
-                crate::response_config::ResponseConfig::default(),
+                response_config.clone(),
             );
             server.spawn_plugin_watcher();
             let service = server.serve(rmcp::transport::stdio()).await?;
@@ -412,6 +429,7 @@ async fn main() -> anyhow::Result<()> {
                 let api = api.clone();
                 let enabled_tools = enabled_tools.clone();
                 let plugin_gated_tools = plugin_gated_tools.clone();
+                let response_config = response_config.clone();
                 StreamableHttpService::new(
                     move || {
                         let server = tools::DelugeServer::new(
@@ -420,8 +438,9 @@ async fn main() -> anyhow::Result<()> {
                             plugin_gated_tools.clone(),
                             initial_label_plugin_active,
                             // HTTP resolves config per-request from the middleware-inserted
-                            // extension (T9); this default is only the fallback when absent.
-                            crate::response_config::ResponseConfig::default(),
+                            // extension (T9); this --response-config value is the fallback
+                            // default used when a request URL carries no per-request config.
+                            response_config.clone(),
                         );
                         server.spawn_plugin_watcher();
                         Ok(server)
