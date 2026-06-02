@@ -268,13 +268,13 @@ but no untested parser branch.
 3. **Dynamic per-session schema for `describe()`.** Confirm the schema-build hook that the
    plugin-gating / `tools/list_changed` machinery uses can carry an id-schema fragment. If it
    can't cleanly, v1 may ship `describe()` as a static fragment and defer per-session injection.
-4. **HTTP routing + config lifetime.** rmcp's `StreamableHttpService` is mounted at `/mcp`;
-   confirm how to add a `/mcp/<format>` path so the format segment + query reach the
-   `DelugeServer` factory (`src/main.rs:412`). Options: mount the service under a `/mcp/{format}`
-   route and extract segment+query in a wrapping layer, or keep `/mcp` and read the format from
-   the path tail. And: is `ResponseConfig` captured **once per session** at factory time
-   (matches the `DelugeServer`-per-session model; design doc implies this) or parsed per-request?
-   *(Leaning per-session via factory; needs the segment+query reachable there.)*
+4. **HTTP routing + config lifetime.** *(Direction resolved by the Phase-2 spike — see the
+   plan doc.)* rmcp's service factory takes **no arguments**, so config cannot be threaded
+   through the factory as the design doc assumed. rmcp instead injects `http::request::Parts`
+   (and axum `Extension`-layer state) into each request's `RequestContext`, so `ResponseConfig`
+   is resolved **per request** from request extensions, with the STDIO/startup config as the
+   fallback. Remaining sub-question for the C6 spike: read the `/mcp/{format}` path via
+   `OriginalUri` in middleware vs. from the rmcp-injected `Parts.uri` inside the handler.
 
 ## Phase Gate
 
