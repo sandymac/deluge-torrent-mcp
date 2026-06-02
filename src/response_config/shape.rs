@@ -196,6 +196,32 @@ mod tests {
         }
     }
 
+    /// T7 lean regression guard: with the default config, every shape a handler actually emits
+    /// must serialize byte-identically to the pre-change `to_string_pretty` call. Covers the
+    /// add_torrent array, the remove/set_label flat object, and the pause/resume_label object.
+    #[test]
+    fn default_config_is_byte_identical_for_handler_output_shapes() {
+        let shapes = [
+            // add_torrent batch (array of per-source results)
+            json!([{"info_hash": "aaaa"}, {"error": "bad source"}]),
+            // remove_torrent / set_torrent_label multi (flat hash -> status object)
+            json!({"aaaa": "ok", "bbbb": {"error": "not found"}}),
+            // bulk_act_on_label (pause/resume_label) summary object
+            json!({"label": "tv", "action": "paused", "count": 3,
+                   "info_hashes": ["aaaa", "bbbb", "cccc"]}),
+            // get_torrent_status single (hash -> fields)
+            json!({"aaaa": {"name": "A", "files": [{"index": 0, "path": "a.mkv"}]}}),
+        ];
+        let default = ResponseConfig::default();
+        for v in shapes {
+            assert_eq!(
+                shape_response(v.clone(), &default),
+                serde_json::to_string_pretty(&v).unwrap(),
+                "default-config output drifted from to_string_pretty for {v}"
+            );
+        }
+    }
+
     #[test]
     fn non_torrent_shape_passes_through_under_sparse() {
         let scalar = json!({"free_space": 12345});
