@@ -16,6 +16,7 @@ use tracing::{info, warn};
 mod deluge;
 mod oauth;
 mod rencode;
+mod response_config;
 mod tools;
 
 use tools::registry;
