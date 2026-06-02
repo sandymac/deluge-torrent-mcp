@@ -14,14 +14,8 @@
 //! that format. All token-saving shaping is strictly opt-in: the [`Default`] is `json` +
 //! `pretty` + `full`, byte-for-byte today's behavior.
 
-// This module lands ahead of its consumers (the server wiring in T5 and the STDIO/HTTP
-// transports in T8/T9). Until those tasks call `parse`/`parse_flag`, the parser has no
-// caller in the binary build. Remove this allow once both transports are wired (T9).
-#![allow(dead_code)]
-
 mod shape;
 
-#[allow(unused_imports)] // consumed by the tool output sites in T7
 pub(crate) use shape::shape_response;
 
 /// A fully-resolved response configuration. Lives in per-request extensions on HTTP and is

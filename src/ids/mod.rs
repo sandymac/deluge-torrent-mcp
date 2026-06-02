@@ -14,10 +14,11 @@
 //! strategy), `describe` (teach the LLM the id's rules), and a batch resolve that is the future
 //! `resolve_ids` tool's contract and the recovery path for expired/abbreviated ids.
 
-// This module lands ahead of its consumer (T7 routes the tools' hash handling through
-// `decode`). The reserved `IdError` variants (`NotFound`/`Ambiguous`/`Expired`) and the batch
-// resolve are designed-for future strategies and stay unconstructed under `Full`; this allow is
-// narrowed to those reserved items in T7 once `encode`/`decode`/`describe` have callers.
+// v1 consumes only `Full::decode` (via `validate_info_hash`). The rest of the seam — `encode`,
+// `describe`, `resolve_batch`, `SchemaFragment`, the `strategy()` selector, and the reserved
+// `IdError` variants (`NotFound`/`Ambiguous`/`Expired`) — is the designed-for surface that a
+// future abbreviation strategy (`Prefix`/`Ephemeral`) and the `resolve_ids` tool will use. It
+// stays intentionally unconstructed under `Full`, so the module-level allow remains until then.
 #![allow(dead_code)]
 
 use crate::response_config::IdSelector;

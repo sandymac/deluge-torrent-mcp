@@ -487,6 +487,8 @@ async fn main() -> anyhow::Result<()> {
                 // Protected MCP routes — CORS permissive only on /mcp
                 let mcp_router = Router::new()
                     .nest_service("/mcp", mcp_service)
+                    // Runs before nest strips /mcp, so it sees the /mcp/<format> tail.
+                    .layer(middleware::from_fn(response_config_layer))
                     .layer(auth_middleware)
                     .layer(CorsLayer::permissive());
 
@@ -528,6 +530,8 @@ async fn main() -> anyhow::Result<()> {
 
                 Router::new()
                     .nest_service("/mcp", mcp_service)
+                    // Runs before nest strips /mcp, so it sees the /mcp/<format> tail.
+                    .layer(middleware::from_fn(response_config_layer))
                     .layer(auth_middleware)
                     .layer(CorsLayer::permissive())
                     .layer(TraceLayer::new_for_http())
@@ -559,9 +563,75 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Axum middleware for the `/mcp` routes: parse the `/mcp/<format>?<params>` path+query into a
+/// [`ResponseConfig`](crate::response_config::ResponseConfig) and insert it into the request
+/// extensions, where rmcp copies it into each tool call's `RequestContext` (read back by
+/// `DelugeServer::resolve_config`). A malformed format/param is rejected with `400 Bad Request`
+/// naming the offending token.
+///
+/// This layer runs before `nest_service("/mcp", …)` strips the `/mcp` prefix, so it sees the
+/// full path here — the format segment is the path tail after `/mcp`.
+async fn response_config_layer(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    match parse_request_config(request.uri().path(), request.uri().query().unwrap_or("")) {
+        Ok(cfg) => {
+            let mut request = request;
+            request.extensions_mut().insert(cfg);
+            next.run(request).await
+        }
+        Err(e) => axum::response::Response::builder()
+            .status(axum::http::StatusCode::BAD_REQUEST)
+            .body(axum::body::Body::from(format!("Bad Request: {e}")))
+            .expect("valid response"),
+    }
+}
+
+/// Pure core of [`response_config_layer`]: derive the format segment from a full request path
+/// (the tail after `/mcp`) and parse it with the query string. Split out so the path-extraction
+/// rules are unit-testable without axum/tower plumbing.
+fn parse_request_config(
+    path: &str,
+    query: &str,
+) -> Result<crate::response_config::ResponseConfig, crate::response_config::ConfigParseError> {
+    let format_segment = path.strip_prefix("/mcp").unwrap_or("").trim_matches('/');
+    crate::response_config::parse(format_segment, query)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::build_allowed_hosts;
+    use super::{build_allowed_hosts, parse_request_config};
+    use crate::response_config::{ResponseConfig, Whitespace};
+
+    #[test]
+    fn request_config_bare_mcp_path_is_default() {
+        assert_eq!(parse_request_config("/mcp", "").unwrap(), ResponseConfig::default());
+        assert_eq!(parse_request_config("/mcp/", "").unwrap(), ResponseConfig::default());
+    }
+
+    #[test]
+    fn request_config_json_segment_with_params() {
+        let cfg = parse_request_config("/mcp/json", "shape=minified").unwrap();
+        assert_eq!(cfg.shape.whitespace, Whitespace::Minified);
+    }
+
+    #[test]
+    fn request_config_sparse_query() {
+        let cfg = parse_request_config("/mcp/json", "shape=minified,sparse").unwrap();
+        assert_eq!(cfg.shape.whitespace, Whitespace::Minified);
+        assert!(cfg.shape.sparse);
+    }
+
+    #[test]
+    fn request_config_unknown_format_segment_errors() {
+        assert!(parse_request_config("/mcp/toon", "").is_err());
+    }
+
+    #[test]
+    fn request_config_invalid_param_errors() {
+        assert!(parse_request_config("/mcp/json", "shape=bogus").is_err());
+    }
 
     #[test]
     fn allowed_hosts_includes_loopback_bind_issuer_and_extra() {
