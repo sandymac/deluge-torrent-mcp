@@ -19,6 +19,11 @@
 // caller in the binary build. Remove this allow once both transports are wired (T9).
 #![allow(dead_code)]
 
+mod shape;
+
+#[allow(unused_imports)] // consumed by the tool output sites in T7
+pub(crate) use shape::shape_response;
+
 /// A fully-resolved response configuration. Lives in per-request extensions on HTTP and is
 /// fixed at startup on STDIO, so it must be cheap to clone and thread-safe.
 #[derive(Clone, Debug, PartialEq, Eq)]
