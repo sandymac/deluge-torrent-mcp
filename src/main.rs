@@ -633,6 +633,77 @@ mod tests {
         assert!(parse_request_config("/mcp/json", "shape=bogus").is_err());
     }
 
+    // --- T11: router-level test of response_config_layer over the production structure. ---
+    // Proves the spike: the middleware (layered outside nest_service) sees the full
+    // /mcp/<format> path, parses it, and the inserted ResponseConfig survives into the
+    // nested service's request.
+
+    /// Nested-service handler: report the path it received (post-nest-strip) and whether the
+    /// ResponseConfig extension arrived as `minified`.
+    async fn echo_handler(request: axum::extract::Request) -> axum::response::Response {
+        let minified = request
+            .extensions()
+            .get::<ResponseConfig>()
+            .map(|c| c.shape.whitespace == Whitespace::Minified)
+            .unwrap_or(false);
+        let inner_path = request.uri().path().to_string();
+        axum::response::Response::new(axum::body::Body::from(format!(
+            "inner_path={inner_path};minified={minified}"
+        )))
+    }
+
+    /// Build a router mirroring production: nest a stub service under `/mcp`, layered with the
+    /// real `response_config_layer`.
+    fn test_app() -> axum::Router {
+        use axum::routing::any;
+        let inner = axum::Router::new().fallback(any(echo_handler));
+        axum::Router::new()
+            .nest_service("/mcp", inner)
+            .layer(axum::middleware::from_fn(super::response_config_layer))
+    }
+
+    async fn send(uri: &str) -> (axum::http::StatusCode, String) {
+        use tower::ServiceExt;
+        let req = axum::http::Request::builder()
+            .uri(uri)
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = test_app().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        (status, String::from_utf8(bytes.to_vec()).unwrap())
+    }
+
+    #[tokio::test]
+    async fn middleware_extracts_format_and_config_reaches_inner_service() {
+        let (status, body) = send("/mcp/json?shape=minified").await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        // Middleware saw the full /mcp/json path and inserted a minified config...
+        assert!(body.contains("minified=true"), "body: {body}");
+        // ...while nest_service stripped /mcp before the inner service.
+        assert!(body.contains("inner_path=/json"), "body: {body}");
+    }
+
+    #[tokio::test]
+    async fn bare_mcp_path_yields_default_pretty() {
+        let (status, body) = send("/mcp").await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert!(body.contains("minified=false"), "body: {body}");
+    }
+
+    #[tokio::test]
+    async fn unknown_format_segment_is_400() {
+        let (status, body) = send("/mcp/toon").await;
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        assert!(body.contains("toon"), "body: {body}");
+    }
+
+    #[tokio::test]
+    async fn invalid_param_is_400() {
+        let (status, _) = send("/mcp/json?shape=bogus").await;
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+    }
+
     #[test]
     fn allowed_hosts_includes_loopback_bind_issuer_and_extra() {
         let hosts = build_allowed_hosts(
