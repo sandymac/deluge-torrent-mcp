@@ -42,9 +42,11 @@ pub(crate) fn shape_response(value: Value, cfg: &ResponseConfig) -> String {
 }
 
 /// Apply the sparse transform: emit a sibling `defaults` block and omit per-row default-valued
-/// fields. Operates only on a `{ "torrents": { <hash>: {fields} }, ... }`-shaped object (the
-/// `list_torrents` / multi-`get_torrent_status` output). Any other shape passes through
-/// unchanged — sparse is meaningless outside a map of torrent rows.
+/// fields. Operates only on a `{ "torrents": { <hash>: {fields} }, ... }`-shaped object — i.e.
+/// `list_torrents` output and the `deluge://torrents` resource (which is wrapped in that
+/// envelope). Any other shape passes through unchanged, including the bare `{ <hash>: {fields} }`
+/// map that `get_torrent_status` (batch) and the single-torrent resource emit — sparse only
+/// applies to the explicit `torrents` envelope.
 fn sparsify(value: Value) -> Value {
     let Value::Object(mut top) = value else {
         return value;

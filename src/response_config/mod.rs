@@ -165,9 +165,19 @@ pub(crate) fn parse(format_segment: &str, query: &str) -> Result<ResponseConfig,
 
 /// Apply a `shape=` CSV value (e.g. `minified,sparse`) onto [`ShapeOpts`].
 fn parse_shape(value: &str, shape: &mut ShapeOpts) -> Result<(), ConfigParseError> {
+    // An empty value (`?shape=` or a bare `?shape`) is a hard error, not a silent no-op —
+    // otherwise a typo that drops the value masquerades as a working config.
+    let tokens: Vec<&str> = value.split(',').filter(|s| !s.is_empty()).collect();
+    if tokens.is_empty() {
+        return Err(ConfigParseError::InvalidValue {
+            param: "shape".to_string(),
+            value: value.to_string(),
+        });
+    }
+
     let mut saw_pretty = false;
     let mut saw_minified = false;
-    for token in value.split(',').filter(|s| !s.is_empty()) {
+    for token in tokens {
         match token {
             "pretty" => {
                 saw_pretty = true;
@@ -300,6 +310,21 @@ mod tests {
                 value: "short".to_string(),
             })
         );
+    }
+
+    #[test]
+    fn empty_shape_value_errors() {
+        // `?shape=` and a bare `?shape` must be hard errors, not silent no-ops.
+        assert_eq!(
+            parse("json", "shape="),
+            Err(ConfigParseError::InvalidValue {
+                param: "shape".to_string(),
+                value: "".to_string(),
+            })
+        );
+        assert!(parse("json", "shape").is_err());
+        // A value that is only separators is likewise empty.
+        assert!(parse("json", "shape=,").is_err());
     }
 
     #[test]

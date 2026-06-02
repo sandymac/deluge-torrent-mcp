@@ -37,9 +37,10 @@ format overrides; any subprocess or multi-instance; path-as-backend-selector.
 
 ## Tech Stack
 
-Rust (edition per `Cargo.toml`), Cargo. Existing crates only — no new dependencies expected.
-`serde_json` for the `Value` transform; `clap` for the new STDIO flag; the existing `axum`
-middleware layer for HTTP query parsing. rmcp transport is **not** modified.
+Rust (edition per `Cargo.toml`), Cargo. No new *runtime* dependencies; `serde_json` for the
+`Value` transform, `clap` for the new STDIO flag, the existing `axum` middleware layer for HTTP
+parsing. rmcp transport is **not** modified. (As built, one new **dev**-dependency — `tower`,
+test-only — was added for the router-level middleware tests; it was already transitive.)
 
 ## Commands
 
@@ -54,20 +55,26 @@ cargo run -- --help         # Verify the new --response-config flag is documente
 ## Project Structure
 
 ```
-src/main.rs                      → CLI: new --response-config flag; HTTP routing so a format
-                                   path segment (/mcp/<format>) + query reach the per-session
-                                   DelugeServer factory (src/main.rs:412) as a ResponseConfig.
+src/main.rs                      → CLI: new --response-config flag; `response_config_layer`
+                                   axum middleware that parses /mcp/<format>?<params> and inserts
+                                   a ResponseConfig into the request extensions. NOTE (as built):
+                                   config is resolved PER REQUEST from the rmcp-injected
+                                   http::request::Parts, not threaded through the per-session
+                                   factory — see ADR-0012. Also shapes --test-connection.
 src/response_config/mod.rs       → NEW. The shared DSL: ResponseConfig struct, the ONE parser
                                    (takes a (format_segment, query) pair from either transport),
                                    format dispatch + json param parser, parse-error type. Pure.
 src/response_config/shape.rs     → NEW. The pure JSON Value → Value transform: minified vs
                                    pretty serialization choice, sparse (defaults-block + omit).
 src/ids/mod.rs                   → NEW. IdStrategy trait (4 responsibilities) + Full impl.
-src/tools/mod.rs                 → DelugeServer gains a ResponseConfig field; serialization call
-                                   sites (mod.rs:324, 488, 508 + each tool's output) route
-                                   through the shaper; id handling routes through IdStrategy.
-tests/response_config.rs         → NEW. Parser grammar tests, shaping output tests, round-trip
-                                   equivalence (sparse output merges back to full).
+src/tools/mod.rs                 → DelugeServer gains a default_config field + resolve_config/
+                                   shape helpers; tool, resource-read, and bulk-label output
+                                   sites route through the shaper; id handling routes through
+                                   IdStrategy (validate_info_hash → Full::decode).
+(tests)                          → Inline #[cfg(test)] modules (project convention; no tests/
+                                   dir): parser grammar in response_config/mod.rs, shaping +
+                                   round-trip in shape.rs, and tower-based router tests of the
+                                   middleware in main.rs.
 docs/specs/consumer-shaped-responses.md  → this spec
 docs/ideas/consumer-shaped-responses.md  → the design doc it implements
 ```
