@@ -14,6 +14,7 @@ use rmcp::ServiceExt;
 use tracing::{info, warn};
 
 mod deluge;
+mod ids;
 mod oauth;
 mod rencode;
 mod response_config;
