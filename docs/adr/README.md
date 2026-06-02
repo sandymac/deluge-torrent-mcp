@@ -9,3 +9,4 @@
 * [9. Design tool parameters defensively for LLM clients](0009-design-tool-parameters-defensively-for-llm-clients.md)
 * [10. Authenticate HTTP clients with OAuth 2.1](0010-authenticate-http-clients-with-oauth-2-1.md)
 * [11. Organize the server as layered modules](0011-organize-the-server-as-layered-modules.md)
+* [12. Resolve response-shaping config per request, not per session](0012-resolve-response-shaping-config-per-request-not-per-session.md)
