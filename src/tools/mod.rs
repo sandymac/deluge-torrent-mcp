@@ -173,14 +173,12 @@ impl DelugeServer {
     /// On HTTP the per-request config is parsed by middleware and travels in the rmcp-injected
     /// [`http::request::Parts`](axum::http::request::Parts) extensions; read it from there. On
     /// STDIO (no `Parts`) and as the HTTP fallback, use the server's [`Self::default_config`].
-    #[allow(dead_code)] // consumed by the tool output/hash sites in T7
     pub(crate) fn resolve_config(&self, ctx: &RequestContext<RoleServer>) -> ResponseConfig {
         config_from_extensions(&ctx.extensions, &self.default_config)
     }
 
     /// Shape a tool's JSON output for the current call's consumer. Convenience wrapper over
     /// [`Self::resolve_config`] + [`shape_response`].
-    #[allow(dead_code)] // consumed by the tool output sites in T7
     pub(crate) fn shape(
         &self,
         value: serde_json::Value,
@@ -301,6 +299,7 @@ impl DelugeServer {
         &self,
         label: &str,
         action: LabelAction,
+        ctx: &RequestContext<RoleServer>,
     ) -> Result<String, String> {
         let filter = Value::Dict(vec![(
             Value::String("label".into()),
@@ -349,7 +348,7 @@ impl DelugeServer {
             "count": count,
             "info_hashes": hashes,
         });
-        Ok(serde_json::to_string_pretty(&out).unwrap_or_default())
+        Ok(self.shape(out, ctx))
     }
 }
 
@@ -513,6 +512,8 @@ impl ServerHandler for DelugeServer {
                 .await
                 .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
+            // v1: MCP resource reads have no format/query channel, so they stay pretty —
+            // response shaping (T7) applies to tool outputs only.
             let text = serde_json::to_string_pretty(&crate::rencode::value_to_json(result))
                 .unwrap_or_default();
             Ok(ReadResourceResult::new(vec![

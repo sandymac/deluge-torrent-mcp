@@ -12,7 +12,8 @@
 use std::collections::HashSet;
 
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::{serde_json, tool, tool_router};
+use rmcp::service::RequestContext;
+use rmcp::{serde_json, tool, tool_router, RoleServer};
 
 use super::params::*;
 use super::{hash_strings, DelugeServer, LabelAction};
@@ -37,6 +38,7 @@ impl DelugeServer {
     async fn add_torrent(
         &self,
         Parameters(p): Parameters<AddTorrentParams>,
+        context: RequestContext<RoleServer>,
     ) -> Result<String, String> {
         if p.torrent_sources.is_empty() {
             return Err("torrent_sources must not be empty.".to_string());
@@ -52,7 +54,7 @@ impl DelugeServer {
                 Err(e) => results.push(serde_json::json!({"error": e})),
             }
         }
-        Ok(serde_json::to_string_pretty(&serde_json::Value::Array(results)).unwrap_or_default())
+        Ok(self.shape(serde_json::Value::Array(results), &context))
     }
 
     /// Remove one or more torrents from Deluge.
@@ -60,6 +62,7 @@ impl DelugeServer {
     async fn remove_torrent(
         &self,
         Parameters(p): Parameters<RemoveTorrentParams>,
+        context: RequestContext<RoleServer>,
     ) -> Result<String, String> {
         self.gate.check("deluge_remove_torrent")?;
         Self::validate_info_hashes(&p.info_hashes)?;
@@ -88,7 +91,7 @@ impl DelugeServer {
             }
             return Err(v["error"].as_str().unwrap_or("unknown error").to_string());
         }
-        Ok(serde_json::to_string_pretty(&serde_json::Value::Object(results)).unwrap_or_default())
+        Ok(self.shape(serde_json::Value::Object(results), &context))
     }
 
     /// List torrents in Deluge with their current status, with filtering, sorting, and pagination.
@@ -103,6 +106,7 @@ impl DelugeServer {
     async fn list_torrents(
         &self,
         Parameters(p): Parameters<ListTorrentsParams>,
+        context: RequestContext<RoleServer>,
     ) -> Result<String, String> {
         let limit = p.limit.unwrap_or(100).max(1);
         let offset = p.offset.unwrap_or(0);
@@ -185,7 +189,7 @@ impl DelugeServer {
 
         let mut pairs = match result {
             Value::Dict(pairs) => pairs,
-            other => return Ok(Self::value_to_json_string(other)),
+            other => return Ok(self.shape(crate::rencode::value_to_json(other), &context)),
         };
 
         // Client-side filter: save_path substring (no Deluge native equivalent).
@@ -222,7 +226,7 @@ impl DelugeServer {
         }
         out.insert("torrents".into(), serde_json::Value::Object(torrents));
 
-        Ok(serde_json::to_string_pretty(&serde_json::Value::Object(out)).unwrap_or_default())
+        Ok(self.shape(serde_json::Value::Object(out), &context))
     }
 
     /// Get comprehensive status and metadata for one or more torrents.
@@ -233,6 +237,7 @@ impl DelugeServer {
     async fn get_torrent_status(
         &self,
         Parameters(p): Parameters<TorrentIdParams>,
+        context: RequestContext<RoleServer>,
     ) -> Result<String, String> {
         Self::validate_info_hashes(&p.info_hashes)?;
         if p.info_hashes.len() == 1 {
@@ -244,8 +249,7 @@ impl DelugeServer {
                 .map_err(Self::enrich_client_error)?;
             let mut out = serde_json::Map::new();
             out.insert(hash.0, crate::rencode::value_to_json(result));
-            return Ok(serde_json::to_string_pretty(&serde_json::Value::Object(out))
-                .unwrap_or_default());
+            return Ok(self.shape(serde_json::Value::Object(out), &context));
         }
         // Batch — use get_torrents_status with id filter
         let filter = Value::Dict(vec![(
@@ -255,7 +259,7 @@ impl DelugeServer {
         self.api
             .get_torrents_status(filter, Value::List(vec![]))
             .await
-            .map(Self::value_to_json_string)
+            .map(|v| self.shape(crate::rencode::value_to_json(v), &context))
             .map_err(Self::enrich_client_error)
     }
 
@@ -493,6 +497,7 @@ impl DelugeServer {
     async fn set_torrent_label(
         &self,
         Parameters(p): Parameters<SetTorrentLabelParams>,
+        context: RequestContext<RoleServer>,
     ) -> Result<String, String> {
         self.gate.check("deluge_set_torrent_label")?;
         Self::validate_info_hashes(&p.info_hashes)?;
@@ -519,7 +524,7 @@ impl DelugeServer {
             }
             return Err(v["error"].as_str().unwrap_or("unknown error").to_string());
         }
-        Ok(serde_json::to_string_pretty(&serde_json::Value::Object(results)).unwrap_or_default())
+        Ok(self.shape(serde_json::Value::Object(results), &context))
     }
 
     /// Pause every torrent assigned the given label. Errors if no torrents currently have this label.
@@ -527,10 +532,11 @@ impl DelugeServer {
     async fn pause_label(
         &self,
         Parameters(p): Parameters<LabelNameParams>,
+        context: RequestContext<RoleServer>,
     ) -> Result<String, String> {
         self.gate.check("deluge_pause_label")?;
         let label = Self::validate_label_name(&p.label)?;
-        self.bulk_act_on_label(&label, LabelAction::Pause).await
+        self.bulk_act_on_label(&label, LabelAction::Pause, &context).await
     }
 
     /// Resume every paused torrent assigned the given label. Errors if no torrents currently have this label.
@@ -538,22 +544,26 @@ impl DelugeServer {
     async fn resume_label(
         &self,
         Parameters(p): Parameters<LabelNameParams>,
+        context: RequestContext<RoleServer>,
     ) -> Result<String, String> {
         self.gate.check("deluge_resume_label")?;
         let label = Self::validate_label_name(&p.label)?;
-        self.bulk_act_on_label(&label, LabelAction::Resume).await
+        self.bulk_act_on_label(&label, LabelAction::Resume, &context).await
     }
 
     /// List all labels defined on the Deluge daemon. Returns a JSON array of label names.
     #[tool(name = "deluge_list_labels", title = "List Labels", annotations(read_only_hint = true, open_world_hint = false))]
-    async fn list_labels(&self) -> Result<String, String> {
+    async fn list_labels(
+        &self,
+        context: RequestContext<RoleServer>,
+    ) -> Result<String, String> {
         self.gate.check("deluge_list_labels")?;
         let result = self
             .api
             .label_get_labels()
             .await
             .map_err(Self::enrich_label_error)?;
-        Ok(Self::value_to_json_string(result))
+        Ok(self.shape(crate::rencode::value_to_json(result), &context))
     }
 
     /// Get a label's default options (speed caps, ratio handling, move-completed path, etc.).
@@ -562,6 +572,7 @@ impl DelugeServer {
     async fn get_label_options(
         &self,
         Parameters(p): Parameters<LabelNameParams>,
+        context: RequestContext<RoleServer>,
     ) -> Result<String, String> {
         self.gate.check("deluge_get_label_options")?;
         let label = Self::validate_label_name(&p.label)?;
@@ -570,7 +581,7 @@ impl DelugeServer {
             .label_get_options(&label)
             .await
             .map_err(Self::enrich_label_error)?;
-        Ok(Self::value_to_json_string(result))
+        Ok(self.shape(crate::rencode::value_to_json(result), &context))
     }
 
     /// Set default options on a label. Options are applied to every torrent currently carrying

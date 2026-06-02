@@ -12,6 +12,7 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 
 use super::params::InfoHash;
 use super::DelugeServer;
+use crate::ids::IdStrategy;
 
 impl DelugeServer {
     /// Validate that info_hashes is non-empty and each hash is well-formed.
@@ -25,18 +26,17 @@ impl DelugeServer {
         Ok(())
     }
 
-    /// Validate a torrent info hash — 40 hex chars (SHA-1) or 64 hex chars (SHA-256).
+    /// Validate (and, for future strategies, resolve) a torrent info hash by routing it through
+    /// the [`IdStrategy`](crate::ids::IdStrategy) seam. v1 has only [`Full`](crate::ids::Full),
+    /// whose `decode` accepts a 40-hex (SHA-1) or 64-hex (SHA-256) hash and is otherwise the
+    /// identity — so this is a behavioral no-op while establishing the seam. When a second
+    /// strategy lands (post-v1), the per-request `IdSelector` is threaded here and the resolved
+    /// hash is used downstream.
     pub(super) fn validate_info_hash(hash: &str) -> Result<(), String> {
-        let valid_len = hash.len() == 40 || hash.len() == 64;
-        let valid_hex = hash.bytes().all(|b| b.is_ascii_hexdigit());
-        if !valid_len || !valid_hex {
-            return Err(format!(
-                "invalid info_hash '{hash}': must be 40 or 64 hex characters.\n\
-                 [Hint: Do not guess or construct an info_hash. Use list_torrents to find the correct \
-                 info_hash for the torrent you want to act on.]"
-            ));
-        }
-        Ok(())
+        crate::ids::Full
+            .decode(hash)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
     }
 
     /// Check if a string is base64-encoded bencode (i.e. a .torrent file).
