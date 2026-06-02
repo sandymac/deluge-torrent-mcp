@@ -374,7 +374,7 @@ dependencies = [
 
 [[package]]
 name = "deluge-torrent-mcp"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -394,6 +394,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-native-tls",
+ "tower",
  "tower-http",
  "tracing",
  "tracing-subscriber",

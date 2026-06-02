@@ -30,7 +30,7 @@ Cargo for package management and build system
 | `tower-http` | CORS and tracing middleware layers for axum |
 | `tracing` | Logging |
 | `tracing-subscriber` | Log output formatting — **must be configured to write to stderr or a file, never stdout**. Any output on stdout corrupts the JSON-RPC framing used by the MCP stdio transport. |
-| `clap` | CLI args (Deluge host/port/credentials, transport selection, `--enable-tool`, `--disable-tool`, `--list-tools`, `--api-token`, `--http-bind`, `--test-connection`, `--oauth-issuer`, `--oauth-state-file`) — credentials and OAuth settings can also be supplied via environment variables (`DELUGE_HOST`, `DELUGE_PORT`, `DELUGE_USERNAME`, `DELUGE_PASSWORD`, `DELUGE_API_TOKEN`, `DELUGE_OAUTH_ISSUER`, `DELUGE_OAUTH_STATE_FILE`) |
+| `clap` | CLI args (Deluge host/port/credentials, transport selection, `--enable-tool`, `--disable-tool`, `--list-tools`, `--api-token`, `--http-bind`, `--test-connection`, `--oauth-issuer`, `--oauth-state-file`, `--response-config`) — credentials, OAuth, and response-shaping settings can also be supplied via environment variables (`DELUGE_HOST`, `DELUGE_PORT`, `DELUGE_USERNAME`, `DELUGE_PASSWORD`, `DELUGE_API_TOKEN`, `DELUGE_OAUTH_ISSUER`, `DELUGE_OAUTH_STATE_FILE`, `DELUGE_RESPONSE_CONFIG`) |
 
 rencode serialization is implemented internally as `src/rencode.rs` rather than using a third-party crate.
 
@@ -154,6 +154,31 @@ By default OAuth state is held in memory only — every registered client, acces
 
 **Corrupt / unknown-version file**: logged as a `WARN`, renamed to `<path>.corrupt-<unix_ts>` for recovery, and startup proceeds with empty state rather than crashing. Clients re-register; no data beyond OAuth sessions is affected.
 
+### Consumer-Shaped Responses
+
+An MCP client can declare what kind of consumer it is — a token-sensitive LLM or a byte/parse-sensitive programmatic tool — and receive a JSON payload shaped for it. The configuration is one canonical DSL, parsed by one function (`src/response_config`), and used on both transports:
+
+```
+HTTP:   POST /mcp/<format>?<params>     e.g. /mcp/json?shape=minified,sparse
+STDIO:  --response-config '<format>?<params>'   e.g. --response-config 'json?shape=minified,sparse'
+        (or DELUGE_RESPONSE_CONFIG)
+```
+
+The **path segment names the payload format** (the encoding namespace — `json` in v1, reserving `toon`/`xml`/`text` for later). The **query string carries parameters scoped to that format** — a parameter like a future TOON separator means nothing to `json`.
+
+`json`-format parameters (v1):
+
+| Param | Values | Default | Effect |
+|---|---|---|---|
+| `shape` | `pretty`, `minified`, `sparse` (CSV; `pretty`/`minified` mutually exclusive) | `pretty` | Whitespace + redundancy. `sparse` emits a one-time `defaults` block and omits per-row default-valued fields from `list_torrents`-shaped output (reconstruct a row as `{...defaults, ...row}`). |
+| `ids` | `full` | `full` | Selects an `IdStrategy` (`src/ids`). v1 ships `Full` (the id is the 40/64-hex info hash) only. |
+
+**Defaults and back-compat**: plain `/mcp`, `/mcp/json` with no params, and STDIO without the flag all produce today's pretty output. All token-saving shaping is strictly opt-in. An unknown format or invalid parameter is a hard error — `400 Bad Request` on HTTP, non-zero exit at STDIO startup.
+
+**How config reaches a tool**: rmcp's per-session service factory takes no request data, so config is resolved **per request**, not per session. On HTTP, `response_config_layer` (middleware on the `/mcp` routes, outside `nest_service` so it sees the pre-strip path) parses the path+query and inserts a `ResponseConfig` into the request extensions; rmcp copies the `http::request::Parts` into each tool call's `RequestContext`, and `DelugeServer::resolve_config` reads it back, falling back to the startup/STDIO config when absent. Tool handlers serialize via `DelugeServer::shape(value, &ctx)`. See ADR-0012.
+
+**Scope (v1)**: shaping applies to all JSON the server emits — tool outputs, MCP resource reads (`deluge://torrents`, `deluge://torrent/<hash>`), and the `--test-connection` session-status diagnostic (which doubles as a demonstration that the shaping switches are in effect). The `deluge://torrents` resource is emitted in the `{"torrents": {...}}` envelope so `sparse` elides default-valued fields there exactly as for `list_torrents`. `sparse` remains a structural no-op on the single-torrent resource and the diagnostic (they aren't that envelope); `minified`/`pretty` apply everywhere. Not yet built but designed-for: `ids=short` prefix/ephemeral strategies, a `resolve_ids` tool, `toon`/`xml` formats, and `fields=` projection.
+
 ## File Structure
 
 | Path | Purpose |
@@ -161,8 +186,11 @@ By default OAuth state is held in memory only — every registered client, acces
 | `Cargo.toml` | The manifest file that defines dependencies, metadata, and crate type. |
 | `Cargo.lock` | Contains the exact dependency versions used in the last build. |
 | `src/` | Contains all the source code for the project. |
-| `src/main.rs` | Entry point — CLI arg parsing, transport selection, server startup, HTTP auth middleware. |
+| `src/main.rs` | Entry point — CLI arg parsing, transport selection, server startup, HTTP auth + response-config middleware. |
 | `src/rencode.rs` | Internal rencode serializer/deserializer (Deluge wire format). |
+| `src/response_config/mod.rs` | The consumer-shaped-response DSL — `ResponseConfig`, the shared parser (HTTP path+query and STDIO flag), parse errors. |
+| `src/response_config/shape.rs` | Pure JSON shaping transform — minified/pretty serialization and the sparse (`defaults` block + omit) transform. |
+| `src/ids/mod.rs` | The `IdStrategy` seam — `encode`/`decode`/`describe` trait with the v1 `Full` (info-hash-is-id) implementation. |
 | `src/deluge/mod.rs` | Deluge RPC client — TLS connection, cert fingerprint logging/pinning, auth, request multiplexing, zlib framing. |
 | `src/tools/mod.rs` | MCP tool implementations — all 21 tools, safety gate helpers, plugin watcher, Value→JSON conversion. |
 | `src/oauth/persist.rs` | Optional file-backed persistence for OAuth clients + access/refresh tokens — atomic JSON writes, `Instant` ↔ Unix conversion, debounced background flusher. |

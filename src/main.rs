@@ -14,8 +14,10 @@ use rmcp::ServiceExt;
 use tracing::{info, warn};
 
 mod deluge;
+mod ids;
 mod oauth;
 mod rencode;
+mod response_config;
 mod tools;
 
 use tools::registry;
@@ -119,6 +121,13 @@ struct Cli {
     /// Connect to Deluge, print session status, and exit
     #[arg(long, default_value_t = false)]
     test_connection: bool,
+
+    /// Shape STDIO tool responses for a token-sensitive (LLM) or byte-sensitive (programmatic)
+    /// consumer. Format `<format>?<params>`, mirroring the HTTP `/mcp/<format>?<params>` path.
+    /// v1: `json?shape=minified`, `json?shape=minified,sparse`, `json?shape=sparse`. Omit for
+    /// today's pretty output. (HTTP transport sets this per-request via the URL instead.)
+    #[arg(long, env = "DELUGE_RESPONSE_CONFIG", value_name = "FORMAT?PARAMS")]
+    response_config: Option<String>,
 }
 
 #[derive(Debug, Clone, clap::ValueEnum)]
@@ -284,6 +293,17 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
 
+    // Validate --response-config before connecting to Deluge — a malformed value is an operator
+    // error that should fail fast. On STDIO this is the process-wide response shaping; on HTTP
+    // it is the fallback default when a request URL carries no per-request config.
+    let response_config = match cli.response_config.as_deref() {
+        Some(s) => match crate::response_config::parse_flag(s) {
+            Ok(cfg) => cfg,
+            Err(e) => bail!("Invalid --response-config '{s}': {e}"),
+        },
+        None => crate::response_config::ResponseConfig::default(),
+    };
+
     // Log effective tool permissions at startup
     let enabled_list: Vec<&str> = registry::all_names()
         .filter(|t| enabled_tools.contains(*t))
@@ -347,8 +367,12 @@ async fn main() -> anyhow::Result<()> {
             Value::String("dht_nodes".into()),
         ]);
         let status = api.session_status(keys).await?;
-        let json = serde_json::to_string_pretty(&crate::rencode::value_to_json(status))
-            .unwrap_or_default();
+        // Honor --response-config here too: the diagnostic doubles as a demonstration that the
+        // shaping switches are in effect.
+        let json = crate::response_config::shape_response(
+            crate::rencode::value_to_json(status),
+            &response_config,
+        );
         eprintln!("core.get_session_status:\n{json}");
 
         return Ok(());
@@ -362,6 +386,7 @@ async fn main() -> anyhow::Result<()> {
                 enabled_tools,
                 plugin_gated_tools,
                 initial_label_plugin_active,
+                response_config.clone(),
             );
             server.spawn_plugin_watcher();
             let service = server.serve(rmcp::transport::stdio()).await?;
@@ -408,6 +433,7 @@ async fn main() -> anyhow::Result<()> {
                 let api = api.clone();
                 let enabled_tools = enabled_tools.clone();
                 let plugin_gated_tools = plugin_gated_tools.clone();
+                let response_config = response_config.clone();
                 StreamableHttpService::new(
                     move || {
                         let server = tools::DelugeServer::new(
@@ -415,6 +441,10 @@ async fn main() -> anyhow::Result<()> {
                             enabled_tools.clone(),
                             plugin_gated_tools.clone(),
                             initial_label_plugin_active,
+                            // HTTP resolves config per-request from the middleware-inserted
+                            // extension (T9); this --response-config value is the fallback
+                            // default used when a request URL carries no per-request config.
+                            response_config.clone(),
                         );
                         server.spawn_plugin_watcher();
                         Ok(server)
@@ -461,6 +491,8 @@ async fn main() -> anyhow::Result<()> {
                 // Protected MCP routes — CORS permissive only on /mcp
                 let mcp_router = Router::new()
                     .nest_service("/mcp", mcp_service)
+                    // Runs before nest strips /mcp, so it sees the /mcp/<format> tail.
+                    .layer(middleware::from_fn(response_config_layer))
                     .layer(auth_middleware)
                     .layer(CorsLayer::permissive());
 
@@ -502,6 +534,8 @@ async fn main() -> anyhow::Result<()> {
 
                 Router::new()
                     .nest_service("/mcp", mcp_service)
+                    // Runs before nest strips /mcp, so it sees the /mcp/<format> tail.
+                    .layer(middleware::from_fn(response_config_layer))
                     .layer(auth_middleware)
                     .layer(CorsLayer::permissive())
                     .layer(TraceLayer::new_for_http())
@@ -533,9 +567,146 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Axum middleware for the `/mcp` routes: parse the `/mcp/<format>?<params>` path+query into a
+/// [`ResponseConfig`](crate::response_config::ResponseConfig) and insert it into the request
+/// extensions, where rmcp copies it into each tool call's `RequestContext` (read back by
+/// `DelugeServer::resolve_config`). A malformed format/param is rejected with `400 Bad Request`
+/// naming the offending token.
+///
+/// This layer runs before `nest_service("/mcp", …)` strips the `/mcp` prefix, so it sees the
+/// full path here — the format segment is the path tail after `/mcp`.
+async fn response_config_layer(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    match parse_request_config(request.uri().path(), request.uri().query().unwrap_or("")) {
+        Ok(cfg) => {
+            let mut request = request;
+            request.extensions_mut().insert(cfg);
+            next.run(request).await
+        }
+        Err(e) => axum::response::Response::builder()
+            .status(axum::http::StatusCode::BAD_REQUEST)
+            .body(axum::body::Body::from(format!("Bad Request: {e}")))
+            .expect("valid response"),
+    }
+}
+
+/// Pure core of [`response_config_layer`]: derive the format segment from a full request path
+/// (the tail after `/mcp`) and parse it with the query string. Split out so the path-extraction
+/// rules are unit-testable without axum/tower plumbing.
+fn parse_request_config(
+    path: &str,
+    query: &str,
+) -> Result<crate::response_config::ResponseConfig, crate::response_config::ConfigParseError> {
+    let format_segment = path.strip_prefix("/mcp").unwrap_or("").trim_matches('/');
+    crate::response_config::parse(format_segment, query)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::build_allowed_hosts;
+    use super::{build_allowed_hosts, parse_request_config};
+    use crate::response_config::{ResponseConfig, Whitespace};
+
+    #[test]
+    fn request_config_bare_mcp_path_is_default() {
+        assert_eq!(parse_request_config("/mcp", "").unwrap(), ResponseConfig::default());
+        assert_eq!(parse_request_config("/mcp/", "").unwrap(), ResponseConfig::default());
+    }
+
+    #[test]
+    fn request_config_json_segment_with_params() {
+        let cfg = parse_request_config("/mcp/json", "shape=minified").unwrap();
+        assert_eq!(cfg.shape.whitespace, Whitespace::Minified);
+    }
+
+    #[test]
+    fn request_config_sparse_query() {
+        let cfg = parse_request_config("/mcp/json", "shape=minified,sparse").unwrap();
+        assert_eq!(cfg.shape.whitespace, Whitespace::Minified);
+        assert!(cfg.shape.sparse);
+    }
+
+    #[test]
+    fn request_config_unknown_format_segment_errors() {
+        assert!(parse_request_config("/mcp/toon", "").is_err());
+    }
+
+    #[test]
+    fn request_config_invalid_param_errors() {
+        assert!(parse_request_config("/mcp/json", "shape=bogus").is_err());
+    }
+
+    // --- T11: router-level test of response_config_layer over the production structure. ---
+    // Proves the spike: the middleware (layered outside nest_service) sees the full
+    // /mcp/<format> path, parses it, and the inserted ResponseConfig survives into the
+    // nested service's request.
+
+    /// Nested-service handler: report the path it received (post-nest-strip) and whether the
+    /// ResponseConfig extension arrived as `minified`.
+    async fn echo_handler(request: axum::extract::Request) -> axum::response::Response {
+        let minified = request
+            .extensions()
+            .get::<ResponseConfig>()
+            .map(|c| c.shape.whitespace == Whitespace::Minified)
+            .unwrap_or(false);
+        let inner_path = request.uri().path().to_string();
+        axum::response::Response::new(axum::body::Body::from(format!(
+            "inner_path={inner_path};minified={minified}"
+        )))
+    }
+
+    /// Build a router mirroring production: nest a stub service under `/mcp`, layered with the
+    /// real `response_config_layer`.
+    fn test_app() -> axum::Router {
+        use axum::routing::any;
+        let inner = axum::Router::new().fallback(any(echo_handler));
+        axum::Router::new()
+            .nest_service("/mcp", inner)
+            .layer(axum::middleware::from_fn(super::response_config_layer))
+    }
+
+    async fn send(uri: &str) -> (axum::http::StatusCode, String) {
+        use tower::ServiceExt;
+        let req = axum::http::Request::builder()
+            .uri(uri)
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = test_app().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        (status, String::from_utf8(bytes.to_vec()).unwrap())
+    }
+
+    #[tokio::test]
+    async fn middleware_extracts_format_and_config_reaches_inner_service() {
+        let (status, body) = send("/mcp/json?shape=minified").await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        // Middleware saw the full /mcp/json path and inserted a minified config...
+        assert!(body.contains("minified=true"), "body: {body}");
+        // ...while nest_service stripped /mcp before the inner service.
+        assert!(body.contains("inner_path=/json"), "body: {body}");
+    }
+
+    #[tokio::test]
+    async fn bare_mcp_path_yields_default_pretty() {
+        let (status, body) = send("/mcp").await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert!(body.contains("minified=false"), "body: {body}");
+    }
+
+    #[tokio::test]
+    async fn unknown_format_segment_is_400() {
+        let (status, body) = send("/mcp/toon").await;
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        assert!(body.contains("toon"), "body: {body}");
+    }
+
+    #[tokio::test]
+    async fn invalid_param_is_400() {
+        let (status, _) = send("/mcp/json?shape=bogus").await;
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+    }
 
     #[test]
     fn allowed_hosts_includes_loopback_bind_issuer_and_extra() {
