@@ -364,6 +364,8 @@ async fn main() -> anyhow::Result<()> {
                 enabled_tools,
                 plugin_gated_tools,
                 initial_label_plugin_active,
+                // T8 replaces this with the parsed --response-config.
+                crate::response_config::ResponseConfig::default(),
             );
             server.spawn_plugin_watcher();
             let service = server.serve(rmcp::transport::stdio()).await?;
@@ -417,6 +419,9 @@ async fn main() -> anyhow::Result<()> {
                             enabled_tools.clone(),
                             plugin_gated_tools.clone(),
                             initial_label_plugin_active,
+                            // HTTP resolves config per-request from the middleware-inserted
+                            // extension (T9); this default is only the fallback when absent.
+                            crate::response_config::ResponseConfig::default(),
                         );
                         server.spawn_plugin_watcher();
                         Ok(server)

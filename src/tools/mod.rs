@@ -30,6 +30,7 @@ const ICON_96: &[u8] = include_bytes!("../../assets/deluge-mcp-icon-96x96.png");
 
 use crate::deluge::{DelugeApi, DelugeEvent};
 use crate::rencode::Value;
+use crate::response_config::{shape_response, ResponseConfig};
 
 mod errors;
 pub(crate) mod gate;
@@ -83,6 +84,10 @@ pub(crate) struct DelugeServer {
     /// All connected MCP peers, captured on `initialize`.
     /// Used to fan out `notifications/tools/list_changed` when plugin state flips.
     connected_peers: Arc<RwLock<Vec<Peer<RoleServer>>>>,
+    /// Response shaping config used when a request carries none. On STDIO this is the
+    /// process-wide config from `--response-config`; on HTTP it is the fallback when a request's
+    /// per-request config is absent. See [`Self::resolve_config`].
+    default_config: ResponseConfig,
 }
 
 // ---------------------------------------------------------------------------
@@ -95,6 +100,7 @@ impl DelugeServer {
         user_intent_tools: HashSet<String>,
         plugin_gated_tools: HashSet<String>,
         initial_label_plugin_active: bool,
+        default_config: ResponseConfig,
     ) -> Self {
         let gate = Arc::new(ToolGate::new(
             user_intent_tools,
@@ -158,7 +164,29 @@ impl DelugeServer {
             tool_router: Self::build_tool_router(),
             subscribers,
             connected_peers: Arc::new(RwLock::new(Vec::new())),
+            default_config,
         }
+    }
+
+    /// Resolve the [`ResponseConfig`] for the current call.
+    ///
+    /// On HTTP the per-request config is parsed by middleware and travels in the rmcp-injected
+    /// [`http::request::Parts`](axum::http::request::Parts) extensions; read it from there. On
+    /// STDIO (no `Parts`) and as the HTTP fallback, use the server's [`Self::default_config`].
+    #[allow(dead_code)] // consumed by the tool output/hash sites in T7
+    pub(crate) fn resolve_config(&self, ctx: &RequestContext<RoleServer>) -> ResponseConfig {
+        config_from_extensions(&ctx.extensions, &self.default_config)
+    }
+
+    /// Shape a tool's JSON output for the current call's consumer. Convenience wrapper over
+    /// [`Self::resolve_config`] + [`shape_response`].
+    #[allow(dead_code)] // consumed by the tool output sites in T7
+    pub(crate) fn shape(
+        &self,
+        value: serde_json::Value,
+        ctx: &RequestContext<RoleServer>,
+    ) -> String {
+        shape_response(value, &self.resolve_config(ctx))
     }
 
     /// Spawn the plugin watcher. Listens for Deluge `PluginEnabled`/`PluginDisabled`
@@ -563,9 +591,59 @@ impl ServerHandler for DelugeServer {
     }
 }
 
+/// Pure core of [`DelugeServer::resolve_config`]: read a per-request [`ResponseConfig`] from the
+/// rmcp-injected [`Parts`](axum::http::request::Parts) extensions (HTTP), falling back to
+/// `default` (STDIO, or HTTP with no per-request config). Free function so it is unit-testable
+/// without constructing a [`DelugeServer`].
+fn config_from_extensions(
+    ext: &rmcp::model::Extensions,
+    default: &ResponseConfig,
+) -> ResponseConfig {
+    ext.get::<axum::http::request::Parts>()
+        .and_then(|parts| parts.extensions.get::<ResponseConfig>().cloned())
+        .unwrap_or_else(|| default.clone())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// STDIO / no-Parts: `resolve_config` returns the server default unchanged.
+    #[test]
+    fn config_from_empty_extensions_is_default() {
+        let ext = rmcp::model::Extensions::default();
+        let default = ResponseConfig::default();
+        assert_eq!(config_from_extensions(&ext, &default), default);
+    }
+
+    /// HTTP: a per-request config in the injected `Parts` extensions wins over the default.
+    #[test]
+    fn config_from_parts_extension_wins() {
+        use crate::response_config::{Format, IdSelector, ShapeOpts, Whitespace};
+        let per_request = ResponseConfig {
+            format: Format::Json,
+            shape: ShapeOpts {
+                whitespace: Whitespace::Minified,
+                sparse: true,
+            },
+            ids: IdSelector::Full,
+        };
+        // Synthesize the rmcp-injected http::request::Parts carrying the per-request config.
+        let mut parts = axum::http::Request::builder()
+            .uri("/mcp/json?shape=minified,sparse")
+            .body(())
+            .unwrap()
+            .into_parts()
+            .0;
+        parts.extensions.insert(per_request.clone());
+
+        let mut ext = rmcp::model::Extensions::default();
+        ext.insert(parts);
+
+        let default = ResponseConfig::default();
+        assert_eq!(config_from_extensions(&ext, &default), per_request);
+        assert_ne!(per_request, default);
+    }
 
     #[test]
     fn registry_matches_registered_tools() {
