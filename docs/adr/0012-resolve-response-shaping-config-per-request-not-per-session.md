@@ -59,5 +59,7 @@ Resolve the `ResponseConfig` **per request**, not per session:
 - Shaping applies to all JSON the server emits: tool outputs, MCP resource reads (which
   reach the same per-request config via their `RequestContext`), and the `--test-connection`
   diagnostic (which uses the parsed `--response-config` directly, so it also demonstrates the
-  switch is in effect). `sparse` is a structural no-op on the resource/diagnostic shapes since
-  they are not the `{"torrents": {...}}` envelope `sparsify` targets; `minified`/`pretty` apply.
+  switch is in effect). The `deluge://torrents` resource is wrapped in the `{"torrents": {...}}`
+  envelope so `sparse` applies to it as it does to `list_torrents`; `sparse` is a structural
+  no-op on the single-torrent resource and the diagnostic (not that envelope), where
+  `minified`/`pretty` still apply.

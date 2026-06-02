@@ -444,7 +444,8 @@ impl ServerHandler for DelugeServer {
                     name: "All Torrents".to_string(),
                     title: Some("All Torrents".to_string()),
                     description: Some(
-                        "Snapshot of all torrents with current status. \
+                        "Snapshot of all torrents with current status, as \
+                         {\"torrents\": {<info_hash>: {fields}}}. \
                          Subscribe for live updates when torrents are added, removed, \
                          or change state."
                             .to_string(),
@@ -512,11 +513,13 @@ impl ServerHandler for DelugeServer {
                 .await
                 .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
-            // Resource reads honor the same response shaping as tool outputs: on HTTP the
-            // per-request config from /mcp/<format>?<params>, on STDIO the --response-config
-            // default. (`sparse` is a structural no-op here — this resource is a bare
-            // {hash: {...}} map, not the {"torrents": {...}} envelope sparsify looks for.)
-            let text = self.shape(crate::rencode::value_to_json(result), &context);
+            // Wrap in the {"torrents": {<hash>: {...}}} envelope so this resource shapes
+            // identically to list_torrents — in particular so `sparse` (which targets that
+            // envelope) elides default-valued fields here too, the biggest payload in the
+            // system. Resource reads honor the same per-request (HTTP) / --response-config
+            // (STDIO) shaping as tool outputs.
+            let wrapped = serde_json::json!({ "torrents": crate::rencode::value_to_json(result) });
+            let text = self.shape(wrapped, &context);
             Ok(ReadResourceResult::new(vec![
                 ResourceContents::TextResourceContents {
                     uri: uri.clone(),
