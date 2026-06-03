@@ -164,7 +164,7 @@ It's one DSL — `<format>?<params>` — used in both places. Plain `/mcp`, `/mc
 
 Notes:
 
-- `defaults` only reshapes the `{"torrents": {...}}` envelope (`list_torrents` and the `deluge://torrents` resource); it's a structural no-op on single-torrent output. `minified`/`pretty` apply everywhere.
+- `defaults` applies to large, repetitive payloads (such as `list_torrents`) and is a no-op elsewhere; `minified`/`pretty` apply everywhere. Which payloads it covers may expand over time.
 - An unknown format or invalid parameter is a hard error: `400 Bad Request` on HTTP, non-zero exit at stdio startup.
 - `--test-connection` honors the shaping flag, so you can run it once to *see* the shape before wiring up a client.
 
