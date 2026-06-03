@@ -63,3 +63,12 @@ Resolve the `ResponseConfig` **per request**, not per session:
   envelope so `sparse` applies to it as it does to `list_torrents`; `sparse` is a structural
   no-op on the single-torrent resource and the diagnostic (not that envelope), where
   `minified`/`pretty` still apply.
+
+## Update (2026-06-02)
+
+The default shape was changed from `pretty` to `minified` after testing: in practice
+the common consumer is a token-sensitive LLM, so the byte-for-byte back-compat default
+described above cost tokens on every call for the typical client. The default now
+serializes with `to_string` (minified); human-readable output is opt-in via `shape=pretty`.
+This supersedes the "byte-identical to `to_string_pretty`" consequence above — that
+guarantee now holds only when a client explicitly requests `shape=pretty`.
