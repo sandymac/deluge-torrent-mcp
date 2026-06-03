@@ -55,14 +55,16 @@ Resolve the `ResponseConfig` **per request**, not per session:
 - The default config makes `shape()` call `to_string_pretty` verbatim, so existing
   clients that opt into nothing see byte-identical output (with one deliberate
   consistency fix: a few read paths that previously emitted minified now default to
-  pretty like every other tool).
+  pretty like every other tool). *(Superseded — see the Update below: the default is now
+  minified.)*
 - Shaping applies to all JSON the server emits: tool outputs, MCP resource reads (which
   reach the same per-request config via their `RequestContext`), and the `--test-connection`
   diagnostic (which uses the parsed `--response-config` directly, so it also demonstrates the
   switch is in effect). The `deluge://torrents` resource is wrapped in the `{"torrents": {...}}`
   envelope so `sparse` applies to it as it does to `list_torrents`; `sparse` is a structural
   no-op on the single-torrent resource and the diagnostic (not that envelope), where
-  `minified`/`pretty` still apply.
+  `minified`/`pretty` still apply. *(The `sparse` token was renamed `defaults` — see the
+  Update below.)*
 
 ## Update (2026-06-02)
 

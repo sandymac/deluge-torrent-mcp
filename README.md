@@ -79,7 +79,7 @@ The MCP server authenticates to Deluge with an RPC username and password. On the
 
 Supply them by flag (`-u`/`-p`) or, preferably, by environment variable (`DELUGE_USERNAME` / `DELUGE_PASSWORD`):
 
-> **Prefer environment variables for credentials.** Passwords passed as CLI flags show up in process listings (`ps`); environment variables don't.
+> **Prefer environment variables for credentials.** Passwords passed as CLI flags appear in shell history and in process listings (`ps`). Environment variables avoid both, though they're still sensitive — a process's environment is readable by the same user (and root) via `/proc/<pid>/environ`.
 
 ### Safety gates
 
@@ -274,7 +274,7 @@ deluge-torrent-mcp --host 192.168.1.50 --port 58846 -u admin -p secret [OPTIONS]
 | `--api-token <TOKEN>` | `DELUGE_API_TOKEN` | — | Bearer token required for HTTP requests (recommended). In OAuth mode it also gates the consent screen as the operator Access Code |
 | `--oauth-issuer <URL>` | `DELUGE_OAUTH_ISSUER` | — | Public HTTPS base URL clients reach over the internet; setting it enables OAuth 2.1 mode |
 | `--oauth-state-file <PATH>` | `DELUGE_OAUTH_STATE_FILE` | — | Persist OAuth client registrations and tokens across restarts (only meaningful with `--oauth-issuer`) |
-| `--response-config <FORMAT?PARAMS>` | `DELUGE_RESPONSE_CONFIG` | `minified` | Shape stdio JSON output, e.g. `json?shape=pretty` for human-readable output |
+| `--response-config <FORMAT?PARAMS>` | `DELUGE_RESPONSE_CONFIG` | — | Shape stdio JSON output. Omit for minified; pass `json?shape=pretty` for human-readable output |
 | `--test-connection` | — | off | Connect to Deluge, verify connection, cert fingerprint, response config, and exit |
 
 ---
