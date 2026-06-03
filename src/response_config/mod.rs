@@ -11,8 +11,8 @@
 //!
 //! The path segment names the *payload format* (the encoding namespace — `json` in v1,
 //! reserving `toon`/`xml`/`text` for later); the query string carries parameters scoped to
-//! that format. All token-saving shaping is strictly opt-in: the [`Default`] is `json` +
-//! `pretty` + `full`, byte-for-byte today's behavior.
+//! that format. The [`Default`] is `json` + `minified` + `full`: compact output suits the
+//! LLM clients that are the common consumer. Human-readable output is opt-in via `shape=pretty`.
 
 mod shape;
 
@@ -42,16 +42,17 @@ pub(crate) enum Format {
 pub(crate) struct ShapeOpts {
     /// Whitespace rendering.
     pub(crate) whitespace: Whitespace,
-    /// When true, emit a one-time `defaults` block and omit per-row default-valued fields.
-    pub(crate) sparse: bool,
+    /// When true, emit a one-time `defaults` block and omit per-row default-valued fields
+    /// (the `defaults` shape token).
+    pub(crate) omit_defaults: bool,
 }
 
 /// Whitespace rendering for the `json` format.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Whitespace {
-    /// `serde_json::to_string_pretty` — today's behavior, the default.
+    /// `serde_json::to_string_pretty` — human-readable; opt in with `shape=pretty`.
     Pretty,
-    /// `serde_json::to_string` — no whitespace.
+    /// `serde_json::to_string` — no whitespace. The default.
     Minified,
 }
 
@@ -63,13 +64,14 @@ pub(crate) enum IdSelector {
 }
 
 impl Default for ResponseConfig {
-    /// `json` + `pretty` + `full` — byte-for-byte today's behavior. All shaping is opt-in.
+    /// `json` + `minified` + `full`. Compact output is the default because LLM clients are the
+    /// common consumer; opt into human-readable output with `shape=pretty`.
     fn default() -> Self {
         Self {
             format: Format::Json,
             shape: ShapeOpts {
-                whitespace: Whitespace::Pretty,
-                sparse: false,
+                whitespace: Whitespace::Minified,
+                omit_defaults: false,
             },
             ids: IdSelector::Full,
         }
@@ -105,7 +107,7 @@ impl std::fmt::Display for ConfigParseError {
             Self::InvalidValue { param, value } => match param.as_str() {
                 "shape" => write!(
                     f,
-                    "invalid shape value '{value}' (valid: pretty, minified, sparse)"
+                    "invalid shape value '{value}' (valid: pretty, minified, defaults)"
                 ),
                 "ids" => write!(f, "invalid ids value '{value}' (valid: full)"),
                 other => write!(f, "invalid value '{value}' for parameter '{other}'"),
@@ -163,7 +165,7 @@ pub(crate) fn parse(format_segment: &str, query: &str) -> Result<ResponseConfig,
     Ok(cfg)
 }
 
-/// Apply a `shape=` CSV value (e.g. `minified,sparse`) onto [`ShapeOpts`].
+/// Apply a `shape=` CSV value (e.g. `minified,defaults`) onto [`ShapeOpts`].
 fn parse_shape(value: &str, shape: &mut ShapeOpts) -> Result<(), ConfigParseError> {
     // An empty value (`?shape=` or a bare `?shape`) is a hard error, not a silent no-op —
     // otherwise a typo that drops the value masquerades as a working config.
@@ -187,7 +189,7 @@ fn parse_shape(value: &str, shape: &mut ShapeOpts) -> Result<(), ConfigParseErro
                 saw_minified = true;
                 shape.whitespace = Whitespace::Minified;
             }
-            "sparse" => shape.sparse = true,
+            "defaults" => shape.omit_defaults = true,
             other => {
                 return Err(ConfigParseError::InvalidValue {
                     param: "shape".to_string(),
@@ -203,7 +205,7 @@ fn parse_shape(value: &str, shape: &mut ShapeOpts) -> Result<(), ConfigParseErro
 }
 
 /// Parse a STDIO `--response-config` string of the form `<format>?<params>` (e.g.
-/// `json?shape=minified,sparse`). Splits on the first `?` and delegates to [`parse`], so the
+/// `json?shape=minified,defaults`). Splits on the first `?` and delegates to [`parse`], so the
 /// STDIO flag and the HTTP path+query share one grammar.
 pub(crate) fn parse_flag(s: &str) -> Result<ResponseConfig, ConfigParseError> {
     let (format, query) = s.split_once('?').unwrap_or((s, ""));
@@ -215,11 +217,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_is_json_pretty_full() {
+    fn default_is_json_minified_full() {
         let cfg = ResponseConfig::default();
         assert_eq!(cfg.format, Format::Json);
-        assert_eq!(cfg.shape.whitespace, Whitespace::Pretty);
-        assert!(!cfg.shape.sparse);
+        assert_eq!(cfg.shape.whitespace, Whitespace::Minified);
+        assert!(!cfg.shape.omit_defaults);
         assert_eq!(cfg.ids, IdSelector::Full);
     }
 
@@ -242,21 +244,22 @@ mod tests {
     fn parses_minified() {
         let cfg = parse("json", "shape=minified").unwrap();
         assert_eq!(cfg.shape.whitespace, Whitespace::Minified);
-        assert!(!cfg.shape.sparse);
+        assert!(!cfg.shape.omit_defaults);
     }
 
     #[test]
-    fn parses_minified_and_sparse_csv() {
-        let cfg = parse("json", "shape=minified,sparse").unwrap();
+    fn parses_minified_and_defaults_csv() {
+        let cfg = parse("json", "shape=minified,defaults").unwrap();
         assert_eq!(cfg.shape.whitespace, Whitespace::Minified);
-        assert!(cfg.shape.sparse);
+        assert!(cfg.shape.omit_defaults);
     }
 
     #[test]
-    fn parses_sparse_with_implicit_pretty() {
-        let cfg = parse("json", "shape=sparse").unwrap();
-        assert_eq!(cfg.shape.whitespace, Whitespace::Pretty);
-        assert!(cfg.shape.sparse);
+    fn parses_defaults_with_implicit_minified() {
+        // `defaults` alone leaves whitespace at the default (minified).
+        let cfg = parse("json", "shape=defaults").unwrap();
+        assert_eq!(cfg.shape.whitespace, Whitespace::Minified);
+        assert!(cfg.shape.omit_defaults);
     }
 
     #[test]
@@ -266,9 +269,9 @@ mod tests {
 
     #[test]
     fn parses_multiple_params() {
-        let cfg = parse("json", "shape=minified,sparse&ids=full").unwrap();
+        let cfg = parse("json", "shape=minified,defaults&ids=full").unwrap();
         assert_eq!(cfg.shape.whitespace, Whitespace::Minified);
-        assert!(cfg.shape.sparse);
+        assert!(cfg.shape.omit_defaults);
         assert_eq!(cfg.ids, IdSelector::Full);
     }
 
@@ -341,7 +344,7 @@ mod tests {
         assert!(parse("json", "shape=x")
             .unwrap_err()
             .to_string()
-            .contains("pretty, minified, sparse"));
+            .contains("pretty, minified, defaults"));
     }
 
     // --- parser: HTTP-form and STDIO-form equivalence (single-grammar guarantee) ---
@@ -350,8 +353,8 @@ mod tests {
     fn http_form_equals_stdio_form() {
         // HTTP supplies (segment, query) separately; STDIO supplies one "<format>?<params>"
         // string. The same logical config must parse identically.
-        let http = parse("json", "shape=minified,sparse&ids=full").unwrap();
-        let stdio = parse_flag("json?shape=minified,sparse&ids=full").unwrap();
+        let http = parse("json", "shape=minified,defaults&ids=full").unwrap();
+        let stdio = parse_flag("json?shape=minified,defaults&ids=full").unwrap();
         assert_eq!(http, stdio);
     }
 

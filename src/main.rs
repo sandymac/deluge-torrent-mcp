@@ -94,20 +94,25 @@ struct Cli {
 
     /// Additional Host header value(s) to accept on the HTTP transport, for when the
     /// server runs behind a reverse proxy that forwards a public hostname (e.g.
-    /// mcp.example.com). The loopback hosts, the --http-bind host, and the --oauth-issuer
+    /// mcp.dyn.dns). The loopback hosts, the --http-bind host, and the --oauth-issuer
     /// host are always accepted; use this for any other public name. Comma-separated or
     /// repeated. Without it, rmcp's DNS-rebinding guard rejects proxied requests with 403.
     #[arg(long = "allowed-host", value_name = "HOST", value_delimiter = ',', action = clap::ArgAction::Append, env = "DELUGE_ALLOWED_HOST")]
     allowed_host: Vec<String>,
 
-    /// Bearer token required for HTTP transport requests (recommended)
+    /// Bearer token required for HTTP transport requests (recommended). In OAuth mode this
+    /// value also gates the consent screen as the operator "Access Code" — set it, or anyone
+    /// who reaches the consent page can approve a client and obtain a token.
     #[arg(long, env = "DELUGE_API_TOKEN")]
     api_token: Option<String>,
 
-    /// Base URL of this server as the OAuth 2.1 issuer (enables OAuth mode).
-    /// Example: <http://localhost:8080>  or  <https://mcp.example.com>
-    /// When set, OAuth 2.1 endpoints are activated and MCP requests require OAuth tokens.
-    /// Can be combined with --api-token to also accept static tokens as a fallback.
+    /// Base URL of this server as the OAuth 2.1 issuer (enables OAuth mode). Intended for
+    /// internet-facing deployments where remote clients connect back to your MCP server;
+    /// use the public HTTPS URL clients reach, e.g. <https://mcp.dyn.dns> (not a
+    /// localhost URL). When set, OAuth 2.1 endpoints are activated and MCP requests require
+    /// OAuth tokens. Set --api-token alongside it: that value gates the consent screen (the
+    /// operator Access Code) and also works as a static bearer-token fallback. Without it the
+    /// consent screen is ungated and anyone who can reach it can authorize a client.
     #[arg(long, env = "DELUGE_OAUTH_ISSUER")]
     oauth_issuer: Option<String>,
 
@@ -118,16 +123,18 @@ struct Cli {
     #[arg(long, env = "DELUGE_OAUTH_STATE_FILE", value_name = "PATH")]
     oauth_state_file: Option<std::path::PathBuf>,
 
-    /// Connect to Deluge, print session status, and exit
-    #[arg(long, default_value_t = false)]
-    test_connection: bool,
-
     /// Shape STDIO tool responses for a token-sensitive (LLM) or byte-sensitive (programmatic)
-    /// consumer. Format `<format>?<params>`, mirroring the HTTP `/mcp/<format>?<params>` path.
-    /// v1: `json?shape=minified`, `json?shape=minified,sparse`, `json?shape=sparse`. Omit for
-    /// today's pretty output. (HTTP transport sets this per-request via the URL instead.)
+    /// consumer. Format `<format>?<params>`, mirroring the HTTP `/mcp/<format>?<params>` URL.
+    /// Example: --response-config 'json?shape=pretty'.
+    /// v1 values: shape=pretty|minified|defaults (CSV; pretty/minified are exclusive), ids=full.
+    /// Omit for the default (minified); pass shape=pretty for human-readable output.
+    /// On the HTTP transport this is chosen per-request via the URL instead of this flag.
     #[arg(long, env = "DELUGE_RESPONSE_CONFIG", value_name = "FORMAT?PARAMS")]
     response_config: Option<String>,
+
+    /// Connect to Deluge, verify connection, cert fingerprint, response config, and exit
+    #[arg(long, default_value_t = false)]
+    test_connection: bool,
 }
 
 #[derive(Debug, Clone, clap::ValueEnum)]
@@ -621,10 +628,10 @@ mod tests {
     }
 
     #[test]
-    fn request_config_sparse_query() {
-        let cfg = parse_request_config("/mcp/json", "shape=minified,sparse").unwrap();
+    fn request_config_defaults_query() {
+        let cfg = parse_request_config("/mcp/json", "shape=minified,defaults").unwrap();
         assert_eq!(cfg.shape.whitespace, Whitespace::Minified);
-        assert!(cfg.shape.sparse);
+        assert!(cfg.shape.omit_defaults);
     }
 
     #[test]
@@ -689,10 +696,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bare_mcp_path_yields_default_pretty() {
+    async fn bare_mcp_path_yields_default_minified() {
         let (status, body) = send("/mcp").await;
         assert_eq!(status, axum::http::StatusCode::OK);
-        assert!(body.contains("minified=false"), "body: {body}");
+        assert!(body.contains("minified=true"), "body: {body}");
     }
 
     #[tokio::test]

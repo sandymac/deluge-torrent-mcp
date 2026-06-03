@@ -3,8 +3,8 @@
 
 //! The pure JSON shaping transform. Given a tool's output [`Value`](serde_json::Value) and a
 //! [`ResponseConfig`], produce the serialized string the consumer asked for — minified or
-//! pretty whitespace, optionally sparse (a one-time `defaults` block with per-row default
-//! fields omitted). No I/O; fully unit-testable.
+//! pretty whitespace, optionally factoring out defaults (the `defaults` shape token: a one-time
+//! `defaults` block with per-row default-valued fields omitted). No I/O; fully unit-testable.
 
 use serde_json::{Map, Value};
 
@@ -15,7 +15,7 @@ use super::{ResponseConfig, Whitespace};
 /// `const`-compatible `Value`.
 type DefaultEntry = (&'static str, fn() -> Value);
 
-/// The v1 sparse default set for torrent rows, from the measured distribution in issue #9.
+/// The v1 default set for torrent rows, from the measured distribution in issue #9.
 /// A field is omitted from a row only when (a) every row carries it and (b) its value equals
 /// the default here, so the consumer reconstructs a row as `{...defaults, ...row}` losslessly.
 const TORRENT_DEFAULTS: &[DefaultEntry] = &[
@@ -29,8 +29,8 @@ const TORRENT_DEFAULTS: &[DefaultEntry] = &[
 
 /// Shape a tool's JSON output for the declared consumer. Pure transform; never touches I/O.
 pub(crate) fn shape_response(value: Value, cfg: &ResponseConfig) -> String {
-    let value = if cfg.shape.sparse {
-        sparsify(value)
+    let value = if cfg.shape.omit_defaults {
+        factor_defaults(value)
     } else {
         value
     };
@@ -41,13 +41,13 @@ pub(crate) fn shape_response(value: Value, cfg: &ResponseConfig) -> String {
     serialized.unwrap_or_default()
 }
 
-/// Apply the sparse transform: emit a sibling `defaults` block and omit per-row default-valued
+/// Apply the `defaults` transform: emit a sibling `defaults` block and omit per-row default-valued
 /// fields. Operates only on a `{ "torrents": { <hash>: {fields} }, ... }`-shaped object — i.e.
 /// `list_torrents` output and the `deluge://torrents` resource (which is wrapped in that
 /// envelope). Any other shape passes through unchanged, including the bare `{ <hash>: {fields} }`
-/// map that `get_torrent_status` (batch) and the single-torrent resource emit — sparse only
-/// applies to the explicit `torrents` envelope.
-fn sparsify(value: Value) -> Value {
+/// map that `get_torrent_status` (batch) and the single-torrent resource emit — this transform
+/// only applies to the explicit `torrents` envelope.
+fn factor_defaults(value: Value) -> Value {
     let Value::Object(mut top) = value else {
         return value;
     };
@@ -110,10 +110,10 @@ mod tests {
     use crate::response_config::{IdSelector, Format, ShapeOpts};
     use serde_json::json;
 
-    fn cfg(whitespace: Whitespace, sparse: bool) -> ResponseConfig {
+    fn cfg(whitespace: Whitespace, omit_defaults: bool) -> ResponseConfig {
         ResponseConfig {
             format: Format::Json,
-            shape: ShapeOpts { whitespace, sparse },
+            shape: ShapeOpts { whitespace, omit_defaults },
             ids: IdSelector::Full,
         }
     }
@@ -151,7 +151,7 @@ mod tests {
     }
 
     #[test]
-    fn sparse_emits_defaults_and_omits_defaulted_fields() {
+    fn defaults_emits_defaults_and_omits_defaulted_fields() {
         let got = shape_response(sample(), &cfg(Whitespace::Pretty, true));
         let parsed: Value = serde_json::from_str(&got).unwrap();
 
@@ -175,8 +175,8 @@ mod tests {
     }
 
     #[test]
-    fn sparse_round_trips_to_full_rows() {
-        // Merging defaults into each sparse row must reproduce the original rows exactly.
+    fn defaults_round_trips_to_full_rows() {
+        // Merging defaults into each omitted row must reproduce the original rows exactly.
         let original = sample();
         let shaped: Value =
             serde_json::from_str(&shape_response(original.clone(), &cfg(Whitespace::Minified, true)))
@@ -184,10 +184,10 @@ mod tests {
 
         let defaults = shaped["defaults"].as_object().unwrap();
         for (hash, orig_row) in original["torrents"].as_object().unwrap() {
-            let sparse_row = shaped["torrents"][hash].as_object().unwrap();
-            // row = {...defaults, ...sparse_row}
+            let omitted_row = shaped["torrents"][hash].as_object().unwrap();
+            // row = {...defaults, ...omitted_row}
             let mut merged = defaults.clone();
-            for (k, v) in sparse_row {
+            for (k, v) in omitted_row {
                 merged.insert(k.clone(), v.clone());
             }
             assert_eq!(
@@ -198,11 +198,11 @@ mod tests {
         }
     }
 
-    /// T7 lean regression guard: with the default config, every shape a handler actually emits
-    /// must serialize byte-identically to the pre-change `to_string_pretty` call. Covers the
-    /// add_torrent array, the remove/set_label flat object, and the pause/resume_label object.
+    /// Lean regression guard: with the default config (minified), every shape a handler actually
+    /// emits must serialize byte-identically to `serde_json::to_string`. Covers the add_torrent
+    /// array, the remove/set_label flat object, and the pause/resume_label object.
     #[test]
-    fn default_config_is_byte_identical_for_handler_output_shapes() {
+    fn default_config_is_byte_identical_to_minified() {
         let shapes = [
             // add_torrent batch (array of per-source results)
             json!([{"info_hash": "aaaa"}, {"error": "bad source"}]),
@@ -218,14 +218,14 @@ mod tests {
         for v in shapes {
             assert_eq!(
                 shape_response(v.clone(), &default),
-                serde_json::to_string_pretty(&v).unwrap(),
-                "default-config output drifted from to_string_pretty for {v}"
+                serde_json::to_string(&v).unwrap(),
+                "default-config output drifted from to_string (minified) for {v}"
             );
         }
     }
 
     #[test]
-    fn non_torrent_shape_passes_through_under_sparse() {
+    fn non_torrent_shape_passes_through_under_defaults() {
         let scalar = json!({"free_space": 12345});
         let got = shape_response(scalar.clone(), &cfg(Whitespace::Pretty, true));
         assert_eq!(got, serde_json::to_string_pretty(&scalar).unwrap());
@@ -236,7 +236,7 @@ mod tests {
     }
 
     #[test]
-    fn sparse_skips_default_key_absent_from_some_rows() {
+    fn defaults_skips_default_key_absent_from_some_rows() {
         // If a default key isn't present in every row, it must not be declared/omitted —
         // otherwise the merge would add a key a row never had.
         let v = json!({

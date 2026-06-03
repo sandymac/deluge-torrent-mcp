@@ -159,8 +159,8 @@ By default OAuth state is held in memory only — every registered client, acces
 An MCP client can declare what kind of consumer it is — a token-sensitive LLM or a byte/parse-sensitive programmatic tool — and receive a JSON payload shaped for it. The configuration is one canonical DSL, parsed by one function (`src/response_config`), and used on both transports:
 
 ```
-HTTP:   POST /mcp/<format>?<params>     e.g. /mcp/json?shape=minified,sparse
-STDIO:  --response-config '<format>?<params>'   e.g. --response-config 'json?shape=minified,sparse'
+HTTP:   POST /mcp/<format>?<params>     e.g. /mcp/json?shape=minified,defaults
+STDIO:  --response-config '<format>?<params>'   e.g. --response-config 'json?shape=minified,defaults'
         (or DELUGE_RESPONSE_CONFIG)
 ```
 
@@ -170,14 +170,14 @@ The **path segment names the payload format** (the encoding namespace — `json`
 
 | Param | Values | Default | Effect |
 |---|---|---|---|
-| `shape` | `pretty`, `minified`, `sparse` (CSV; `pretty`/`minified` mutually exclusive) | `pretty` | Whitespace + redundancy. `sparse` emits a one-time `defaults` block and omits per-row default-valued fields from `list_torrents`-shaped output (reconstruct a row as `{...defaults, ...row}`). |
+| `shape` | `pretty`, `minified`, `defaults` (CSV; `pretty`/`minified` mutually exclusive) | `minified` | Whitespace + redundancy. `defaults` emits a one-time `defaults` block and omits per-row default-valued fields from `list_torrents`-shaped output (reconstruct a row as `{...defaults, ...row}`). |
 | `ids` | `full` | `full` | Selects an `IdStrategy` (`src/ids`). v1 ships `Full` (the id is the 40/64-hex info hash) only. |
 
-**Defaults and back-compat**: plain `/mcp`, `/mcp/json` with no params, and STDIO without the flag all produce today's pretty output. All token-saving shaping is strictly opt-in. An unknown format or invalid parameter is a hard error — `400 Bad Request` on HTTP, non-zero exit at STDIO startup.
+**Defaults**: plain `/mcp`, `/mcp/json` with no params, and STDIO without the flag all produce **minified** output — compact output suits the LLM clients that are the common consumer. Human-readable output is opt-in via `shape=pretty`. An unknown format or invalid parameter is a hard error — `400 Bad Request` on HTTP, non-zero exit at STDIO startup.
 
 **How config reaches a tool**: rmcp's per-session service factory takes no request data, so config is resolved **per request**, not per session. On HTTP, `response_config_layer` (middleware on the `/mcp` routes, outside `nest_service` so it sees the pre-strip path) parses the path+query and inserts a `ResponseConfig` into the request extensions; rmcp copies the `http::request::Parts` into each tool call's `RequestContext`, and `DelugeServer::resolve_config` reads it back, falling back to the startup/STDIO config when absent. Tool handlers serialize via `DelugeServer::shape(value, &ctx)`. See ADR-0012.
 
-**Scope (v1)**: shaping applies to all JSON the server emits — tool outputs, MCP resource reads (`deluge://torrents`, `deluge://torrent/<hash>`), and the `--test-connection` session-status diagnostic (which doubles as a demonstration that the shaping switches are in effect). The `deluge://torrents` resource is emitted in the `{"torrents": {...}}` envelope so `sparse` elides default-valued fields there exactly as for `list_torrents`. `sparse` remains a structural no-op on the single-torrent resource and the diagnostic (they aren't that envelope); `minified`/`pretty` apply everywhere. Not yet built but designed-for: `ids=short` prefix/ephemeral strategies, a `resolve_ids` tool, `toon`/`xml` formats, and `fields=` projection.
+**Scope (v1)**: shaping applies to all JSON the server emits — tool outputs, MCP resource reads (`deluge://torrents`, `deluge://torrent/<hash>`), and the `--test-connection` session-status diagnostic (which doubles as a demonstration that the shaping switches are in effect). The `deluge://torrents` resource is emitted in the `{"torrents": {...}}` envelope so `defaults` elides default-valued fields there exactly as for `list_torrents`. `defaults` remains a structural no-op on the single-torrent resource and the diagnostic (they aren't that envelope); `minified`/`pretty` apply everywhere. Not yet built but designed-for: `ids=short` prefix/ephemeral strategies, a `resolve_ids` tool, `toon`/`xml` formats, and `fields=` projection.
 
 ## File Structure
 
@@ -189,7 +189,7 @@ The **path segment names the payload format** (the encoding namespace — `json`
 | `src/main.rs` | Entry point — CLI arg parsing, transport selection, server startup, HTTP auth + response-config middleware. |
 | `src/rencode.rs` | Internal rencode serializer/deserializer (Deluge wire format). |
 | `src/response_config/mod.rs` | The consumer-shaped-response DSL — `ResponseConfig`, the shared parser (HTTP path+query and STDIO flag), parse errors. |
-| `src/response_config/shape.rs` | Pure JSON shaping transform — minified/pretty serialization and the sparse (`defaults` block + omit) transform. |
+| `src/response_config/shape.rs` | Pure JSON shaping transform — minified/pretty serialization and the `defaults` (defaults-block + omit) transform. |
 | `src/ids/mod.rs` | The `IdStrategy` seam — `encode`/`decode`/`describe` trait with the v1 `Full` (info-hash-is-id) implementation. |
 | `src/deluge/mod.rs` | Deluge RPC client — TLS connection, cert fingerprint logging/pinning, auth, request multiplexing, zlib framing. |
 | `src/tools/mod.rs` | MCP tool implementations — all 21 tools, safety gate helpers, plugin watcher, Value→JSON conversion. |

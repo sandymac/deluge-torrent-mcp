@@ -55,11 +55,28 @@ Resolve the `ResponseConfig` **per request**, not per session:
 - The default config makes `shape()` call `to_string_pretty` verbatim, so existing
   clients that opt into nothing see byte-identical output (with one deliberate
   consistency fix: a few read paths that previously emitted minified now default to
-  pretty like every other tool).
+  pretty like every other tool). *(Superseded — see the Update below: the default is now
+  minified.)*
 - Shaping applies to all JSON the server emits: tool outputs, MCP resource reads (which
   reach the same per-request config via their `RequestContext`), and the `--test-connection`
   diagnostic (which uses the parsed `--response-config` directly, so it also demonstrates the
   switch is in effect). The `deluge://torrents` resource is wrapped in the `{"torrents": {...}}`
   envelope so `sparse` applies to it as it does to `list_torrents`; `sparse` is a structural
   no-op on the single-torrent resource and the diagnostic (not that envelope), where
-  `minified`/`pretty` still apply.
+  `minified`/`pretty` still apply. *(The `sparse` token was renamed `defaults` — see the
+  Update below.)*
+
+## Update (2026-06-02)
+
+The default shape was changed from `pretty` to `minified` after testing: in practice
+the common consumer is a token-sensitive LLM, so the byte-for-byte back-compat default
+described above cost tokens on every call for the typical client. The default now
+serializes with `to_string` (minified); human-readable output is opt-in via `shape=pretty`.
+This supersedes the "byte-identical to `to_string_pretty`" consequence above — that
+guarantee now holds only when a client explicitly requests `shape=pretty`.
+
+The redundancy-omission shape token was also renamed `sparse` → `defaults`: it factors out
+shared *default-valued* fields into a `defaults` block (not empty/null fields, which `sparse`
+would imply), so the token now matches both the emitted block and the `{...defaults, ...row}`
+reconstruction. Internally the flag is `ShapeOpts::omit_defaults` and the transform is
+`factor_defaults`.
