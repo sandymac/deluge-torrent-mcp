@@ -170,10 +170,10 @@ The **path segment names the payload format** (the encoding namespace — `json`
 
 | Param | Values | Default | Effect |
 |---|---|---|---|
-| `shape` | `pretty`, `minified`, `sparse` (CSV; `pretty`/`minified` mutually exclusive) | `pretty` | Whitespace + redundancy. `sparse` emits a one-time `defaults` block and omits per-row default-valued fields from `list_torrents`-shaped output (reconstruct a row as `{...defaults, ...row}`). |
+| `shape` | `pretty`, `minified`, `sparse` (CSV; `pretty`/`minified` mutually exclusive) | `minified` | Whitespace + redundancy. `sparse` emits a one-time `defaults` block and omits per-row default-valued fields from `list_torrents`-shaped output (reconstruct a row as `{...defaults, ...row}`). |
 | `ids` | `full` | `full` | Selects an `IdStrategy` (`src/ids`). v1 ships `Full` (the id is the 40/64-hex info hash) only. |
 
-**Defaults and back-compat**: plain `/mcp`, `/mcp/json` with no params, and STDIO without the flag all produce today's pretty output. All token-saving shaping is strictly opt-in. An unknown format or invalid parameter is a hard error — `400 Bad Request` on HTTP, non-zero exit at STDIO startup.
+**Defaults**: plain `/mcp`, `/mcp/json` with no params, and STDIO without the flag all produce **minified** output — compact output suits the LLM clients that are the common consumer. Human-readable output is opt-in via `shape=pretty`. An unknown format or invalid parameter is a hard error — `400 Bad Request` on HTTP, non-zero exit at STDIO startup.
 
 **How config reaches a tool**: rmcp's per-session service factory takes no request data, so config is resolved **per request**, not per session. On HTTP, `response_config_layer` (middleware on the `/mcp` routes, outside `nest_service` so it sees the pre-strip path) parses the path+query and inserts a `ResponseConfig` into the request extensions; rmcp copies the `http::request::Parts` into each tool call's `RequestContext`, and `DelugeServer::resolve_config` reads it back, falling back to the startup/STDIO config when absent. Tool handlers serialize via `DelugeServer::shape(value, &ctx)`. See ADR-0012.
 

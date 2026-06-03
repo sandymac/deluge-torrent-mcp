@@ -11,8 +11,8 @@
 //!
 //! The path segment names the *payload format* (the encoding namespace — `json` in v1,
 //! reserving `toon`/`xml`/`text` for later); the query string carries parameters scoped to
-//! that format. All token-saving shaping is strictly opt-in: the [`Default`] is `json` +
-//! `pretty` + `full`, byte-for-byte today's behavior.
+//! that format. The [`Default`] is `json` + `minified` + `full`: compact output suits the
+//! LLM clients that are the common consumer. Human-readable output is opt-in via `shape=pretty`.
 
 mod shape;
 
@@ -49,9 +49,9 @@ pub(crate) struct ShapeOpts {
 /// Whitespace rendering for the `json` format.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Whitespace {
-    /// `serde_json::to_string_pretty` — today's behavior, the default.
+    /// `serde_json::to_string_pretty` — human-readable; opt in with `shape=pretty`.
     Pretty,
-    /// `serde_json::to_string` — no whitespace.
+    /// `serde_json::to_string` — no whitespace. The default.
     Minified,
 }
 
@@ -63,12 +63,13 @@ pub(crate) enum IdSelector {
 }
 
 impl Default for ResponseConfig {
-    /// `json` + `pretty` + `full` — byte-for-byte today's behavior. All shaping is opt-in.
+    /// `json` + `minified` + `full`. Compact output is the default because LLM clients are the
+    /// common consumer; opt into human-readable output with `shape=pretty`.
     fn default() -> Self {
         Self {
             format: Format::Json,
             shape: ShapeOpts {
-                whitespace: Whitespace::Pretty,
+                whitespace: Whitespace::Minified,
                 sparse: false,
             },
             ids: IdSelector::Full,
@@ -215,10 +216,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_is_json_pretty_full() {
+    fn default_is_json_minified_full() {
         let cfg = ResponseConfig::default();
         assert_eq!(cfg.format, Format::Json);
-        assert_eq!(cfg.shape.whitespace, Whitespace::Pretty);
+        assert_eq!(cfg.shape.whitespace, Whitespace::Minified);
         assert!(!cfg.shape.sparse);
         assert_eq!(cfg.ids, IdSelector::Full);
     }
@@ -253,9 +254,10 @@ mod tests {
     }
 
     #[test]
-    fn parses_sparse_with_implicit_pretty() {
+    fn parses_sparse_with_implicit_minified() {
+        // `sparse` alone leaves whitespace at the default (minified).
         let cfg = parse("json", "shape=sparse").unwrap();
-        assert_eq!(cfg.shape.whitespace, Whitespace::Pretty);
+        assert_eq!(cfg.shape.whitespace, Whitespace::Minified);
         assert!(cfg.shape.sparse);
     }
 

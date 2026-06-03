@@ -689,10 +689,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bare_mcp_path_yields_default_pretty() {
+    async fn bare_mcp_path_yields_default_minified() {
         let (status, body) = send("/mcp").await;
         assert_eq!(status, axum::http::StatusCode::OK);
-        assert!(body.contains("minified=false"), "body: {body}");
+        assert!(body.contains("minified=true"), "body: {body}");
     }
 
     #[tokio::test]

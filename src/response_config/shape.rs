@@ -198,11 +198,11 @@ mod tests {
         }
     }
 
-    /// T7 lean regression guard: with the default config, every shape a handler actually emits
-    /// must serialize byte-identically to the pre-change `to_string_pretty` call. Covers the
-    /// add_torrent array, the remove/set_label flat object, and the pause/resume_label object.
+    /// Lean regression guard: with the default config (minified), every shape a handler actually
+    /// emits must serialize byte-identically to `serde_json::to_string`. Covers the add_torrent
+    /// array, the remove/set_label flat object, and the pause/resume_label object.
     #[test]
-    fn default_config_is_byte_identical_for_handler_output_shapes() {
+    fn default_config_is_byte_identical_to_minified() {
         let shapes = [
             // add_torrent batch (array of per-source results)
             json!([{"info_hash": "aaaa"}, {"error": "bad source"}]),
@@ -218,8 +218,8 @@ mod tests {
         for v in shapes {
             assert_eq!(
                 shape_response(v.clone(), &default),
-                serde_json::to_string_pretty(&v).unwrap(),
-                "default-config output drifted from to_string_pretty for {v}"
+                serde_json::to_string(&v).unwrap(),
+                "default-config output drifted from to_string (minified) for {v}"
             );
         }
     }
