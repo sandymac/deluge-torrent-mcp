@@ -72,3 +72,9 @@ described above cost tokens on every call for the typical client. The default no
 serializes with `to_string` (minified); human-readable output is opt-in via `shape=pretty`.
 This supersedes the "byte-identical to `to_string_pretty`" consequence above — that
 guarantee now holds only when a client explicitly requests `shape=pretty`.
+
+The redundancy-omission shape token was also renamed `sparse` → `defaults`: it factors out
+shared *default-valued* fields into a `defaults` block (not empty/null fields, which `sparse`
+would imply), so the token now matches both the emitted block and the `{...defaults, ...row}`
+reconstruction. Internally the flag is `ShapeOpts::omit_defaults` and the transform is
+`factor_defaults`.

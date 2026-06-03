@@ -20,7 +20,7 @@ Key properties:
 
 - **Safety gates** — tools that can delete data or rewrite paths are **disabled by default** and must be turned on individually, so a hallucinating model can't wreck your library.
 - **Two transports** — **stdio** for a local client like Claude Desktop, and **HTTP/SSE** for a network-accessible, always-on server with optional token or OAuth 2.1 authentication.
-- **Configurable response shaping** — per-client JSON formatting (minified and/or sparse to balance token count vs reasoning abilities) on both transports, with more encodings planned.
+- **Configurable response shaping** — per-client JSON formatting (minified and/or defaults-factoring to balance token count vs reasoning abilities) on both transports, with more encodings planned.
 - **Flexible TLS** — works out of the box with Deluge's default self-signed certificate, log lines provide an easy copy-paste pinning mechanism for pinning to a cert.
 - **Native RPC** — speaks Deluge's binary protocol (rencode/zlib over TLS) directly, deluged thinks it's another client.
 
@@ -43,7 +43,7 @@ cargo build --release
 
 The compiled binary lands at `target/release/deluge-torrent-mcp`.
 
-Sanity-check the build without touching a daemon — `--list-tools` prints the tool inventory and exits before connecting:
+Sanity-check the build without touching a daemon via `--help` or `--list-tools`:
 
 ```bash
 ./target/release/deluge-torrent-mcp --list-tools
@@ -118,9 +118,9 @@ deluge-torrent-mcp --enable-tools=move_storage,rename_folder,rename_files,force_
 
 When the AI calls a disabled tool, the server returns an error naming the exact flag needed to enable it.
 
-### Label plugin
+### Labels
 
-Deluge ships a built-in **Label** plugin for grouping and bulk-operating on torrents. When it's enabled on the daemon, the server exposes eight label-aware tools:
+Deluge ships a built-in **Label** plugin, disabled by default, for grouping and bulk-operating on torrents. When it's enabled on the daemon, the server exposes eight label-aware tools:
 
 | Tool | Default |
 |---|---|
@@ -159,16 +159,16 @@ It's one DSL — `<format>?<params>` — used in both places. Plain `/mcp`, `/mc
 
 | Param | Values | Default | Effect |
 |---|---|---|---|
-| `shape` | `pretty`, `minified`, `sparse` (comma-separated; `pretty`/`minified` are mutually exclusive) | `minified` | Whitespace and redundancy. `sparse` emits a one-time `defaults` block and omits default-valued fields from `list_torrents`-shaped output — reconstruct a row as `{...defaults, ...row}`. |
+| `shape` | `pretty`, `minified`, `defaults` (comma-separated; `pretty`/`minified` are mutually exclusive) | `minified` | Whitespace and redundancy. `defaults` emits a one-time `defaults` block and omits default-valued fields from `list_torrents`-shaped output — reconstruct a row as `{...defaults, ...row}`. |
 | `ids` | `full` | `full` | How torrent ids are rendered. v1 ships `full` only (the id is the 40/64-character info hash). |
 
 Notes:
 
-- `sparse` only reshapes the `{"torrents": {...}}` envelope (`list_torrents` and the `deluge://torrents` resource); it's a structural no-op on single-torrent output. `minified`/`pretty` apply everywhere.
+- `defaults` only reshapes the `{"torrents": {...}}` envelope (`list_torrents` and the `deluge://torrents` resource); it's a structural no-op on single-torrent output. `minified`/`pretty` apply everywhere.
 - An unknown format or invalid parameter is a hard error: `400 Bad Request` on HTTP, non-zero exit at stdio startup.
 - `--test-connection` honors the shaping flag, so you can run it once to *see* the shape before wiring up a client.
 
-> **Rule of thumb:** the default `minified` (add `sparse` for `list_torrents`-heavy use) keeps token use low for LLM clients. Pass `shape=pretty` when you're reading the output yourself.
+> **Rule of thumb:** the default `minified` (add `defaults` for `list_torrents`-heavy use) keeps token use low for LLM clients. Pass `shape=pretty` when you're reading the output yourself.
 
 ### TLS certificate handling
 

@@ -514,7 +514,7 @@ impl ServerHandler for DelugeServer {
                 .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
             // Wrap in the {"torrents": {<hash>: {...}}} envelope so this resource shapes
-            // identically to list_torrents — in particular so `sparse` (which targets that
+            // identically to list_torrents — in particular so `defaults` (which targets that
             // envelope) elides default-valued fields here too, the biggest payload in the
             // system. Resource reads honor the same per-request (HTTP) / --response-config
             // (STDIO) shaping as tool outputs.
@@ -628,13 +628,13 @@ mod tests {
             format: Format::Json,
             shape: ShapeOpts {
                 whitespace: Whitespace::Minified,
-                sparse: true,
+                omit_defaults: true,
             },
             ids: IdSelector::Full,
         };
         // Synthesize the rmcp-injected http::request::Parts carrying the per-request config.
         let mut parts = axum::http::Request::builder()
-            .uri("/mcp/json?shape=minified,sparse")
+            .uri("/mcp/json?shape=minified,defaults")
             .body(())
             .unwrap()
             .into_parts()

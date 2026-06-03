@@ -126,7 +126,7 @@ struct Cli {
     /// Shape STDIO tool responses for a token-sensitive (LLM) or byte-sensitive (programmatic)
     /// consumer. Format `<format>?<params>`, mirroring the HTTP `/mcp/<format>?<params>` URL.
     /// Example: --response-config 'json?shape=pretty'.
-    /// v1 values: shape=pretty|minified|sparse (CSV; pretty/minified are exclusive), ids=full.
+    /// v1 values: shape=pretty|minified|defaults (CSV; pretty/minified are exclusive), ids=full.
     /// Omit for the default (minified); pass shape=pretty for human-readable output.
     /// On the HTTP transport this is chosen per-request via the URL instead of this flag.
     #[arg(long, env = "DELUGE_RESPONSE_CONFIG", value_name = "FORMAT?PARAMS")]
@@ -628,10 +628,10 @@ mod tests {
     }
 
     #[test]
-    fn request_config_sparse_query() {
-        let cfg = parse_request_config("/mcp/json", "shape=minified,sparse").unwrap();
+    fn request_config_defaults_query() {
+        let cfg = parse_request_config("/mcp/json", "shape=minified,defaults").unwrap();
         assert_eq!(cfg.shape.whitespace, Whitespace::Minified);
-        assert!(cfg.shape.sparse);
+        assert!(cfg.shape.omit_defaults);
     }
 
     #[test]
