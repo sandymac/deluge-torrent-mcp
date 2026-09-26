@@ -72,6 +72,18 @@ pub(crate) struct RefreshInfo {
     pub(crate) superseded: Option<(Instant, String, String)>,
 }
 
+impl RefreshInfo {
+    /// A live token dies at `expires_at`. A superseded one lives only for the
+    /// grace window after its rotation, whatever its original expiry: it is
+    /// just a pointer to the pair that replaced it.
+    fn is_dead(&self, now: Instant) -> bool {
+        match &self.superseded {
+            None => self.expires_at <= now,
+            Some((at, _, _)) => now.duration_since(*at) >= REFRESH_GRACE_PERIOD,
+        }
+    }
+}
+
 /// Outcome of presenting a refresh token to the token endpoint.
 pub(crate) enum RefreshOutcome {
     /// A fresh rotation, or a retry within the grace window handed the pair
@@ -334,8 +346,13 @@ impl OAuthState {
     /// has itself been rotated the presentation is replay of a captured token
     /// and every token for the client is revoked. The successor is minted and
     /// stored under the refresh-token lock so a concurrent retry sees it.
+    ///
+    /// Both maps are locked up front, in `flush_inner`'s order (access before
+    /// refresh), so the only `.await`s are the acquisitions: a handler dropped
+    /// mid-way (client disconnect) cannot commit one map without the other.
     pub(crate) async fn rotate_refresh_token(&self, old_token: &str, client_id: &str) -> RefreshOutcome {
         let now = Instant::now();
+        let mut access = self.access_tokens.lock().await;
         let mut tokens = self.refresh_tokens.lock().await;
         let Some(info) = tokens.get(old_token) else {
             return RefreshOutcome::Invalid("invalid or already-used refresh token");
@@ -344,17 +361,15 @@ impl OAuthState {
             return RefreshOutcome::ClientMismatch { expected: info.client_id.clone() };
         }
 
-        let past_grace =
-            matches!(&info.superseded, Some((at, _, _)) if now.duration_since(*at) >= REFRESH_GRACE_PERIOD);
-        if info.expires_at <= now || past_grace {
-            tokens.remove(old_token);
-            drop(tokens);
-            self.mark_dirty();
-            return RefreshOutcome::Invalid(if past_grace {
+        if info.is_dead(now) {
+            let reason = if info.superseded.is_some() {
                 "refresh token has been superseded"
             } else {
                 "refresh token expired"
-            });
+            };
+            tokens.remove(old_token);
+            self.mark_dirty();
+            return RefreshOutcome::Invalid(reason);
         }
 
         if let Some((_, access_token, refresh_token)) = info.superseded.clone() {
@@ -368,8 +383,7 @@ impl OAuthState {
             // replay of a captured token. Revoke everything the client holds:
             // the real client re-consents once, the holder of the copy is out.
             tokens.retain(|_, t| t.client_id != client_id);
-            drop(tokens);
-            self.access_tokens.lock().await.retain(|_, t| t.client_id != client_id);
+            access.retain(|_, t| t.client_id != client_id);
             self.mark_dirty();
             return RefreshOutcome::Replay;
         }
@@ -380,8 +394,8 @@ impl OAuthState {
         let new_refresh = generate_random_hex(32);
         let info = tokens.get_mut(old_token).expect("present: looked up above");
         let scope = info.scope.clone();
-        let old_access = info.access_token.clone();
         let family_expires_at = info.family_expires_at;
+        access.remove(&info.access_token);
         info.superseded = Some((now, new_access.clone(), new_refresh.clone()));
         tokens.insert(
             new_refresh.clone(),
@@ -394,10 +408,6 @@ impl OAuthState {
                 superseded: None,
             },
         );
-        drop(tokens);
-
-        let mut access = self.access_tokens.lock().await;
-        access.remove(&old_access);
         access.insert(
             new_access.clone(),
             TokenInfo {
@@ -406,7 +416,6 @@ impl OAuthState {
                 expires_at: now + ACCESS_TOKEN_TTL,
             },
         );
-        drop(access);
         self.mark_dirty();
 
         RefreshOutcome::Issued { access_token: new_access, refresh_token: new_refresh, scope }
@@ -427,13 +436,7 @@ impl OAuthState {
         });
 
         self.refresh_tokens.lock().await.retain(|_, v| {
-            let past_grace =
-                matches!(&v.superseded, Some((at, _, _)) if now.duration_since(*at) >= REFRESH_GRACE_PERIOD);
-            if v.expires_at <= now || past_grace {
-                result.refresh_tokens += 1;
-                return false;
-            }
-            true
+            if v.is_dead(now) { result.refresh_tokens += 1; false } else { true }
         });
 
         self.pending_authorizations.lock().await.retain(|_, v| {
@@ -537,6 +540,7 @@ mod tests {
     async fn refresh_replay_after_successor_rotated_revokes_client() {
         let state = fresh_state().await;
         state.insert_refresh_token("r1".into(), refresh("c", "a1")).await;
+        state.insert_refresh_token("other".into(), refresh("d", "x1")).await;
         let (a2, r2) = rotate(&state, "r1", "c").await.unwrap();
         let (a3, r3) = rotate(&state, &r2, "c").await.unwrap();
 
@@ -545,6 +549,48 @@ mod tests {
         assert!(!state.validate_token(&a2).await);
         assert!(!state.validate_token(&a3).await);
         assert!(rotate(&state, &r3, "c").await.is_none());
+        // Only that client: another client's chain is untouched.
+        assert!(rotate(&state, "other", "d").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn grace_retry_outlives_old_tokens_own_expiry() {
+        let state = fresh_state().await;
+        state.insert_refresh_token("r1".into(), refresh("c", "a1")).await;
+        let first = rotate(&state, "r1", "c").await.unwrap();
+
+        // The old token's own 30-day window ran out right after the rotation;
+        // within the grace window that must not matter.
+        state.refresh_tokens.lock().await.get_mut("r1").unwrap().expires_at = Instant::now();
+        assert_eq!(rotate(&state, "r1", "c").await, Some(first));
+    }
+
+    #[tokio::test]
+    async fn superseded_past_grace_is_invalid_and_swept() {
+        let state = fresh_state().await;
+        state.insert_refresh_token("r1".into(), refresh("c", "a1")).await;
+        state.insert_refresh_token("s1".into(), refresh("c", "b1")).await;
+        let (_, r2) = rotate(&state, "r1", "c").await.unwrap();
+        let (_, s2) = rotate(&state, "s1", "c").await.unwrap();
+
+        // Within grace the sweep keeps the superseded records.
+        assert_eq!(state.sweep_expired().await.refresh_tokens, 0);
+
+        // Backdate both rotations past the grace window. (None only on a
+        // host whose monotonic clock started less than 30 s ago.)
+        let Some(past) = Instant::now().checked_sub(REFRESH_GRACE_PERIOD) else { return };
+        for t in ["r1", "s1"] {
+            state.refresh_tokens.lock().await.get_mut(t).unwrap().superseded.as_mut().unwrap().0 = past;
+        }
+        assert!(matches!(
+            state.rotate_refresh_token("s1", "c").await,
+            RefreshOutcome::Invalid("refresh token has been superseded")
+        ));
+        assert_eq!(state.sweep_expired().await.refresh_tokens, 1);
+        assert!(!state.refresh_tokens.lock().await.contains_key("r1"));
+        // The successor chains are untouched.
+        assert!(rotate(&state, &r2, "c").await.is_some());
+        assert!(rotate(&state, &s2, "c").await.is_some());
     }
 
     #[tokio::test]

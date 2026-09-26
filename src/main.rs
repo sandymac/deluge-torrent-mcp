@@ -552,7 +552,7 @@ async fn main() -> anyhow::Result<()> {
             info!("Listening on http://{}/mcp", cli.http_bind);
 
             let signal_oauth_state = shutdown_oauth_state.clone();
-            axum::serve(listener, app)
+            let served = axum::serve(listener, app)
                 .with_graceful_shutdown(async move {
                     shutdown_signal().await;
                     info!("Shutting down HTTP server");
@@ -562,11 +562,13 @@ async fn main() -> anyhow::Result<()> {
                         final_flush(state).await;
                     }
                 })
-                .await?;
-            // Drain finished: capture any refresh that happened during it.
+                .await;
+            // Drain finished (or failed): capture any refresh that happened
+            // during it before the error, if any, takes the runtime down.
             if let Some(state) = &shutdown_oauth_state {
                 final_flush(state).await;
             }
+            served?;
         }
     }
 

@@ -497,6 +497,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn legacy_file_without_family_cap_loads_with_full_window() {
+        let path = temp_state_path("legacy");
+        let expires = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() + 3600;
+        // Shape written by 0.9.x: no family_expires_at_unix; a superseded
+        // record carries only superseded_at_unix.
+        let json = format!(
+            r#"{{"version":1,"refresh_tokens":{{
+                "r-live":{{"client_id":"c","scope":"mcp","access_token":"a","expires_at_unix":{expires}}},
+                "r-used":{{"client_id":"c","scope":"mcp","access_token":"a","expires_at_unix":{expires},"superseded_at_unix":{expires}}}
+            }}}}"#
+        );
+        tokio::fs::write(&path, json).await.unwrap();
+
+        let state = OAuthState::new_with_persistence(
+            "http://localhost:8080".into(),
+            None,
+            Some(path.clone()),
+        )
+        .await
+        .unwrap();
+
+        let live = state.get_refresh_info("r-live").await.expect("pre-0.10 record loads");
+        assert!(abs_diff(live.family_expires_at, Instant::now() + REFRESH_ABSOLUTE_TTL) < Duration::from_secs(2));
+        assert!(state.get_refresh_info("r-used").await.is_none(), "superseded record is skipped");
+
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
     async fn missing_file_loads_as_empty() {
         let path = temp_state_path("missing");
         let _ = tokio::fs::remove_file(&path).await;
