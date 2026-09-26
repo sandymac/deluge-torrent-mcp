@@ -16,8 +16,8 @@ use tracing::{debug, trace, warn};
 
 use super::middleware::extract_client_ip;
 use super::state::{
-    OAuthState, RefreshInfo, TokenInfo,
-    ACCESS_TOKEN_TTL, REFRESH_GRACE_PERIOD, REFRESH_TOKEN_TTL,
+    OAuthState, RefreshInfo, RefreshOutcome, TokenInfo,
+    ACCESS_TOKEN_TTL, REFRESH_ABSOLUTE_TTL, REFRESH_TOKEN_TTL,
     generate_random_hex,
 };
 
@@ -178,7 +178,9 @@ async fn handle_authorization_code(state: &OAuthState, ip: &str, req: TokenReque
         return oauth_error(StatusCode::BAD_REQUEST, "invalid_grant", "client has been revoked");
     }
 
-    // Issue tokens
+    // Issue tokens. This grant starts a refresh-token family: the absolute
+    // cap set here is inherited by every rotation.
+    let now = Instant::now();
     let access_token = generate_random_hex(32);
     let refresh_token = generate_random_hex(32);
 
@@ -188,7 +190,7 @@ async fn handle_authorization_code(state: &OAuthState, ip: &str, req: TokenReque
             TokenInfo {
                 client_id: client_id.clone(),
                 scope: code_info.scope.clone(),
-                expires_at: Instant::now() + ACCESS_TOKEN_TTL,
+                expires_at: now + ACCESS_TOKEN_TTL,
             },
         )
         .await;
@@ -200,8 +202,9 @@ async fn handle_authorization_code(state: &OAuthState, ip: &str, req: TokenReque
                 client_id: client_id.clone(),
                 scope: code_info.scope.clone(),
                 access_token: access_token.clone(),
-                expires_at: Instant::now() + REFRESH_TOKEN_TTL,
-                superseded_at: None,
+                expires_at: now + REFRESH_TOKEN_TTL,
+                family_expires_at: now + REFRESH_ABSOLUTE_TTL,
+                superseded: None,
             },
         )
         .await;
@@ -233,93 +236,39 @@ async fn handle_refresh_token(state: &OAuthState, ip: &str, req: TokenRequest) -
         }
     };
 
-    let now = Instant::now();
-
-    // Look up the refresh token
-    let refresh_info = match state.get_refresh_info(&refresh_token_str).await {
-        Some(info) => info,
-        None => {
-            debug!(ip = %ip, client_id = %client_id, "Refresh request: invalid or unknown refresh token");
-            return oauth_error(StatusCode::BAD_REQUEST, "invalid_grant", "invalid or already-used refresh token");
-        }
-    };
-
-    if refresh_info.expires_at <= now {
-        debug!(ip = %ip, client_id = %client_id, "Refresh request: refresh token expired");
-        state.remove_refresh_token(&refresh_token_str).await;
-        return oauth_error(StatusCode::BAD_REQUEST, "invalid_grant", "refresh token expired");
-    }
-
-    // Check if this token has been superseded (rotated out)
-    if let Some(superseded) = refresh_info.superseded_at {
-        if now.duration_since(superseded) >= REFRESH_GRACE_PERIOD {
-            warn!(ip = %ip, client_id = %client_id, "Refresh request: superseded token past grace period");
-            state.remove_refresh_token(&refresh_token_str).await;
-            return oauth_error(StatusCode::BAD_REQUEST, "invalid_grant", "refresh token has been superseded");
-        }
-        // Within grace period — allow reuse (network retry scenario)
-        debug!(ip = %ip, client_id = %client_id, "Refresh request: reusing superseded token within grace period");
-    }
-
-    if refresh_info.client_id != client_id {
-        warn!(ip = %ip, expected = %refresh_info.client_id, got = %client_id, "Refresh request: client_id mismatch");
-        return oauth_error(StatusCode::BAD_REQUEST, "invalid_grant", "client_id mismatch");
-    }
-
-    let old_access_token = refresh_info.access_token.clone();
-    // Always use the originally granted scope — ignore req.scope to prevent
-    // scope escalation (OAuth 2.1: refresh must not exceed original grant).
-    let scope = refresh_info.scope.clone();
-
-    // Mark old refresh token as superseded (don't delete — grace period)
-    state.mark_refresh_superseded(&refresh_token_str, now).await;
-
     // Verify client still exists in registry
     if !state.client_exists(&client_id).await {
         warn!(ip = %ip, client_id = %client_id, "Refresh request: client has been revoked");
         return oauth_error(StatusCode::BAD_REQUEST, "invalid_grant", "client has been revoked");
     }
 
-    // Revoke old access token
-    state.revoke_access_token(&old_access_token).await;
-
-    // Issue new tokens
-    let new_access = generate_random_hex(32);
-    let new_refresh = generate_random_hex(32);
-
-    state
-        .insert_access_token(
-            new_access.clone(),
-            TokenInfo {
-                client_id: client_id.clone(),
-                scope: scope.clone(),
-                expires_at: Instant::now() + ACCESS_TOKEN_TTL,
-            },
-        )
-        .await;
-
-    state
-        .insert_refresh_token(
-            new_refresh.clone(),
-            RefreshInfo {
-                client_id: client_id.clone(),
-                scope: scope.clone(),
-                access_token: new_access.clone(),
-                expires_at: Instant::now() + REFRESH_TOKEN_TTL,
-                superseded_at: None,
-            },
-        )
-        .await;
-
-    debug!(ip = %ip, client_id = %client_id, "Issued access token via refresh_token grant");
-
-    token_response(TokenResponse {
-        access_token: new_access,
-        token_type: "Bearer",
-        expires_in: ACCESS_TOKEN_TTL.as_secs(),
-        refresh_token: Some(new_refresh),
-        scope,
-    })
+    // Rotation, grace-period retry, and reuse detection all happen under the
+    // refresh-token lock in `rotate_refresh_token`; req.scope is ignored there
+    // (the original grant's scope is carried over) to prevent escalation.
+    match state.rotate_refresh_token(&refresh_token_str, &client_id).await {
+        RefreshOutcome::Issued { access_token, refresh_token, scope } => {
+            debug!(ip = %ip, client_id = %client_id, "Issued access token via refresh_token grant");
+            token_response(TokenResponse {
+                access_token,
+                token_type: "Bearer",
+                expires_in: ACCESS_TOKEN_TTL.as_secs(),
+                refresh_token: Some(refresh_token),
+                scope,
+            })
+        }
+        RefreshOutcome::Invalid(reason) => {
+            debug!(ip = %ip, client_id = %client_id, reason, "Refresh request rejected");
+            oauth_error(StatusCode::BAD_REQUEST, "invalid_grant", reason)
+        }
+        RefreshOutcome::ClientMismatch { expected } => {
+            warn!(ip = %ip, expected = %expected, got = %client_id, "Refresh request: client_id mismatch");
+            oauth_error(StatusCode::BAD_REQUEST, "invalid_grant", "client_id mismatch")
+        }
+        RefreshOutcome::Replay => {
+            warn!(ip = %ip, client_id = %client_id, "Refresh request: refresh token reuse detected; revoked all tokens for client");
+            oauth_error(StatusCode::BAD_REQUEST, "invalid_grant", "refresh token reuse detected; all tokens for this client have been revoked")
+        }
+    }
 }
 
 #[cfg(test)]
