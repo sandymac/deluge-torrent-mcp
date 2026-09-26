@@ -551,27 +551,57 @@ async fn main() -> anyhow::Result<()> {
             let listener = tokio::net::TcpListener::bind(&cli.http_bind).await?;
             info!("Listening on http://{}/mcp", cli.http_bind);
 
-            axum::serve(listener, app)
+            let signal_oauth_state = shutdown_oauth_state.clone();
+            let served = axum::serve(listener, app)
                 .with_graceful_shutdown(async move {
-                    tokio::signal::ctrl_c()
-                        .await
-                        .expect("failed to listen for ctrl-c");
+                    shutdown_signal().await;
                     info!("Shutting down HTTP server");
-                    if let Some(state) = shutdown_oauth_state {
-                        if state.has_persist_path() {
-                            if let Err(e) = state.flush().await {
-                                warn!(error = %e, "Final OAuth state flush failed");
-                            } else {
-                                info!("Flushed OAuth state to disk");
-                            }
-                        }
+                    // Flush now, in case the connection drain below outlives
+                    // the supervisor's kill timeout (open SSE streams can).
+                    if let Some(state) = &signal_oauth_state {
+                        final_flush(state).await;
                     }
                 })
-                .await?;
+                .await;
+            // Drain finished (or failed): capture any refresh that happened
+            // during it before the error, if any, takes the runtime down.
+            if let Some(state) = &shutdown_oauth_state {
+                final_flush(state).await;
+            }
+            served?;
         }
     }
 
     Ok(())
+}
+
+/// Write the OAuth state file if persistence is on. Called at every shutdown
+/// point so mutations since the last 2 s flush are not lost.
+async fn final_flush(state: &oauth::OAuthState) {
+    if !state.has_persist_path() {
+        return;
+    }
+    match state.flush().await {
+        Ok(()) => info!("Flushed OAuth state to disk"),
+        Err(e) => warn!(error = %e, "Final OAuth state flush failed"),
+    }
+}
+
+/// Resolve on Ctrl-C, or on SIGTERM (what systemd / `docker stop` send) on
+/// Unix, so the final state flush runs on every ordinary restart.
+async fn shutdown_signal() {
+    let ctrl_c = tokio::signal::ctrl_c();
+    #[cfg(unix)]
+    {
+        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to listen for SIGTERM");
+        tokio::select! {
+            r = ctrl_c => r.expect("failed to listen for ctrl-c"),
+            _ = term.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    ctrl_c.await.expect("failed to listen for ctrl-c");
 }
 
 /// Axum middleware for the `/mcp` routes: parse the `/mcp/<format>?<params>` path+query into a

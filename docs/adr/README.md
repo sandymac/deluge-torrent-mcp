@@ -10,3 +10,4 @@
 * [10. Authenticate HTTP clients with OAuth 2.1](0010-authenticate-http-clients-with-oauth-2-1.md)
 * [11. Organize the server as layered modules](0011-organize-the-server-as-layered-modules.md)
 * [12. Resolve response-shaping config per request, not per session](0012-resolve-response-shaping-config-per-request-not-per-session.md)
+* [13. Rotate refresh tokens with sliding expiry, a family cap, and reuse detection](0013-rotate-refresh-tokens-with-sliding-expiry-family-cap-and-reuse-detection.md)

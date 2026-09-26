@@ -6,9 +6,10 @@
 //! is not persisted — those flows simply restart after a server restart.
 //!
 //! Writes are debounced: mutations set a dirty flag on `OAuthState`, and a
-//! background task flushes every `FLUSH_INTERVAL` if dirty. File writes are
-//! atomic via `tmp` + `rename`. On Unix, the file is chmod'd to 0600 before
-//! rename because it contains bearer tokens.
+//! background task flushes every `FLUSH_INTERVAL` if dirty. Saves are
+//! serialised behind `OAuthState::save_lock` so that task and a shutdown flush
+//! never interleave. File writes are atomic via `tmp` + `rename`. On Unix, the
+//! file is chmod'd to 0600 before rename because it contains bearer tokens.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -18,7 +19,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
-use super::state::{ClientInfo, OAuthState, REFRESH_GRACE_PERIOD, RefreshInfo, TokenInfo, UNAUTHED_CLIENT_TTL};
+use super::state::{ClientInfo, OAuthState, REFRESH_ABSOLUTE_TTL, RefreshInfo, TokenInfo, UNAUTHED_CLIENT_TTL};
 
 /// Schema version for the on-disk format. Bump when the JSON shape changes.
 pub(crate) const SCHEMA_VERSION: u32 = 1;
@@ -65,8 +66,13 @@ pub(crate) struct PersistedRefresh {
     pub(crate) scope: String,
     pub(crate) access_token: String,
     pub(crate) expires_at_unix: u64,
+    /// A superseded record's grace-period replacement pair is not persisted,
+    /// so any record with this set is skipped on load.
     #[serde(default)]
     pub(crate) superseded_at_unix: Option<u64>,
+    /// Absent in files written before the family cap existed.
+    #[serde(default)]
+    pub(crate) family_expires_at_unix: Option<u64>,
 }
 
 impl PersistedState {
@@ -129,8 +135,10 @@ impl PersistedState {
                         access_token: v.access_token.clone(),
                         expires_at_unix: instant_to_unix(v.expires_at, now_i, now_s),
                         superseded_at_unix: v
-                            .superseded_at
-                            .map(|i| instant_to_unix(i, now_i, now_s)),
+                            .superseded
+                            .as_ref()
+                            .map(|(i, _, _)| instant_to_unix(*i, now_i, now_s)),
+                        family_expires_at_unix: Some(instant_to_unix(v.family_expires_at, now_i, now_s)),
                     },
                 )
             })
@@ -207,19 +215,11 @@ impl PersistedState {
                 continue;
             }
 
-            // For superseded refresh tokens, the grace window is only 30 s —
-            // if restart took longer than that, drop the token outright.
-            let superseded_at = match pr.superseded_at_unix {
-                None => None,
-                Some(ts) => {
-                    let saved = UNIX_EPOCH + Duration::from_secs(ts);
-                    let since = now_s.duration_since(saved).unwrap_or(Duration::ZERO);
-                    if since >= REFRESH_GRACE_PERIOD {
-                        continue;
-                    }
-                    Some(now_i.checked_sub(since).unwrap_or(now_i))
-                }
-            };
+            // A superseded token is only useful as a grace-period retry, and
+            // its replacement pair isn't persisted — drop it across restarts.
+            if pr.superseded_at_unix.is_some() {
+                continue;
+            }
 
             refresh_tokens.insert(
                 tok,
@@ -228,7 +228,12 @@ impl PersistedState {
                     scope: pr.scope,
                     access_token: pr.access_token,
                     expires_at,
-                    superseded_at,
+                    // Records written before the cap existed get a full window.
+                    family_expires_at: pr
+                        .family_expires_at_unix
+                        .and_then(|ts| unix_to_instant(ts, now_i, now_s))
+                        .unwrap_or(now_i + REFRESH_ABSOLUTE_TTL),
+                    superseded: None,
                 },
             );
         }
@@ -359,7 +364,11 @@ pub(crate) fn spawn_persistence(state: Arc<OAuthState>) {
 mod tests {
     use super::*;
     use crate::oauth::OAuthState;
-    use crate::oauth::state::{ClientInfo, RefreshInfo};
+    use crate::oauth::state::{ClientInfo, RefreshInfo, RefreshOutcome};
+
+    fn abs_diff(a: Instant, b: Instant) -> Duration {
+        if a > b { a - b } else { b - a }
+    }
 
     fn temp_state_path(tag: &str) -> PathBuf {
         let ts = SystemTime::now()
@@ -408,8 +417,18 @@ mod tests {
         let path = temp_state_path("roundtrip");
         let _ = tokio::fs::remove_file(&path).await;
 
+        let family = Instant::now() + Duration::from_secs(7200);
+        let refresh_info = |access_token: &str| RefreshInfo {
+            client_id: "client-abc".into(),
+            scope: "mcp".into(),
+            access_token: access_token.into(),
+            expires_at: Instant::now() + Duration::from_secs(3600),
+            family_expires_at: family,
+            superseded: None,
+        };
+
         // Seed first instance.
-        {
+        let successor = {
             let state = OAuthState::new_with_persistence(
                 "http://localhost:8080".into(),
                 None,
@@ -431,21 +450,20 @@ mod tests {
                 )
                 .await;
 
-            state
-                .insert_refresh_token(
-                    "refresh-xyz".into(),
-                    RefreshInfo {
-                        client_id: "client-abc".into(),
-                        scope: "mcp".into(),
-                        access_token: "access-123".into(),
-                        expires_at: Instant::now() + Duration::from_secs(3600),
-                        superseded_at: None,
-                    },
-                )
-                .await;
+            state.insert_refresh_token("refresh-xyz".into(), refresh_info("access-123")).await;
+
+            // A rotated token: the superseded record must not survive a
+            // reload, but its successor (inheriting the family cap) must.
+            state.insert_refresh_token("refresh-old".into(), refresh_info("access-old")).await;
+            let RefreshOutcome::Issued { refresh_token: successor, .. } =
+                state.rotate_refresh_token("refresh-old", "client-abc").await
+            else {
+                panic!("rotation should succeed");
+            };
 
             state.flush().await.unwrap();
-        }
+            successor
+        };
 
         // Load a fresh instance from the same file.
         let reloaded = OAuthState::new_with_persistence(
@@ -466,7 +484,43 @@ mod tests {
         let refresh = refresh.unwrap();
         assert_eq!(refresh.client_id, "client-abc");
         assert_eq!(refresh.access_token, "access-123");
-        assert!(refresh.superseded_at.is_none());
+        assert!(abs_diff(refresh.family_expires_at, family) < Duration::from_secs(2));
+
+        assert!(
+            reloaded.get_refresh_info("refresh-old").await.is_none(),
+            "superseded token must be dropped on load"
+        );
+        let refresh = reloaded.get_refresh_info(&successor).await.expect("successor should survive reload");
+        assert!(abs_diff(refresh.family_expires_at, family) < Duration::from_secs(2));
+
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn legacy_file_without_family_cap_loads_with_full_window() {
+        let path = temp_state_path("legacy");
+        let expires = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() + 3600;
+        // Shape written by 0.9.x: no family_expires_at_unix; a superseded
+        // record carries only superseded_at_unix.
+        let json = format!(
+            r#"{{"version":1,"refresh_tokens":{{
+                "r-live":{{"client_id":"c","scope":"mcp","access_token":"a","expires_at_unix":{expires}}},
+                "r-used":{{"client_id":"c","scope":"mcp","access_token":"a","expires_at_unix":{expires},"superseded_at_unix":{expires}}}
+            }}}}"#
+        );
+        tokio::fs::write(&path, json).await.unwrap();
+
+        let state = OAuthState::new_with_persistence(
+            "http://localhost:8080".into(),
+            None,
+            Some(path.clone()),
+        )
+        .await
+        .unwrap();
+
+        let live = state.get_refresh_info("r-live").await.expect("pre-0.10 record loads");
+        assert!(abs_diff(live.family_expires_at, Instant::now() + REFRESH_ABSOLUTE_TTL) < Duration::from_secs(2));
+        assert!(state.get_refresh_info("r-used").await.is_none(), "superseded record is skipped");
 
         let _ = tokio::fs::remove_file(&path).await;
     }
