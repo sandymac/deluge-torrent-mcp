@@ -396,7 +396,12 @@ async fn main() -> anyhow::Result<()> {
                 response_config.clone(),
             );
             server.spawn_plugin_watcher();
-            let service = server.serve(rmcp::transport::stdio()).await?;
+            // rmcp caps a stdio line at 16 MiB by default; raise it to match the largest
+            // input add_torrent accepts (a 32 MiB base64 .torrent) while staying bounded.
+            let (stdin, stdout) = rmcp::transport::stdio();
+            let transport = rmcp::transport::async_rw::AsyncRwTransport::new_server(stdin, stdout)
+                .with_max_line_length(tools::MAX_MCP_MESSAGE_BYTES);
+            let service = server.serve(transport).await?;
             service.waiting().await?;
         }
 
@@ -430,8 +435,14 @@ async fn main() -> anyhow::Result<()> {
             let allowed_hosts =
                 build_allowed_hosts(&cli.http_bind, &cli.oauth_issuer, &cli.allowed_host);
             info!(allowed_hosts = %allowed_hosts.join(", "), "HTTP Host allow-list");
-            let http_config =
-                StreamableHttpServerConfig::default().with_allowed_hosts(allowed_hosts);
+            let http_config = StreamableHttpServerConfig::default()
+                .with_allowed_hosts(allowed_hosts)
+                // Explicit: peer tracking, resource subscriptions and the per-session
+                // plugin watcher all depend on long-lived sessions. (rmcp 3.x default,
+                // and moot for 2026-07-28 since we cap negotiation at 2025-11-25.)
+                .with_legacy_session_mode(true)
+                // rmcp's 4 MiB default would reject large base64 .torrent uploads.
+                .with_max_request_body_bytes(tools::MAX_MCP_MESSAGE_BYTES);
 
             // Build the MCP service — factory creates a DelugeServer per session.
             // Each session spawns its own plugin watcher so it gets independent

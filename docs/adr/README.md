@@ -11,3 +11,4 @@
 * [11. Organize the server as layered modules](0011-organize-the-server-as-layered-modules.md)
 * [12. Resolve response-shaping config per request, not per session](0012-resolve-response-shaping-config-per-request-not-per-session.md)
 * [13. Rotate refresh tokens with sliding expiry, a family cap, and reuse detection](0013-rotate-refresh-tokens-with-sliding-expiry-family-cap-and-reuse-detection.md)
+* [14. Cap MCP protocol negotiation at 2025-11-25](0014-cap-mcp-protocol-negotiation-at-2025-11-25.md)

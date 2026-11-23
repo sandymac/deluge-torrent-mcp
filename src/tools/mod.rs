@@ -10,12 +10,12 @@ use rmcp::{
     handler::server::router::tool::ToolRouter,
     handler::server::tool::ToolCallContext,
     model::{
-        CallToolRequestParams, CallToolResult, Icon, Implementation, InitializeRequestParams,
+        CallToolRequestParams, CallToolResponse, Icon, Implementation, InitializeRequestParams,
         InitializeResult, ListResourcesResult, ListResourceTemplatesResult, ListToolsResult,
-        PaginatedRequestParams, RawResource, RawResourceTemplate, ReadResourceRequestParams,
+        PaginatedRequestParams, ProtocolVersion, ReadResourceRequestParams, ReadResourceResponse,
         ReadResourceResult, Resource, ResourceContents, ResourceTemplate,
-        ResourceUpdatedNotificationParam, ServerInfo, SetLevelRequestParams,
-        SubscribeRequestParams, Tool, UnsubscribeRequestParams,
+        ResourceUpdatedNotificationParam, ServerConfig, SubscribeRequestParams, Tool,
+        UnsubscribeRequestParams,
     },
     serde_json,
     service::RequestContext,
@@ -44,6 +44,24 @@ mod values;
 use gate::ToolGate;
 use params::*;
 use plugin_watcher::{apply_label_state, event_to_resource_uris};
+
+/// Largest base64 `.torrent` payload `add_torrent` accepts per source (32 MiB).
+pub(crate) const MAX_BASE64_TORRENT_BYTES: usize = 32 * 1024 * 1024;
+
+/// Largest single MCP message either transport accepts: one maximal base64 torrent
+/// plus 1 MiB headroom for the JSON-RPC envelope and other arguments. Applied as
+/// rmcp's HTTP `max_request_body_bytes` (default 4 MiB) and stdio `max_line_length`
+/// (default 16 MiB) so neither transport rejects an input `add_torrent` would accept,
+/// while still bounding memory per message.
+pub(crate) const MAX_MCP_MESSAGE_BYTES: usize = MAX_BASE64_TORRENT_BYTES + 1024 * 1024;
+const _: () = assert!(MAX_MCP_MESSAGE_BYTES > MAX_BASE64_TORRENT_BYTES);
+
+/// Protocol versions this server negotiates — everything up to and including the last
+/// revision with an `initialize` handshake. See `ServerHandler::supported_protocol_versions`
+/// on [`DelugeServer`] and ADR-0014.
+fn supported_protocol_versions() -> &'static [ProtocolVersion] {
+    ProtocolVersion::known_up_to(&ProtocolVersion::LATEST_WITH_INITIALIZE)
+}
 
 /// Flatten validated info hashes into the `Vec<String>` the [`DelugeApi`] bulk
 /// methods accept.
@@ -250,8 +268,7 @@ impl DelugeServer {
             // which Deluge decodes via add_torrent_file. Deluge has no RPC that
             // reads a server-side path, so a path is not an accepted source.
             // Size guard BEFORE base64 decode to prevent oversized allocation.
-            const MAX_BASE64_BYTES: usize = 32 * 1024 * 1024; // 32 MB
-            if source.len() > MAX_BASE64_BYTES {
+            if source.len() > MAX_BASE64_TORRENT_BYTES {
                 return Err(format!(
                     "base64 content is {} bytes, exceeding the 32 MB limit. \
                      .torrent files are typically under 1 MB — this input is likely incorrect.",
@@ -357,7 +374,7 @@ impl DelugeServer {
 // ---------------------------------------------------------------------------
 
 impl ServerHandler for DelugeServer {
-    fn get_info(&self) -> ServerInfo {
+    fn get_info(&self) -> ServerConfig {
         let icons = vec![
             Icon::new(format!("data:image/svg+xml;base64,{}", BASE64.encode(ICON_SVG)))
                 .with_mime_type("image/svg+xml")
@@ -369,15 +386,18 @@ impl ServerHandler for DelugeServer {
                 .with_mime_type("image/png")
                 .with_sizes(vec!["96x96".to_string()]),
         ];
-        ServerInfo::new(
-            rmcp::model::ServerCapabilities::builder()
+        // `enable_logging` is deprecated by SEP-2577 (2026-07-28), but this server caps
+        // negotiation at 2025-11-25 (see `supported_protocol_versions`), where clients may
+        // still send `logging/setLevel`.
+        #[allow(deprecated)]
+        let capabilities = rmcp::model::ServerCapabilities::builder()
                 .enable_tools()
                 .enable_tool_list_changed()
                 .enable_resources()
                 .enable_resources_subscribe()
                 .enable_logging()
-                .build(),
-        )
+                .build();
+        ServerConfig::new(capabilities)
             .with_server_info(
                 Implementation::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
                     .with_icons(icons),
@@ -390,11 +410,21 @@ impl ServerHandler for DelugeServer {
         context: RequestContext<RoleServer>,
     ) -> Result<InitializeResult, ErrorData> {
         if context.peer.peer_info().is_none() {
-            context.peer.set_peer_info(request);
+            context.peer.set_peer_info(request.clone());
         }
         // Track this peer so the plugin watcher can deliver tools/list_changed.
         self.connected_peers.write().await.push(context.peer.clone());
-        Ok(self.get_info())
+        self.negotiate_initialize(&request)
+    }
+
+    /// Cap negotiation at 2025-11-25, the last revision with an `initialize` handshake.
+    ///
+    /// 2026-07-28 clients are served statelessly via `server/discover` and never call
+    /// `initialize`, so peer tracking (`connected_peers` → `tools/list_changed`), resource
+    /// subscriptions, and the per-session plugin watcher would silently stop working for
+    /// them. Raise this ceiling only after those move onto SEP-2575 listen streams.
+    fn supported_protocol_versions(&self) -> std::borrow::Cow<'static, [ProtocolVersion]> {
+        std::borrow::Cow::Borrowed(supported_protocol_versions())
     }
 
     async fn list_tools(
@@ -409,14 +439,14 @@ impl ServerHandler for DelugeServer {
             .into_iter()
             .filter(|t| enabled.contains(t.name.as_ref()))
             .collect();
-        Ok(ListToolsResult { tools, meta: None, next_cursor: None })
+        Ok(ListToolsResult::with_all_items(tools))
     }
 
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, ErrorData> {
+    ) -> Result<CallToolResponse, ErrorData> {
         self.tool_router.call(ToolCallContext::new(self, request, context)).await
     }
 
@@ -424,9 +454,11 @@ impl ServerHandler for DelugeServer {
         self.tool_router.get(name).cloned()
     }
 
+    // Logging is deprecated by SEP-2577, but still part of the protocol versions we negotiate.
+    #[allow(deprecated)]
     async fn set_level(
         &self,
-        _request: SetLevelRequestParams,
+        _request: rmcp::model::SetLevelRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<(), ErrorData> {
         Ok(())
@@ -437,29 +469,14 @@ impl ServerHandler for DelugeServer {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListResourcesResult, ErrorData> {
-        Ok(ListResourcesResult {
-            resources: vec![Resource {
-                raw: RawResource {
-                    uri: "deluge://torrents".to_string(),
-                    name: "All Torrents".to_string(),
-                    title: Some("All Torrents".to_string()),
-                    description: Some(
-                        "Snapshot of all torrents with current status, as \
-                         {\"torrents\": {<info_hash>: {fields}}}. \
-                         Subscribe for live updates when torrents are added, removed, \
-                         or change state."
-                            .to_string(),
-                    ),
-                    mime_type: Some("application/json".to_string()),
-                    size: None,
-                    icons: None,
-                    meta: None,
-                },
-                annotations: None,
-            }],
-            meta: None,
-            next_cursor: None,
-        })
+        Ok(ListResourcesResult::with_all_items(vec![
+            Resource::new("deluge://torrents", "All Torrents")
+                .with_title("All Torrents")
+                .with_description(
+                    "Snapshot of all torrents with current status, as                      {\"torrents\": {<info_hash>: {fields}}}.                      Subscribe for live updates when torrents are added, removed,                      or change state.",
+                )
+                .with_mime_type("application/json"),
+        ]))
     }
 
     async fn list_resource_templates(
@@ -467,33 +484,21 @@ impl ServerHandler for DelugeServer {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListResourceTemplatesResult, ErrorData> {
-        Ok(ListResourceTemplatesResult {
-            resource_templates: vec![ResourceTemplate {
-                raw: RawResourceTemplate {
-                    uri_template: "deluge://torrent/{info_hash}".to_string(),
-                    name: "Torrent Status".to_string(),
-                    title: Some("Torrent Status".to_string()),
-                    description: Some(
-                        "Complete status and metadata for a single torrent. \
-                         Subscribe for live updates on state changes, file renames, \
-                         and storage moves."
-                            .to_string(),
-                    ),
-                    mime_type: Some("application/json".to_string()),
-                    icons: None,
-                },
-                annotations: None,
-            }],
-            meta: None,
-            next_cursor: None,
-        })
+        Ok(ListResourceTemplatesResult::with_all_items(vec![
+            ResourceTemplate::new("deluge://torrent/{info_hash}", "Torrent Status")
+                .with_title("Torrent Status")
+                .with_description(
+                    "Complete status and metadata for a single torrent.                      Subscribe for live updates on state changes, file renames,                      and storage moves.",
+                )
+                .with_mime_type("application/json"),
+        ]))
     }
 
     async fn read_resource(
         &self,
         request: ReadResourceRequestParams,
         context: RequestContext<RoleServer>,
-    ) -> Result<ReadResourceResult, ErrorData> {
+    ) -> Result<ReadResourceResponse, ErrorData> {
         let uri = &request.uri;
 
         if uri == "deluge://torrents" {
@@ -527,7 +532,8 @@ impl ServerHandler for DelugeServer {
                     text,
                     meta: None,
                 },
-            ]))
+            ])
+            .into())
         } else if let Some(hash) = uri.strip_prefix("deluge://torrent/") {
             if let Err(e) = Self::validate_info_hash(hash) {
                 return Err(ErrorData::invalid_params(e, None));
@@ -546,7 +552,8 @@ impl ServerHandler for DelugeServer {
                     text,
                     meta: None,
                 },
-            ]))
+            ])
+            .into())
         } else {
             Err(ErrorData::resource_not_found(
                 format!("Unknown resource URI: {uri}"),
@@ -667,5 +674,15 @@ mod tests {
             registry, registered,
             "registry::TOOLS and the #[tool_router] tool set must match exactly"
         );
+    }
+
+    #[test]
+    fn protocol_negotiation_is_capped_at_last_initialize_revision() {
+        let versions = super::supported_protocol_versions();
+        assert!(versions.contains(&ProtocolVersion::V_2025_11_25));
+        assert!(versions.contains(&ProtocolVersion::V_2024_11_05));
+        // 2026-07-28 drops `initialize` and sessions, which peer tracking, resource
+        // subscriptions and the plugin watcher depend on. See ADR-0014.
+        assert!(!versions.contains(&ProtocolVersion::V_2026_07_28));
     }
 }
