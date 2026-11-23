@@ -210,7 +210,12 @@ impl OAuthState {
         }
         let _serialised = self.save_lock.lock().await;
         self.dirty.store(false, Ordering::Relaxed);
-        self.flush_inner().await
+        // Re-set dirty on failure so a later flush (e.g. the post-drain one) retries.
+        if let Err(e) = self.flush_inner().await {
+            self.dirty.store(true, Ordering::Relaxed);
+            return Err(e);
+        }
+        Ok(())
     }
 
     /// Flush only if the dirty flag is set. Clears the flag *before* writing so

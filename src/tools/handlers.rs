@@ -43,6 +43,25 @@ impl DelugeServer {
         if p.torrent_sources.is_empty() {
             return Err("torrent_sources must not be empty.".to_string());
         }
+        // Bound per-call work and response size: each source yields its own result
+        // object, so tiny/empty sources could otherwise inflate the response far beyond
+        // the request. Mirrors the schema's maxItems, which clients may not enforce.
+        if p.torrent_sources.len() > super::MAX_TORRENT_SOURCES {
+            return Err(format!(
+                "torrent_sources has {} entries; at most {} are accepted per call.",
+                p.torrent_sources.len(),
+                super::MAX_TORRENT_SOURCES
+            ));
+        }
+        // Per-call cap so anything accepted here also fits in one transport message
+        // (see MAX_MCP_MESSAGE_BYTES).
+        let total: usize = p.torrent_sources.iter().map(String::len).sum();
+        if total > super::MAX_BASE64_TORRENT_BYTES {
+            return Err(format!(
+                "torrent_sources total {total} bytes, exceeding the 32 MiB per-call limit. \
+                 Split large .torrent uploads across separate calls."
+            ));
+        }
         if p.torrent_sources.len() == 1 {
             return self.add_single_torrent(&p.torrent_sources[0]).await;
         }
@@ -65,6 +84,8 @@ impl DelugeServer {
         context: RequestContext<RoleServer>,
     ) -> Result<String, String> {
         self.gate.check("deluge_remove_torrent")?;
+        // Size check first: don't validate up to ~750k hashes only to reject the batch.
+        Self::check_per_hash_batch(&p.info_hashes)?;
         Self::validate_info_hashes(&p.info_hashes)?;
         let hashes = p.info_hashes;
         let status_word = if p.delete_data { "deleted" } else { "ok" };
@@ -108,7 +129,8 @@ impl DelugeServer {
         Parameters(p): Parameters<ListTorrentsParams>,
         context: RequestContext<RoleServer>,
     ) -> Result<String, String> {
-        let limit = p.limit.unwrap_or(100).max(1);
+        // limit 0 is a count-only request: honoured as-is, never clamped up to 1.
+        let limit = p.limit.unwrap_or(100);
         let offset = p.offset.unwrap_or(0);
         let sort_by = p.sort_by.unwrap_or(SortField::Name);
         let sort_order = p.sort_order.unwrap_or(SortOrder::Asc);
@@ -202,18 +224,7 @@ impl DelugeServer {
         Self::sort_torrent_pairs(&mut pairs, sort_by, sort_order);
 
         let page: Vec<_> = pairs.into_iter().skip(offset).take(limit).collect();
-        let returned = page.len();
-        let has_more = offset + returned < total;
-
-        let mut out = serde_json::Map::new();
-        out.insert("total".into(), serde_json::json!(total));
-        out.insert("returned".into(), serde_json::json!(returned));
-        out.insert("offset".into(), serde_json::json!(offset));
-        out.insert("limit".into(), serde_json::json!(limit));
-        out.insert("has_more".into(), serde_json::json!(has_more));
-        if has_more {
-            out.insert("next_offset".into(), serde_json::json!(offset + returned));
-        }
+        let mut out = Self::page_summary(total, offset, page.len(), limit);
 
         let mut torrents = serde_json::Map::new();
         for (k, mut v) in page {
@@ -500,6 +511,8 @@ impl DelugeServer {
         context: RequestContext<RoleServer>,
     ) -> Result<String, String> {
         self.gate.check("deluge_set_torrent_label")?;
+        // Size check first: don't validate up to ~750k hashes only to reject the batch.
+        Self::check_per_hash_batch(&p.info_hashes)?;
         Self::validate_info_hashes(&p.info_hashes)?;
         let label = Self::normalize_label_for_set(&p.label)?;
 

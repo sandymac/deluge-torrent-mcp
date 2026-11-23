@@ -1,6 +1,6 @@
 [package]
 name = "deluge-torrent-mcp"
-version = "0.10.0"
+version = "0.11.0"
 edition = "2021"
 license = "MIT"
 authors = ["Sandy McArthur, Jr."]
@@ -10,20 +10,23 @@ name = "deluge-torrent-mcp"
 path = "src/main.rs"
 
 [dependencies]
-rmcp = { version = "1.7.0", features = ["server", "transport-io", "transport-streamable-http-server", "schemars"] }
+rmcp = { version = "3.11.0", features = ["server", "transport-io", "transport-streamable-http-server", "schemars"] }
 tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
 native-tls = "0.2"
 tokio-native-tls = "0.3"
 bytes = "1"
 flate2 = "1"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-base64 = "0.22"
+# preserve_order: JSON objects keep insertion order. list_torrents emits its sorted page as an
+# object keyed by info_hash; without this, keys re-sort alphabetically and the sort is lost.
+serde_json = { version = "1", features = ["preserve_order"] }
+base64 = "0.23"
 bendy = "0.6"
 anyhow = "1"
-sha2 = "0.10"
+sha2 = "0.11"
 axum = "0.8"
-tower-http = { version = "0.6", features = ["cors", "trace"] }
+tower-http = { version = "0.7", features = ["cors", "trace"] }
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

@@ -14,7 +14,7 @@ use serde::Deserialize;
 #[derive(Deserialize, schemars::JsonSchema)]
 pub(super) struct AddTorrentParams {
     /// Torrent sources to add. Each entry is auto-detected: magnet: URIs, http/https URLs, or base64-encoded .torrent file content.
-    #[schemars(length(min = 1))]
+    #[schemars(length(min = 1, max = 100))]
     pub(super) torrent_sources: Vec<String>,
 }
 
@@ -35,7 +35,7 @@ pub(super) struct TorrentIdParams {
 #[derive(Deserialize, schemars::JsonSchema)]
 pub(super) struct RemoveTorrentParams {
     /// Torrent info_hashes to remove.
-    #[schemars(length(min = 1))]
+    #[schemars(length(min = 1, max = 1000))]
     pub(super) info_hashes: Vec<InfoHash>,
     /// If true, permanently deletes all downloaded files from disk — this is irreversible. If false (default), removes the torrent from Deluge but leaves files on disk. Always confirm with the user before setting to true.
     #[serde(default)]
@@ -156,7 +156,7 @@ pub(super) struct ListTorrentsParams {
     pub(super) sort_by: Option<SortField>,
     /// Sort direction (default: asc).
     pub(super) sort_order: Option<SortOrder>,
-    /// Max torrents per page (default: 100).
+    /// Max torrents per page (default: 100). 0 returns only the counts, no torrents.
     pub(super) limit: Option<usize>,
     /// Torrents to skip (default: 0). Use next_offset from previous response to paginate.
     pub(super) offset: Option<usize>,
@@ -179,7 +179,7 @@ pub(super) struct LabelNameParams {
 #[derive(Deserialize, schemars::JsonSchema)]
 pub(super) struct SetTorrentLabelParams {
     /// Torrent info_hashes to apply the label to.
-    #[schemars(length(min = 1))]
+    #[schemars(length(min = 1, max = 1000))]
     pub(super) info_hashes: Vec<InfoHash>,
     /// Label to assign. Pass an empty string or "No Label" to clear the torrent's label.
     /// Otherwise must already exist on the daemon — use deluge_create_label first if it does not.

@@ -34,7 +34,9 @@ pub(crate) use middleware::oauth_auth_middleware;
 pub(crate) use persist::spawn_persistence;
 pub(crate) use state::OAuthState;
 
-/// Build a Router containing all OAuth 2.1 endpoints.
+/// Build a Router containing the OAuth 2.1 endpoints a client calls programmatically:
+/// discovery, dynamic registration, and token. A browser-based client must `fetch()`
+/// these, so they may sit behind the origin-scoped CORS layer.
 ///
 /// These routes are unauthenticated — they must NOT be behind the MCP auth middleware.
 pub(crate) fn oauth_routes(state: Arc<OAuthState>) -> Router {
@@ -48,10 +50,65 @@ pub(crate) fn oauth_routes(state: Arc<OAuthState>) -> Router {
             get(discovery::authorization_server_metadata),
         )
         .route("/register", post(registration::handle_register))
+        .route("/token", post(token::handle_token))
+        .with_state(state)
+}
+
+/// Build a Router for the consent endpoint (`/authorize`, GET and POST).
+///
+/// Must NEVER get CORS: the consent page embeds the nonce that approves the request, so
+/// a cross-origin read would let a script approve without the user seeing the page. The
+/// authorization endpoint is reached by top-level navigation, which needs no CORS.
+pub(crate) fn oauth_authorize_routes(state: Arc<OAuthState>) -> Router {
+    Router::new()
         .route(
             "/authorize",
             get(authorize::handle_authorize_get).post(authorize::handle_authorize_post),
         )
-        .route("/token", post(token::handle_token))
         .with_state(state)
+        .layer(axum::middleware::map_response(consent_page_headers))
+}
+
+/// Anti-clickjacking and no-cache headers for every `/authorize` response. Without
+/// them another site could frame the consent page (which carries the approval nonce)
+/// and trick the user into clicking Allow; and the page must not be cached.
+async fn consent_page_headers(mut res: axum::response::Response) -> axum::response::Response {
+    use axum::http::{HeaderValue, header};
+    let h = res.headers_mut();
+    h.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    h.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static("frame-ancestors 'none'"),
+    );
+    h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    res
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use tower::ServiceExt;
+
+    use super::{OAuthState, oauth_authorize_routes};
+
+    /// Every /authorize response — even an error for a malformed request — must forbid
+    /// framing and caching, since the consent page carries the approval nonce.
+    #[tokio::test]
+    async fn authorize_responses_forbid_framing_and_caching() {
+        let state = Arc::new(
+            OAuthState::new_with_persistence("https://mcp.example".to_string(), None, None)
+                .await
+                .unwrap(),
+        );
+        let req = axum::http::Request::builder()
+            .uri("/authorize")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let res = oauth_authorize_routes(state).oneshot(req).await.unwrap();
+        let h = res.headers();
+        assert_eq!(h["x-frame-options"], "DENY");
+        assert_eq!(h["content-security-policy"], "frame-ancestors 'none'");
+        assert_eq!(h["cache-control"], "no-store");
+    }
 }

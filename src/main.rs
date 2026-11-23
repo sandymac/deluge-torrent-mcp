@@ -16,6 +16,7 @@ use tracing::{info, warn};
 mod deluge;
 mod ids;
 mod oauth;
+mod origin;
 mod rencode;
 mod response_config;
 mod tools;
@@ -99,6 +100,15 @@ struct Cli {
     /// repeated. Without it, rmcp's DNS-rebinding guard rejects proxied requests with 403.
     #[arg(long = "allowed-host", value_name = "HOST", value_delimiter = ',', action = clap::ArgAction::Append, env = "DELUGE_ALLOWED_HOST")]
     allowed_host: Vec<String>,
+
+    /// Browser origin(s) allowed to call the HTTP transport, e.g. a browser-based MCP
+    /// client such as http://localhost:6274. Format scheme://host[:port]; an omitted port
+    /// means the scheme's default, `:*` means any port; a malformed entry fails startup.
+    /// Requests carrying any other Origin header are rejected with 403, and with none
+    /// configured every browser origin is rejected. Native MCP clients send no Origin and
+    /// are unaffected. Comma-separated or repeated.
+    #[arg(long = "allowed-origin", value_name = "ORIGIN", value_delimiter = ',', action = clap::ArgAction::Append, env = "DELUGE_ALLOWED_ORIGIN")]
+    allowed_origin: Vec<String>,
 
     /// Bearer token required for HTTP transport requests (recommended). In OAuth mode this
     /// value also gates the consent screen as the operator "Access Code" — set it, or anyone
@@ -329,6 +339,10 @@ async fn main() -> anyhow::Result<()> {
         "Starting deluge-torrent-mcp"
     );
 
+    // Validate --allowed-origin before touching the network, so a typo fails fast.
+    let allowed_origins =
+        origin::AllowedOrigins::parse(&cli.allowed_origin).map_err(anyhow::Error::msg)?;
+
     let (client, auth_level) = deluge::DelugeClient::connect(
         &cli.host,
         cli.port,
@@ -353,6 +367,13 @@ async fn main() -> anyhow::Result<()> {
     }
     let plugin_gated_tools: HashSet<String> =
         registry::plugin_gated_names().map(|s| s.to_string()).collect();
+    // Process-wide tool gate + peer registry, kept live by one plugin watcher (spawned
+    // below once a transport is chosen) and shared by every session.
+    let shared = tools::SharedState::new(
+        enabled_tools.clone(),
+        plugin_gated_tools,
+        initial_label_plugin_active,
+    );
 
     if cli.test_connection {
         use crate::rencode::Value;
@@ -388,15 +409,14 @@ async fn main() -> anyhow::Result<()> {
     match cli.transport {
         Transport::Stdio => {
             info!("Starting MCP server on stdio");
-            let server = tools::DelugeServer::new(
-                api,
-                enabled_tools,
-                plugin_gated_tools,
-                initial_label_plugin_active,
-                response_config.clone(),
-            );
-            server.spawn_plugin_watcher();
-            let service = server.serve(rmcp::transport::stdio()).await?;
+            shared.spawn_plugin_watcher(api.clone());
+            let server = tools::DelugeServer::new(api, &shared, response_config.clone());
+            // rmcp caps a stdio line at 16 MiB by default; raise it to match the largest
+            // input add_torrent accepts (a 32 MiB base64 .torrent) while staying bounded.
+            let (stdin, stdout) = rmcp::transport::stdio();
+            let transport = rmcp::transport::async_rw::AsyncRwTransport::new_server(stdin, stdout)
+                .with_max_line_length(tools::MAX_MCP_MESSAGE_BYTES);
+            let service = server.serve(transport).await?;
             service.waiting().await?;
         }
 
@@ -407,10 +427,9 @@ async fn main() -> anyhow::Result<()> {
             use axum::middleware::{self, Next};
             use axum::response::Response;
             use rmcp::transport::streamable_http_server::{
-                StreamableHttpService, StreamableHttpServerConfig,
+                StreamableHttpService,
             };
             use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
-            use tower_http::cors::CorsLayer;
             use tower_http::trace::TraceLayer;
 
             if cli.api_token.is_none() && cli.oauth_issuer.is_none() {
@@ -430,35 +449,62 @@ async fn main() -> anyhow::Result<()> {
             let allowed_hosts =
                 build_allowed_hosts(&cli.http_bind, &cli.oauth_issuer, &cli.allowed_host);
             info!(allowed_hosts = %allowed_hosts.join(", "), "HTTP Host allow-list");
-            let http_config =
-                StreamableHttpServerConfig::default().with_allowed_hosts(allowed_hosts);
+            // Browser Origin policy. Host validation alone does not stop a page on another
+            // site from calling a loopback server (the Host is legitimately 127.0.0.1), so
+            // rmcp's Origin check is always on: requests carrying an Origin must match
+            // --allowed-origin, and with none configured every browser Origin is rejected.
+            // Native MCP clients send no Origin and are unaffected. Entries were validated
+            // at startup and normalized once, so rmcp's check and the CORS layer apply
+            // exactly the same policy.
+            if allowed_origins.is_empty() {
+                info!("HTTP Origin allow-list empty — browser-origin requests are rejected");
+            } else {
+                info!(
+                    allowed_origins = %allowed_origins.normalized().join(", "),
+                    "HTTP Origin allow-list"
+                );
+            }
+            // Cancelled on shutdown so open SSE streams end and the axum drain completes.
+            let mcp_cancel = tokio_util::sync::CancellationToken::new();
+            let http_config = mcp_http_config(
+                allowed_hosts,
+                allowed_origins.normalized(),
+                mcp_cancel.child_token(),
+            );
 
-            // Build the MCP service — factory creates a DelugeServer per session.
-            // Each session spawns its own plugin watcher so it gets independent
-            // tools/list_changed delivery to its own peer.
+            shared.spawn_plugin_watcher(api.clone());
+
+            // Build the MCP service — factory creates a DelugeServer per session. rmcp 3
+            // also calls it for stateless requests (inline `_meta`, `server/discover`), so
+            // it must stay side-effect free; see DelugeServer.
             let mcp_service = {
                 let api = api.clone();
-                let enabled_tools = enabled_tools.clone();
-                let plugin_gated_tools = plugin_gated_tools.clone();
+                let shared = shared.clone();
                 let response_config = response_config.clone();
                 StreamableHttpService::new(
                     move || {
-                        let server = tools::DelugeServer::new(
+                        // HTTP resolves config per-request from the middleware-inserted
+                        // extension (T9); this --response-config value is the fallback
+                        // default used when a request URL carries no per-request config.
+                        Ok(tools::DelugeServer::new(
                             api.clone(),
-                            enabled_tools.clone(),
-                            plugin_gated_tools.clone(),
-                            initial_label_plugin_active,
-                            // HTTP resolves config per-request from the middleware-inserted
-                            // extension (T9); this --response-config value is the fallback
-                            // default used when a request URL carries no per-request config.
+                            &shared,
                             response_config.clone(),
-                        );
-                        server.spawn_plugin_watcher();
-                        Ok(server)
+                        ))
                     },
                     Arc::new(LocalSessionManager::default()),
                     http_config,
                 )
+            };
+
+            // CORS only for the allowed origins (none configured = no CORS at all). rmcp's
+            // Origin check remains the enforcement point on /mcp — CORS only decides which
+            // browser pages may read responses. Applied outermost, so it also covers the
+            // auth middleware's 401s and, in OAuth mode, the OAuth endpoints a browser
+            // client must fetch (discovery, /register, /token) — never /authorize.
+            let with_cors = |router: Router| match allowed_origins.cors_layer() {
+                Some(cors) => router.layer(cors),
+                None => router,
             };
 
             let mut shutdown_oauth_state: Option<Arc<oauth::OAuthState>> = None;
@@ -487,6 +533,7 @@ async fn main() -> anyhow::Result<()> {
                 }
 
                 let oauth_router = oauth::oauth_routes(oauth_state.clone());
+                let authorize_router = oauth::oauth_authorize_routes(oauth_state.clone());
 
                 let auth_middleware = middleware::from_fn_with_state(
                     oauth_state.clone(),
@@ -495,17 +542,17 @@ async fn main() -> anyhow::Result<()> {
 
                 shutdown_oauth_state = Some(oauth_state);
 
-                // Protected MCP routes — CORS permissive only on /mcp
+                // Protected MCP routes.
                 let mcp_router = Router::new()
                     .nest_service("/mcp", mcp_service)
                     // Runs before nest strips /mcp, so it sees the /mcp/<format> tail.
                     .layer(middleware::from_fn(response_config_layer))
-                    .layer(auth_middleware)
-                    .layer(CorsLayer::permissive());
+                    .layer(auth_middleware);
 
-                // OAuth endpoints get no CORS (browser-to-browser calls are not needed)
-                oauth_router
-                    .merge(mcp_router)
+                // /authorize is merged outside the CORS layer: its consent page carries
+                // the approval nonce and must never be readable cross-origin.
+                with_cors(oauth_router.merge(mcp_router))
+                    .merge(authorize_router)
                     .layer(TraceLayer::new_for_http())
             } else {
                 // --- Static Bearer token mode (existing behavior) ---
@@ -539,13 +586,14 @@ async fn main() -> anyhow::Result<()> {
                     },
                 );
 
-                Router::new()
-                    .nest_service("/mcp", mcp_service)
-                    // Runs before nest strips /mcp, so it sees the /mcp/<format> tail.
-                    .layer(middleware::from_fn(response_config_layer))
-                    .layer(auth_middleware)
-                    .layer(CorsLayer::permissive())
-                    .layer(TraceLayer::new_for_http())
+                with_cors(
+                    Router::new()
+                        .nest_service("/mcp", mcp_service)
+                        // Runs before nest strips /mcp, so it sees the /mcp/<format> tail.
+                        .layer(middleware::from_fn(response_config_layer))
+                        .layer(auth_middleware),
+                )
+                .layer(TraceLayer::new_for_http())
             };
 
             let listener = tokio::net::TcpListener::bind(&cli.http_bind).await?;
@@ -556,6 +604,9 @@ async fn main() -> anyhow::Result<()> {
                 .with_graceful_shutdown(async move {
                     shutdown_signal().await;
                     info!("Shutting down HTTP server");
+                    // End MCP sessions and their SSE streams, which would otherwise hold
+                    // axum's connection drain open until the supervisor kills us.
+                    mcp_cancel.cancel();
                     // Flush now, in case the connection drain below outlives
                     // the supervisor's kill timeout (open SSE streams can).
                     if let Some(state) = &signal_oauth_state {
@@ -573,6 +624,27 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// rmcp streamable-HTTP config for `/mcp`: Host and (always-enforced) Origin allow-lists,
+/// legacy sessions, the transport message cap, and the shutdown token.
+fn mcp_http_config(
+    allowed_hosts: Vec<String>,
+    allowed_origins: Vec<String>,
+    cancel: tokio_util::sync::CancellationToken,
+) -> rmcp::transport::streamable_http_server::StreamableHttpServerConfig {
+    rmcp::transport::streamable_http_server::StreamableHttpServerConfig::default()
+        .with_allowed_hosts(allowed_hosts)
+        .with_allowed_origins(allowed_origins)
+        // Validate even when the list is empty, so an empty list rejects every Origin.
+        .enforce_origin_validation()
+        // Explicit: peer registration and resource subscriptions depend on long-lived
+        // sessions. (rmcp 3.x default, and moot for 2026-07-28 since we cap negotiation
+        // at 2025-11-25.)
+        .with_legacy_session_mode(true)
+        // rmcp's 4 MiB default would reject large base64 .torrent uploads.
+        .with_max_request_body_bytes(tools::MAX_MCP_MESSAGE_BYTES)
+        .with_cancellation_token(cancel)
 }
 
 /// Write the OAuth state file if persistence is on. Called at every shutdown
@@ -773,5 +845,80 @@ mod tests {
         assert!(!hosts.contains(&"mcp.deluge.mcarthur.org".to_string()));
         // A host-only --http-bind (no ':') must not inject an empty entry.
         assert!(!hosts.iter().any(|h| h.is_empty()));
+    }
+
+    /// Drive the real rmcp service with the production `/mcp` config and a stub handler.
+    async fn origin_status(origin: Option<&str>, allowed_origins: &[&str]) -> axum::http::StatusCode {
+        use rmcp::transport::streamable_http_server::{
+            StreamableHttpService, session::local::LocalSessionManager,
+        };
+        use tower::ServiceExt;
+
+        #[derive(Clone)]
+        struct Stub;
+        impl rmcp::ServerHandler for Stub {}
+
+        let config = super::mcp_http_config(
+            build_allowed_hosts("127.0.0.1:8080", &None, &[]),
+            allowed_origins.iter().map(|o| o.to_string()).collect(),
+            tokio_util::sync::CancellationToken::new(),
+        );
+        let service = StreamableHttpService::new(
+            || Ok(Stub),
+            std::sync::Arc::new(LocalSessionManager::default()),
+            config,
+        );
+        let mut req = axum::http::Request::builder()
+            .method("POST")
+            .uri("http://127.0.0.1:8080/mcp")
+            .header("host", "127.0.0.1:8080")
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream");
+        if let Some(origin) = origin {
+            req = req.header("origin", origin);
+        }
+        let body = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}"#;
+        let req = req.body(axum::body::Body::from(body)).unwrap();
+        service.oneshot(req).await.unwrap().status()
+    }
+
+    #[tokio::test]
+    async fn http_rejects_browser_origins_by_default() {
+        use axum::http::StatusCode;
+        assert_eq!(origin_status(Some("https://evil.example"), &[]).await, StatusCode::FORBIDDEN);
+        // Native clients send no Origin.
+        assert_eq!(origin_status(None, &[]).await, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn http_accepts_only_configured_origins() {
+        use axum::http::StatusCode;
+        let allowed = ["http://localhost:6274"];
+        assert_eq!(origin_status(Some("http://localhost:6274"), &allowed).await, StatusCode::OK);
+        assert_eq!(
+            origin_status(Some("https://evil.example"), &allowed).await,
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    /// Our normalized `--allowed-origin` forms must be ones rmcp's own Origin check
+    /// accepts — otherwise CORS and enforcement would disagree.
+    #[tokio::test]
+    async fn rmcp_accepts_normalized_allowed_origins() {
+        use axum::http::StatusCode;
+        let normalized = crate::origin::AllowedOrigins::parse(&[
+            "http://[0:0:0:0:0:0:0:1]:8080".to_string(),
+            "https://app.example.com".to_string(),
+            "http://dev.local:*".to_string(),
+        ])
+        .unwrap()
+        .normalized();
+        let allowed: Vec<&str> = normalized.iter().map(String::as_str).collect();
+        for origin in ["http://[::1]:8080", "https://app.example.com", "http://dev.local:5173"] {
+            assert_eq!(origin_status(Some(origin), &allowed).await, StatusCode::OK, "{origin}");
+        }
+        for origin in ["http://[::1]:8081", "https://app.example.com:8443", "https://dev.local:5173"] {
+            assert_eq!(origin_status(Some(origin), &allowed).await, StatusCode::FORBIDDEN, "{origin}");
+        }
     }
 }

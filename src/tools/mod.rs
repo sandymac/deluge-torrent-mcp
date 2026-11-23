@@ -1,8 +1,9 @@
 // Copyright (c) 2026 Sandy McArthur, Jr.
 // SPDX-License-Identifier: MIT
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use rmcp::{
@@ -10,12 +11,12 @@ use rmcp::{
     handler::server::router::tool::ToolRouter,
     handler::server::tool::ToolCallContext,
     model::{
-        CallToolRequestParams, CallToolResult, Icon, Implementation, InitializeRequestParams,
+        CallToolRequestParams, CallToolResponse, Icon, Implementation, InitializeRequestParams,
         InitializeResult, ListResourcesResult, ListResourceTemplatesResult, ListToolsResult,
-        PaginatedRequestParams, RawResource, RawResourceTemplate, ReadResourceRequestParams,
+        PaginatedRequestParams, ProtocolVersion, ReadResourceRequestParams, ReadResourceResponse,
         ReadResourceResult, Resource, ResourceContents, ResourceTemplate,
-        ResourceUpdatedNotificationParam, ServerInfo, SetLevelRequestParams,
-        SubscribeRequestParams, Tool, UnsubscribeRequestParams,
+        ResourceUpdatedNotificationParam, ServerConfig, SubscribeRequestParams, Tool,
+        UnsubscribeRequestParams,
     },
     serde_json,
     service::RequestContext,
@@ -43,7 +44,39 @@ mod values;
 
 use gate::ToolGate;
 use params::*;
-use plugin_watcher::{apply_label_state, event_to_resource_uris};
+use plugin_watcher::{
+    apply_label_state, event_to_resource_uris, prune_closed_peers, spawn_tool_list_fanout,
+};
+
+/// Largest total of `torrent_sources` `add_torrent` accepts in one call (32 MiB) — a
+/// single base64 `.torrent` or several summed. Enforced per call, not per source, so
+/// that everything the tool accepts also fits in one transport message.
+pub(crate) const MAX_BASE64_TORRENT_BYTES: usize = 32 * 1024 * 1024;
+
+/// Most `torrent_sources` `add_torrent` accepts per call. Must match the
+/// `length(max = ...)` on `AddTorrentParams::torrent_sources`.
+pub(crate) const MAX_TORRENT_SOURCES: usize = 100;
+
+/// Most `info_hashes` accepted per call by tools that issue one daemon RPC per hash
+/// (`remove_torrent`, `set_torrent_label`). Must match the `length(max = ...)` on those
+/// tools' params in `params.rs`. Single-RPC batch tools are not capped.
+pub(crate) const MAX_PER_HASH_BATCH: usize = 1000;
+
+/// Largest single MCP message either transport accepts: a maximal `add_torrent` call
+/// plus 1 MiB headroom for the JSON-RPC envelope and JSON string escaping. Applied as
+/// rmcp's HTTP `max_request_body_bytes` (default 4 MiB) and stdio `max_line_length`
+/// (default 16 MiB) so neither transport rejects an input `add_torrent` would accept,
+/// while still bounding memory per message. Oversized messages get HTTP 413; on stdio
+/// rmcp drops the line and logs to stderr without a JSON-RPC error.
+pub(crate) const MAX_MCP_MESSAGE_BYTES: usize = MAX_BASE64_TORRENT_BYTES + 1024 * 1024;
+const _: () = assert!(MAX_MCP_MESSAGE_BYTES > MAX_BASE64_TORRENT_BYTES);
+
+/// Protocol versions this server negotiates — everything up to and including the last
+/// revision with an `initialize` handshake. See `ServerHandler::supported_protocol_versions`
+/// on [`DelugeServer`] and ADR-0014.
+fn supported_protocol_versions() -> &'static [ProtocolVersion] {
+    ProtocolVersion::known_up_to(&ProtocolVersion::LATEST_WITH_INITIALIZE)
+}
 
 /// Flatten validated info hashes into the `Vec<String>` the [`DelugeApi`] bulk
 /// methods accept.
@@ -67,105 +100,236 @@ impl LabelAction {
     }
 }
 
+/// State shared by every MCP session in the process: the tool gate and the set of
+/// initialized peers. One [`Self::spawn_plugin_watcher`] task per process keeps the
+/// gate live and fans `tools/list_changed` out to every peer, so sessions — and
+/// stateless requests, which never initialize — all see the current Label-plugin state.
+#[derive(Clone)]
+pub(crate) struct SharedState {
+    gate: Arc<ToolGate>,
+    /// Initialized MCP peers, registered on `initialize`. Closed peers are pruned on
+    /// every registration and after every fan-out.
+    connected_peers: Arc<RwLock<Vec<Peer<RoleServer>>>>,
+    /// Built once: generating the 21 tools' JSON schemas per session — and per
+    /// stateless HTTP request — is wasted work.
+    tool_router: ToolRouter<DelugeServer>,
+}
+
+impl SharedState {
+    pub(crate) fn new(
+        user_intent_tools: HashSet<String>,
+        plugin_gated_tools: HashSet<String>,
+        initial_label_plugin_active: bool,
+    ) -> Self {
+        Self {
+            gate: Arc::new(ToolGate::new(
+                user_intent_tools,
+                plugin_gated_tools,
+                initial_label_plugin_active,
+            )),
+            connected_peers: Arc::new(RwLock::new(Vec::new())),
+            tool_router: DelugeServer::build_tool_router(),
+        }
+    }
+
+    /// Spawn the process-wide plugin watcher — call once per process. Listens for
+    /// Deluge `PluginEnabled`/`PluginDisabled` events for the Label plugin and updates
+    /// the [`ToolGate`] accordingly. On reconnect or broadcast lag it re-probes via
+    /// `core.get_enabled_plugins` to recover the authoritative state.
+    pub(crate) fn spawn_plugin_watcher(&self, api: DelugeApi) {
+        let gate = self.gate.clone();
+        let fanout = spawn_tool_list_fanout(self.connected_peers.clone());
+        let mut event_rx = api.subscribe_events();
+
+        tokio::spawn(async move {
+            // Seed from an authoritative probe: the startup value may already be stale,
+            // and the receiver above buffers any events that arrive meanwhile.
+            if let Some(active) = api.label_plugin_active().await {
+                apply_label_state(active, &gate, &fanout);
+            }
+
+            loop {
+                match event_rx.recv().await {
+                    Ok(DelugeEvent::PluginEnabled { name }) if name == "Label" => {
+                        apply_label_state(true, &gate, &fanout);
+                    }
+                    Ok(DelugeEvent::PluginDisabled { name }) if name == "Label" => {
+                        apply_label_state(false, &gate, &fanout);
+                    }
+                    Ok(DelugeEvent::Reconnected) => {
+                        // Re-seed from the daemon — the previous state may be stale
+                        // and `set_event_interest` was just re-issued, so we may have
+                        // missed transitions while disconnected.
+                        if let Some(active) = api.label_plugin_active().await {
+                            apply_label_state(active, &gate, &fanout);
+                        }
+                    }
+                    Err(RecvError::Lagged(n)) => {
+                        warn!(
+                            "Plugin watcher lagged by {n} events — re-probing plugin state"
+                        );
+                        if let Some(active) = api.label_plugin_active().await {
+                            apply_label_state(active, &gate, &fanout);
+                        }
+                    }
+                    Err(RecvError::Closed) => break,
+                    _ => {}
+                }
+            }
+        });
+    }
+}
+
+/// What woke the resource-event forwarder.
+enum ForwarderStep {
+    Event(Result<DelugeEvent, RecvError>),
+    Tick,
+    BatchDone,
+}
+
+/// How often a session's resource-event forwarder checks whether its session has
+/// closed, so an idle daemon (no events to wake it) cannot keep it alive.
+const SESSION_CLOSED_POLL: std::time::Duration = std::time::Duration::from_secs(30);
+
 // ---------------------------------------------------------------------------
 // Server struct
 // ---------------------------------------------------------------------------
 
+/// One MCP session's handler. Constructing it has no side effects: rmcp 3 also builds
+/// one per stateless HTTP request (inline `_meta`, `server/discover`). Session work
+/// starts lazily — peer registration on `initialize` (which stateless requests never
+/// send), the resource-event forwarder on the first `resources/subscribe`.
 #[derive(Clone)]
 pub(crate) struct DelugeServer {
     api: DelugeApi,
     /// Tool visibility gating — which tools are callable, given operator intent
-    /// and the live Label-plugin state. Updated by the plugin watcher.
+    /// and the live Label-plugin state. Shared process-wide; see [`SharedState`].
     gate: Arc<ToolGate>,
     tool_router: ToolRouter<Self>,
-    /// Active resource subscriptions: resource URI → connected peer.
-    /// One subscriber per URI — last `subscribe` call wins.
-    subscribers: Arc<RwLock<HashMap<String, Peer<RoleServer>>>>,
-    /// All connected MCP peers, captured on `initialize`.
-    /// Used to fan out `notifications/tools/list_changed` when plugin state flips.
+    /// This session's resource subscriptions (URIs). Notifications go to the session's
+    /// own peer, captured when the forwarder starts.
+    subscribed_uris: Arc<RwLock<HashSet<String>>>,
+    /// Process-wide set of initialized peers; see [`SharedState`].
     connected_peers: Arc<RwLock<Vec<Peer<RoleServer>>>>,
     /// Response shaping config used when a request carries none. On STDIO this is the
     /// process-wide config from `--response-config`; on HTTP it is the fallback when a request's
     /// per-request config is absent. See [`Self::resolve_config`].
     default_config: ResponseConfig,
+    /// Set once this session has initialized and its peer is registered in
+    /// `connected_peers`. Guards against double registration on a repeated
+    /// `initialize`, and gates `resources/subscribe` to real sessions.
+    peer_registered: Arc<AtomicBool>,
+    /// Set once this session's resource-event forwarder is spawned.
+    forwarder_started: Arc<AtomicBool>,
 }
 
 // ---------------------------------------------------------------------------
-// Constructor, plugin watcher, and self-methods
+// Constructor, session tasks, and self-methods
 // ---------------------------------------------------------------------------
 
 impl DelugeServer {
     pub(crate) fn new(
         api: DelugeApi,
-        user_intent_tools: HashSet<String>,
-        plugin_gated_tools: HashSet<String>,
-        initial_label_plugin_active: bool,
+        shared: &SharedState,
         default_config: ResponseConfig,
     ) -> Self {
-        let gate = Arc::new(ToolGate::new(
-            user_intent_tools,
-            plugin_gated_tools,
-            initial_label_plugin_active,
-        ));
-
-        let subscribers: Arc<RwLock<HashMap<String, Peer<RoleServer>>>> =
-            Arc::new(RwLock::new(HashMap::new()));
-
-        // Background task: forward Deluge push events to subscribed MCP peers.
-        let mut event_rx = api.subscribe_events();
-        let subs_for_task = subscribers.clone();
-        tokio::spawn(async move {
-            loop {
-                match event_rx.recv().await {
-                    Ok(event) => {
-                        let uris = event_to_resource_uris(&event);
-                        if uris.is_empty() {
-                            continue;
-                        }
-                        let mut failed_uris = Vec::new();
-                        {
-                            let subs = subs_for_task.read().await;
-                            for uri in &uris {
-                                if let Some(peer) = subs.get(uri) {
-                                    let param =
-                                        ResourceUpdatedNotificationParam::new(uri.clone());
-                                    if let Err(e) =
-                                        peer.notify_resource_updated(param).await
-                                    {
-                                        debug!(
-                                            "resource_updated notification failed for {uri}: {e}"
-                                        );
-                                        failed_uris.push(uri.clone());
-                                    }
-                                }
-                            }
-                        }
-                        if !failed_uris.is_empty() {
-                            let mut subs = subs_for_task.write().await;
-                            for uri in &failed_uris {
-                                subs.remove(uri);
-                            }
-                        }
-                    }
-                    Err(RecvError::Lagged(n)) => {
-                        warn!(
-                            "Resource event subscriber lagged by {n} events — \
-                             some resource_updated notifications may have been missed"
-                        );
-                    }
-                    Err(RecvError::Closed) => break,
-                }
-            }
-        });
-
         Self {
             api,
-            gate,
-            tool_router: Self::build_tool_router(),
-            subscribers,
-            connected_peers: Arc::new(RwLock::new(Vec::new())),
+            gate: shared.gate.clone(),
+            tool_router: shared.tool_router.clone(),
+            subscribed_uris: Arc::new(RwLock::new(HashSet::new())),
+            connected_peers: shared.connected_peers.clone(),
             default_config,
+            peer_registered: Arc::new(AtomicBool::new(false)),
+            forwarder_started: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Register this session's peer for `tools/list_changed` fan-out — once per session,
+    /// from `initialize`. Prunes peers whose transport has closed while holding the lock.
+    async fn register_peer(&self, peer: &Peer<RoleServer>) {
+        if self.peer_registered.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let mut peers = self.connected_peers.write().await;
+        prune_closed_peers(&mut peers);
+        peers.push(peer.clone());
+    }
+
+    /// Forward Deluge push events to this session's resource subscribers as
+    /// `notifications/resources/updated` — spawned at most once, on the first subscribe,
+    /// and runs until the session closes (checked on every event and every
+    /// [`SESSION_CLOSED_POLL`], so a quiet daemon cannot strand it).
+    ///
+    /// At most one batch of sends is in flight. rmcp does not cancel a notification once
+    /// queued, and a client that stops reading its SSE stream blocks its session worker,
+    /// so instead of timing out (which would leave sends queued) or giving up (which
+    /// would silently end a subscription the client made once), URIs that change while a
+    /// batch is in flight are collected in a set and sent when it completes. A wedged
+    /// client therefore costs one in-flight batch plus a set bounded by its
+    /// subscriptions, and a slow-but-alive one still receives every changed URI.
+    fn ensure_event_forwarder(&self, session_peer: &Peer<RoleServer>) {
+        if self.forwarder_started.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let session_peer = session_peer.clone();
+        let mut event_rx = self.api.subscribe_events();
+        let subs_for_task = self.subscribed_uris.clone();
+        tokio::spawn(async move {
+            let mut closed_poll = tokio::time::interval(SESSION_CLOSED_POLL);
+            let mut pending: BTreeSet<String> = BTreeSet::new();
+            let mut inflight: Option<tokio::task::JoinHandle<()>> = None;
+            loop {
+                // broadcast::Receiver::recv is cancel-safe, so losing the race to another
+                // branch drops no event.
+                let step = tokio::select! {
+                    r = event_rx.recv() => ForwarderStep::Event(r),
+                    _ = closed_poll.tick() => ForwarderStep::Tick,
+                    _ = async { inflight.as_mut().expect("guarded").await }, if inflight.is_some() => {
+                        ForwarderStep::BatchDone
+                    }
+                };
+                if session_peer.is_transport_closed() {
+                    debug!("Session closed — stopping resource event forwarder");
+                    break;
+                }
+                match step {
+                    ForwarderStep::Tick => {}
+                    ForwarderStep::BatchDone => inflight = None,
+                    ForwarderStep::Event(Ok(event)) => {
+                        let uris = event_to_resource_uris(&event);
+                        if !uris.is_empty() {
+                            let subs = subs_for_task.read().await;
+                            pending.extend(uris.into_iter().filter(|u| subs.contains(u)));
+                        }
+                    }
+                    ForwarderStep::Event(Err(RecvError::Lagged(n))) => {
+                        // Events were dropped, so any subscribed resource may be stale:
+                        // tell the client to re-read all of them.
+                        warn!("Resource event subscriber lagged by {n} events — re-notifying all subscriptions");
+                        pending.extend(subs_for_task.read().await.iter().cloned());
+                    }
+                    ForwarderStep::Event(Err(RecvError::Closed)) => break,
+                }
+                if inflight.is_none() && !pending.is_empty() {
+                    let batch = std::mem::take(&mut pending);
+                    let peer = session_peer.clone();
+                    inflight = Some(tokio::spawn(async move {
+                        for uri in batch {
+                            let param = ResourceUpdatedNotificationParam::new(uri.clone());
+                            if let Err(e) = peer.notify_resource_updated(param).await {
+                                // Only fails once the session's transport is gone.
+                                debug!("resource_updated notification failed for {uri}: {e}");
+                                break;
+                            }
+                        }
+                    }));
+                }
+            }
+            if let Some(batch) = inflight {
+                batch.abort();
+            }
+        });
     }
 
     /// Resolve the [`ResponseConfig`] for the current call.
@@ -187,57 +351,6 @@ impl DelugeServer {
         shape_response(value, &self.resolve_config(ctx))
     }
 
-    /// Spawn the plugin watcher. Listens for Deluge `PluginEnabled`/`PluginDisabled`
-    /// events for the Label plugin and updates the [`ToolGate`] accordingly.
-    /// On reconnect or broadcast lag it re-probes via `core.get_enabled_plugins`
-    /// to recover the authoritative state.
-    pub(crate) fn spawn_plugin_watcher(&self) {
-        let api = self.api.clone();
-        let gate = self.gate.clone();
-        let connected_peers = self.connected_peers.clone();
-        let mut event_rx = api.subscribe_events();
-
-        tokio::spawn(async move {
-            // Seed from an authoritative probe. The constructor's
-            // `initial_label_plugin_active` may be stale (e.g. captured at
-            // process start but the plugin toggled before this HTTP session
-            // opened), and the broadcast receiver was created above — any
-            // events that arrive between here and the loop will be buffered.
-            if let Some(active) = api.label_plugin_active().await {
-                apply_label_state(active, &gate, &connected_peers).await;
-            }
-
-            loop {
-                match event_rx.recv().await {
-                    Ok(DelugeEvent::PluginEnabled { name }) if name == "Label" => {
-                        apply_label_state(true, &gate, &connected_peers).await;
-                    }
-                    Ok(DelugeEvent::PluginDisabled { name }) if name == "Label" => {
-                        apply_label_state(false, &gate, &connected_peers).await;
-                    }
-                    Ok(DelugeEvent::Reconnected) => {
-                        // Re-seed from the daemon — the previous state may be stale
-                        // and `set_event_interest` was just re-issued, so we may have
-                        // missed transitions while disconnected.
-                        if let Some(active) = api.label_plugin_active().await {
-                            apply_label_state(active, &gate, &connected_peers).await;
-                        }
-                    }
-                    Err(RecvError::Lagged(n)) => {
-                        warn!(
-                            "Plugin watcher lagged by {n} events — re-probing plugin state"
-                        );
-                        if let Some(active) = api.label_plugin_active().await {
-                            apply_label_state(active, &gate, &connected_peers).await;
-                        }
-                    }
-                    Err(RecvError::Closed) => break,
-                    _ => {}
-                }
-            }
-        });
-    }
-
     /// Auto-detect the source type and add a single torrent to Deluge.
     /// Detection order: magnet: → http/https URL → base64 .torrent content.
     async fn add_single_torrent(&self, source: &str) -> Result<String, String> {
@@ -250,8 +363,7 @@ impl DelugeServer {
             // which Deluge decodes via add_torrent_file. Deluge has no RPC that
             // reads a server-side path, so a path is not an accepted source.
             // Size guard BEFORE base64 decode to prevent oversized allocation.
-            const MAX_BASE64_BYTES: usize = 32 * 1024 * 1024; // 32 MB
-            if source.len() > MAX_BASE64_BYTES {
+            if source.len() > MAX_BASE64_TORRENT_BYTES {
                 return Err(format!(
                     "base64 content is {} bytes, exceeding the 32 MB limit. \
                      .torrent files are typically under 1 MB — this input is likely incorrect.",
@@ -357,7 +469,7 @@ impl DelugeServer {
 // ---------------------------------------------------------------------------
 
 impl ServerHandler for DelugeServer {
-    fn get_info(&self) -> ServerInfo {
+    fn get_info(&self) -> ServerConfig {
         let icons = vec![
             Icon::new(format!("data:image/svg+xml;base64,{}", BASE64.encode(ICON_SVG)))
                 .with_mime_type("image/svg+xml")
@@ -369,15 +481,18 @@ impl ServerHandler for DelugeServer {
                 .with_mime_type("image/png")
                 .with_sizes(vec!["96x96".to_string()]),
         ];
-        ServerInfo::new(
-            rmcp::model::ServerCapabilities::builder()
+        // `enable_logging` is deprecated by SEP-2577 (2026-07-28), but this server caps
+        // negotiation at 2025-11-25 (see `supported_protocol_versions`), where clients may
+        // still send `logging/setLevel`.
+        #[allow(deprecated)]
+        let capabilities = rmcp::model::ServerCapabilities::builder()
                 .enable_tools()
                 .enable_tool_list_changed()
                 .enable_resources()
                 .enable_resources_subscribe()
                 .enable_logging()
-                .build(),
-        )
+                .build();
+        ServerConfig::new(capabilities)
             .with_server_info(
                 Implementation::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
                     .with_icons(icons),
@@ -390,11 +505,25 @@ impl ServerHandler for DelugeServer {
         context: RequestContext<RoleServer>,
     ) -> Result<InitializeResult, ErrorData> {
         if context.peer.peer_info().is_none() {
-            context.peer.set_peer_info(request);
+            context.peer.set_peer_info(request.clone());
         }
-        // Track this peer so the plugin watcher can deliver tools/list_changed.
-        self.connected_peers.write().await.push(context.peer.clone());
-        Ok(self.get_info())
+        // Negotiate first: a refused version registers nothing.
+        let result = self.negotiate_initialize(&request)?;
+        // Register here rather than on `notifications/initialized`: rmcp 3 lets clients
+        // proceed without sending that notification, and they should still get
+        // tools/list_changed. Stateless requests never call `initialize`.
+        self.register_peer(&context.peer).await;
+        Ok(result)
+    }
+
+    /// Cap negotiation at 2025-11-25, the last revision with an `initialize` handshake.
+    ///
+    /// 2026-07-28 clients are served statelessly via `server/discover` and never call
+    /// `initialize`, so peer registration (`connected_peers` → `tools/list_changed`) and
+    /// resource subscriptions would silently stop working for them. Raise this ceiling
+    /// only after those move onto SEP-2575 listen streams.
+    fn supported_protocol_versions(&self) -> std::borrow::Cow<'static, [ProtocolVersion]> {
+        std::borrow::Cow::Borrowed(supported_protocol_versions())
     }
 
     async fn list_tools(
@@ -409,14 +538,14 @@ impl ServerHandler for DelugeServer {
             .into_iter()
             .filter(|t| enabled.contains(t.name.as_ref()))
             .collect();
-        Ok(ListToolsResult { tools, meta: None, next_cursor: None })
+        Ok(ListToolsResult::with_all_items(tools))
     }
 
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, ErrorData> {
+    ) -> Result<CallToolResponse, ErrorData> {
         self.tool_router.call(ToolCallContext::new(self, request, context)).await
     }
 
@@ -424,9 +553,11 @@ impl ServerHandler for DelugeServer {
         self.tool_router.get(name).cloned()
     }
 
+    // Logging is deprecated by SEP-2577, but still part of the protocol versions we negotiate.
+    #[allow(deprecated)]
     async fn set_level(
         &self,
-        _request: SetLevelRequestParams,
+        _request: rmcp::model::SetLevelRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<(), ErrorData> {
         Ok(())
@@ -437,29 +568,17 @@ impl ServerHandler for DelugeServer {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListResourcesResult, ErrorData> {
-        Ok(ListResourcesResult {
-            resources: vec![Resource {
-                raw: RawResource {
-                    uri: "deluge://torrents".to_string(),
-                    name: "All Torrents".to_string(),
-                    title: Some("All Torrents".to_string()),
-                    description: Some(
-                        "Snapshot of all torrents with current status, as \
-                         {\"torrents\": {<info_hash>: {fields}}}. \
-                         Subscribe for live updates when torrents are added, removed, \
-                         or change state."
-                            .to_string(),
-                    ),
-                    mime_type: Some("application/json".to_string()),
-                    size: None,
-                    icons: None,
-                    meta: None,
-                },
-                annotations: None,
-            }],
-            meta: None,
-            next_cursor: None,
-        })
+        Ok(ListResourcesResult::with_all_items(vec![
+            Resource::new("deluge://torrents", "All Torrents")
+                .with_title("All Torrents")
+                .with_description(
+                    "Snapshot of all torrents with current status, as \
+                     {\"torrents\": {<info_hash>: {fields}}}. \
+                     Subscribe for live updates when torrents are added, removed, \
+                     or change state.",
+                )
+                .with_mime_type("application/json"),
+        ]))
     }
 
     async fn list_resource_templates(
@@ -467,33 +586,23 @@ impl ServerHandler for DelugeServer {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListResourceTemplatesResult, ErrorData> {
-        Ok(ListResourceTemplatesResult {
-            resource_templates: vec![ResourceTemplate {
-                raw: RawResourceTemplate {
-                    uri_template: "deluge://torrent/{info_hash}".to_string(),
-                    name: "Torrent Status".to_string(),
-                    title: Some("Torrent Status".to_string()),
-                    description: Some(
-                        "Complete status and metadata for a single torrent. \
-                         Subscribe for live updates on state changes, file renames, \
-                         and storage moves."
-                            .to_string(),
-                    ),
-                    mime_type: Some("application/json".to_string()),
-                    icons: None,
-                },
-                annotations: None,
-            }],
-            meta: None,
-            next_cursor: None,
-        })
+        Ok(ListResourceTemplatesResult::with_all_items(vec![
+            ResourceTemplate::new("deluge://torrent/{info_hash}", "Torrent Status")
+                .with_title("Torrent Status")
+                .with_description(
+                    "Complete status and metadata for a single torrent. \
+                     Subscribe for live updates on state changes, file renames, \
+                     and storage moves.",
+                )
+                .with_mime_type("application/json"),
+        ]))
     }
 
     async fn read_resource(
         &self,
         request: ReadResourceRequestParams,
         context: RequestContext<RoleServer>,
-    ) -> Result<ReadResourceResult, ErrorData> {
+    ) -> Result<ReadResourceResponse, ErrorData> {
         let uri = &request.uri;
 
         if uri == "deluge://torrents" {
@@ -527,7 +636,8 @@ impl ServerHandler for DelugeServer {
                     text,
                     meta: None,
                 },
-            ]))
+            ])
+            .into())
         } else if let Some(hash) = uri.strip_prefix("deluge://torrent/") {
             if let Err(e) = Self::validate_info_hash(hash) {
                 return Err(ErrorData::invalid_params(e, None));
@@ -546,7 +656,8 @@ impl ServerHandler for DelugeServer {
                     text,
                     meta: None,
                 },
-            ]))
+            ])
+            .into())
         } else {
             Err(ErrorData::resource_not_found(
                 format!("Unknown resource URI: {uri}"),
@@ -575,10 +686,17 @@ impl ServerHandler for DelugeServer {
                 None,
             ));
         }
-        self.subscribers
-            .write()
-            .await
-            .insert(uri.clone(), context.peer.clone());
+        // Only an initialized session can receive notifications. A stateless request
+        // (rmcp 3 serves inline-`_meta` requests without `initialize`) has nowhere to
+        // deliver them, so refuse rather than spawn a forwarder that cannot.
+        if !self.peer_registered.load(Ordering::Acquire) {
+            return Err(ErrorData::invalid_request(
+                "resources/subscribe requires an initialized session",
+                None,
+            ));
+        }
+        self.subscribed_uris.write().await.insert(uri.clone());
+        self.ensure_event_forwarder(&context.peer);
         debug!("Subscribed to resource {uri}");
         Ok(())
     }
@@ -588,7 +706,7 @@ impl ServerHandler for DelugeServer {
         request: UnsubscribeRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<(), ErrorData> {
-        if self.subscribers.write().await.remove(&request.uri).is_some() {
+        if self.subscribed_uris.write().await.remove(&request.uri) {
             debug!("Unsubscribed from resource {}", request.uri);
         }
         Ok(())
@@ -667,5 +785,45 @@ mod tests {
             registry, registered,
             "registry::TOOLS and the #[tool_router] tool set must match exactly"
         );
+    }
+
+    #[test]
+    fn protocol_negotiation_is_capped_at_last_initialize_revision() {
+        let versions = super::supported_protocol_versions();
+        assert!(versions.contains(&ProtocolVersion::V_2025_11_25));
+        assert!(versions.contains(&ProtocolVersion::V_2024_11_05));
+        // 2026-07-28 drops `initialize` and sessions, which peer tracking, resource
+        // subscriptions and the plugin watcher depend on. See ADR-0014.
+        assert!(!versions.contains(&ProtocolVersion::V_2026_07_28));
+    }
+
+    #[test]
+    fn add_torrent_schema_max_items_matches_handler_cap() {
+        let schema = rmcp::schemars::schema_for!(params::AddTorrentParams);
+        let json = serde_json::to_value(&schema).unwrap();
+        assert_eq!(
+            json["properties"]["torrent_sources"]["maxItems"],
+            serde_json::json!(super::MAX_TORRENT_SOURCES)
+        );
+    }
+
+    /// Per-hash-RPC tools cap `info_hashes` in the schema at exactly the handler limit;
+    /// single-RPC batch tools stay uncapped (or are single-torrent, max 1).
+    #[test]
+    fn info_hashes_schema_caps_match_handlers() {
+        const PER_HASH: [&str; 2] = ["deluge_remove_torrent", "deluge_set_torrent_label"];
+        let mut checked = 0;
+        for tool in DelugeServer::build_tool_router().list_all() {
+            let schema = serde_json::Value::Object((*tool.input_schema).clone());
+            let Some(prop) = schema["properties"].get("info_hashes") else { continue };
+            let max = prop["maxItems"].as_u64();
+            if PER_HASH.contains(&tool.name.as_ref()) {
+                assert_eq!(max, Some(super::MAX_PER_HASH_BATCH as u64), "{}", tool.name);
+            } else {
+                assert!(max.is_none() || max == Some(1), "{}: maxItems {max:?}", tool.name);
+            }
+            checked += 1;
+        }
+        assert!(checked >= 7, "expected every info_hashes tool to be checked, got {checked}");
     }
 }

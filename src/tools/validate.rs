@@ -16,6 +16,21 @@ use crate::ids::IdStrategy;
 
 impl DelugeServer {
     /// Validate that info_hashes is non-empty and each hash is well-formed.
+    /// For tools that issue one daemon RPC per hash: bound the work one call can request.
+    /// Mirrors the `maxItems` on those tools' schemas, which clients may not enforce.
+    /// Single-RPC batch tools (pause, resume, recheck, …) take any count.
+    pub(super) fn check_per_hash_batch(hashes: &[InfoHash]) -> Result<(), String> {
+        if hashes.len() > super::MAX_PER_HASH_BATCH {
+            return Err(format!(
+                "info_hashes has {} entries; this tool accepts at most {} per call — \
+                 split the request.",
+                hashes.len(),
+                super::MAX_PER_HASH_BATCH
+            ));
+        }
+        Ok(())
+    }
+
     pub(super) fn validate_info_hashes(hashes: &[InfoHash]) -> Result<(), String> {
         if hashes.is_empty() {
             return Err("info_hashes must not be empty.".to_string());
