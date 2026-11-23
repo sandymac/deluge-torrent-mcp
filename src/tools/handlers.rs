@@ -43,6 +43,16 @@ impl DelugeServer {
         if p.torrent_sources.is_empty() {
             return Err("torrent_sources must not be empty.".to_string());
         }
+        // Bound per-call work and response size: each source yields its own result
+        // object, so tiny/empty sources could otherwise inflate the response far beyond
+        // the request. Mirrors the schema's maxItems, which clients may not enforce.
+        if p.torrent_sources.len() > super::MAX_TORRENT_SOURCES {
+            return Err(format!(
+                "torrent_sources has {} entries; at most {} are accepted per call.",
+                p.torrent_sources.len(),
+                super::MAX_TORRENT_SOURCES
+            ));
+        }
         // Per-call cap so anything accepted here also fits in one transport message
         // (see MAX_MCP_MESSAGE_BYTES).
         let total: usize = p.torrent_sources.iter().map(String::len).sum();

@@ -19,7 +19,7 @@ use rmcp::{
         UnsubscribeRequestParams,
     },
     serde_json,
-    service::RequestContext,
+    service::{NotificationContext, RequestContext},
     ErrorData, RoleServer,
 };
 use tokio::sync::{broadcast::error::RecvError, RwLock};
@@ -50,6 +50,10 @@ use plugin_watcher::{apply_label_state, event_to_resource_uris};
 /// single base64 `.torrent` or several summed. Enforced per call, not per source, so
 /// that everything the tool accepts also fits in one transport message.
 pub(crate) const MAX_BASE64_TORRENT_BYTES: usize = 32 * 1024 * 1024;
+
+/// Most `torrent_sources` `add_torrent` accepts per call. Must match the
+/// `length(max = ...)` on `AddTorrentParams::torrent_sources`.
+pub(crate) const MAX_TORRENT_SOURCES: usize = 100;
 
 /// Largest single MCP message either transport accepts: a maximal `add_torrent` call
 /// plus 1 MiB headroom for the JSON-RPC envelope and JSON string escaping. Applied as
@@ -89,92 +93,175 @@ impl LabelAction {
     }
 }
 
+/// State shared by every MCP session in the process: the tool gate and the set of
+/// initialized peers. One [`Self::spawn_plugin_watcher`] task per process keeps the
+/// gate live and fans `tools/list_changed` out to every peer, so sessions — and
+/// stateless requests, which never initialize — all see the current Label-plugin state.
+#[derive(Clone)]
+pub(crate) struct SharedState {
+    gate: Arc<ToolGate>,
+    /// Initialized MCP peers, registered on `notifications/initialized`. Closed peers
+    /// are pruned on registration and whenever a fan-out to them fails.
+    connected_peers: Arc<RwLock<Vec<Peer<RoleServer>>>>,
+}
+
+impl SharedState {
+    pub(crate) fn new(
+        user_intent_tools: HashSet<String>,
+        plugin_gated_tools: HashSet<String>,
+        initial_label_plugin_active: bool,
+    ) -> Self {
+        Self {
+            gate: Arc::new(ToolGate::new(
+                user_intent_tools,
+                plugin_gated_tools,
+                initial_label_plugin_active,
+            )),
+            connected_peers: Arc::new(RwLock::new(Vec::new())),
+        }
+    }
+
+    /// Spawn the process-wide plugin watcher — call once per process. Listens for
+    /// Deluge `PluginEnabled`/`PluginDisabled` events for the Label plugin and updates
+    /// the [`ToolGate`] accordingly. On reconnect or broadcast lag it re-probes via
+    /// `core.get_enabled_plugins` to recover the authoritative state.
+    pub(crate) fn spawn_plugin_watcher(&self, api: DelugeApi) {
+        let gate = self.gate.clone();
+        let connected_peers = self.connected_peers.clone();
+        let mut event_rx = api.subscribe_events();
+
+        tokio::spawn(async move {
+            // Seed from an authoritative probe: the startup value may already be stale,
+            // and the receiver above buffers any events that arrive meanwhile.
+            if let Some(active) = api.label_plugin_active().await {
+                apply_label_state(active, &gate, &connected_peers).await;
+            }
+
+            loop {
+                match event_rx.recv().await {
+                    Ok(DelugeEvent::PluginEnabled { name }) if name == "Label" => {
+                        apply_label_state(true, &gate, &connected_peers).await;
+                    }
+                    Ok(DelugeEvent::PluginDisabled { name }) if name == "Label" => {
+                        apply_label_state(false, &gate, &connected_peers).await;
+                    }
+                    Ok(DelugeEvent::Reconnected) => {
+                        // Re-seed from the daemon — the previous state may be stale
+                        // and `set_event_interest` was just re-issued, so we may have
+                        // missed transitions while disconnected.
+                        if let Some(active) = api.label_plugin_active().await {
+                            apply_label_state(active, &gate, &connected_peers).await;
+                        }
+                    }
+                    Err(RecvError::Lagged(n)) => {
+                        warn!(
+                            "Plugin watcher lagged by {n} events — re-probing plugin state"
+                        );
+                        if let Some(active) = api.label_plugin_active().await {
+                            apply_label_state(active, &gate, &connected_peers).await;
+                        }
+                    }
+                    Err(RecvError::Closed) => break,
+                    _ => {}
+                }
+            }
+        });
+    }
+}
+
+/// How often a session's resource-event forwarder checks whether its session has
+/// closed, so an idle daemon (no events to wake it) cannot keep it alive.
+const SESSION_CLOSED_POLL: std::time::Duration = std::time::Duration::from_secs(30);
+
 // ---------------------------------------------------------------------------
 // Server struct
 // ---------------------------------------------------------------------------
 
+/// One MCP session's handler. Constructing it has no side effects: rmcp 3 also builds
+/// one per stateless HTTP request (inline `_meta`, `server/discover`). Session work
+/// starts lazily — peer registration on `notifications/initialized`, the resource-event
+/// forwarder on the first `resources/subscribe`.
 #[derive(Clone)]
 pub(crate) struct DelugeServer {
     api: DelugeApi,
     /// Tool visibility gating — which tools are callable, given operator intent
-    /// and the live Label-plugin state. Updated by the plugin watcher.
+    /// and the live Label-plugin state. Shared process-wide; see [`SharedState`].
     gate: Arc<ToolGate>,
     tool_router: ToolRouter<Self>,
     /// Active resource subscriptions: resource URI → connected peer.
     /// One subscriber per URI — last `subscribe` call wins.
     subscribers: Arc<RwLock<HashMap<String, Peer<RoleServer>>>>,
-    /// All connected MCP peers, captured on `initialize`.
-    /// Used to fan out `notifications/tools/list_changed` when plugin state flips.
+    /// Process-wide set of initialized peers; see [`SharedState`].
     connected_peers: Arc<RwLock<Vec<Peer<RoleServer>>>>,
     /// Response shaping config used when a request carries none. On STDIO this is the
     /// process-wide config from `--response-config`; on HTTP it is the fallback when a request's
     /// per-request config is absent. See [`Self::resolve_config`].
     default_config: ResponseConfig,
-    /// Set once this server's session background tasks (resource-event forwarder and
-    /// plugin watcher) have been spawned. They start from `initialize`, not construction:
-    /// rmcp 3 also runs the HTTP session factory for stateless requests (inline `_meta`,
-    /// `server/discover`) that never initialize, and spawning there leaked two tasks per
-    /// request. See [`Self::start_session_tasks`].
-    session_tasks_started: Arc<AtomicBool>,
+    /// Set once this session's peer is registered in `connected_peers`, so a repeated
+    /// `notifications/initialized` cannot register it twice.
+    peer_registered: Arc<AtomicBool>,
+    /// Set once this session's resource-event forwarder is spawned.
+    forwarder_started: Arc<AtomicBool>,
 }
 
 // ---------------------------------------------------------------------------
-// Constructor, plugin watcher, and self-methods
+// Constructor, session tasks, and self-methods
 // ---------------------------------------------------------------------------
 
 impl DelugeServer {
     pub(crate) fn new(
         api: DelugeApi,
-        user_intent_tools: HashSet<String>,
-        plugin_gated_tools: HashSet<String>,
-        initial_label_plugin_active: bool,
+        shared: &SharedState,
         default_config: ResponseConfig,
     ) -> Self {
-        let gate = Arc::new(ToolGate::new(
-            user_intent_tools,
-            plugin_gated_tools,
-            initial_label_plugin_active,
-        ));
-
-        let subscribers: Arc<RwLock<HashMap<String, Peer<RoleServer>>>> =
-            Arc::new(RwLock::new(HashMap::new()));
-
         Self {
             api,
-            gate,
+            gate: shared.gate.clone(),
             tool_router: Self::build_tool_router(),
-            subscribers,
-            connected_peers: Arc::new(RwLock::new(Vec::new())),
+            subscribers: Arc::new(RwLock::new(HashMap::new())),
+            connected_peers: shared.connected_peers.clone(),
             default_config,
-            session_tasks_started: Arc::new(AtomicBool::new(false)),
+            peer_registered: Arc::new(AtomicBool::new(false)),
+            forwarder_started: Arc::new(AtomicBool::new(false)),
         }
     }
 
-    /// Spawn this session's background tasks — at most once per server instance.
-    ///
-    /// Called from `initialize`, so only real sessions (stdio, or an HTTP session that
-    /// completed the handshake) get them. Each task exits after the next Deluge event
-    /// once `peer`'s transport has closed, so ended sessions stop accumulating tasks.
-    fn start_session_tasks(&self, peer: &Peer<RoleServer>) {
-        if self.session_tasks_started.swap(true, Ordering::AcqRel) {
+    /// Register this session's peer for `tools/list_changed` fan-out — once per session.
+    /// Prunes peers whose transport has closed while holding the lock.
+    async fn register_peer(&self, peer: &Peer<RoleServer>) {
+        if self.peer_registered.swap(true, Ordering::AcqRel) {
             return;
         }
-        self.spawn_event_forwarder(peer.clone());
-        self.spawn_plugin_watcher(peer.clone());
+        let mut peers = self.connected_peers.write().await;
+        peers.retain(|p| !p.is_transport_closed());
+        peers.push(peer.clone());
     }
 
     /// Forward Deluge push events to this session's resource subscribers as
-    /// `notifications/resources/updated`.
-    fn spawn_event_forwarder(&self, session_peer: Peer<RoleServer>) {
+    /// `notifications/resources/updated` — spawned at most once, on the first
+    /// subscribe. Exits once `session_peer`'s transport has closed: checked on every
+    /// event and every [`SESSION_CLOSED_POLL`], so a quiet daemon cannot strand it.
+    fn ensure_event_forwarder(&self, session_peer: &Peer<RoleServer>) {
+        if self.forwarder_started.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let session_peer = session_peer.clone();
         let mut event_rx = self.api.subscribe_events();
         let subs_for_task = self.subscribers.clone();
         tokio::spawn(async move {
+            let mut closed_poll = tokio::time::interval(SESSION_CLOSED_POLL);
             loop {
-                let received = event_rx.recv().await;
+                // broadcast::Receiver::recv is cancel-safe, so losing the race to the
+                // poll tick drops no event.
+                let received = tokio::select! {
+                    r = event_rx.recv() => Some(r),
+                    _ = closed_poll.tick() => None,
+                };
                 if session_peer.is_transport_closed() {
                     debug!("Session closed — stopping resource event forwarder");
                     break;
                 }
+                let Some(received) = received else { continue };
                 match received {
                     Ok(event) => {
                         let uris = event_to_resource_uris(&event);
@@ -235,62 +322,6 @@ impl DelugeServer {
         ctx: &RequestContext<RoleServer>,
     ) -> String {
         shape_response(value, &self.resolve_config(ctx))
-    }
-
-    /// Spawn the plugin watcher. Listens for Deluge `PluginEnabled`/`PluginDisabled`
-    /// events for the Label plugin and updates the [`ToolGate`] accordingly.
-    /// On reconnect or broadcast lag it re-probes via `core.get_enabled_plugins`
-    /// to recover the authoritative state.
-    fn spawn_plugin_watcher(&self, session_peer: Peer<RoleServer>) {
-        let api = self.api.clone();
-        let gate = self.gate.clone();
-        let connected_peers = self.connected_peers.clone();
-        let mut event_rx = api.subscribe_events();
-
-        tokio::spawn(async move {
-            // Seed from an authoritative probe. The constructor's
-            // `initial_label_plugin_active` may be stale (e.g. captured at
-            // process start but the plugin toggled before this HTTP session
-            // opened), and the broadcast receiver was created above — any
-            // events that arrive between here and the loop will be buffered.
-            if let Some(active) = api.label_plugin_active().await {
-                apply_label_state(active, &gate, &connected_peers).await;
-            }
-
-            loop {
-                let received = event_rx.recv().await;
-                if session_peer.is_transport_closed() {
-                    debug!("Session closed — stopping plugin watcher");
-                    break;
-                }
-                match received {
-                    Ok(DelugeEvent::PluginEnabled { name }) if name == "Label" => {
-                        apply_label_state(true, &gate, &connected_peers).await;
-                    }
-                    Ok(DelugeEvent::PluginDisabled { name }) if name == "Label" => {
-                        apply_label_state(false, &gate, &connected_peers).await;
-                    }
-                    Ok(DelugeEvent::Reconnected) => {
-                        // Re-seed from the daemon — the previous state may be stale
-                        // and `set_event_interest` was just re-issued, so we may have
-                        // missed transitions while disconnected.
-                        if let Some(active) = api.label_plugin_active().await {
-                            apply_label_state(active, &gate, &connected_peers).await;
-                        }
-                    }
-                    Err(RecvError::Lagged(n)) => {
-                        warn!(
-                            "Plugin watcher lagged by {n} events — re-probing plugin state"
-                        );
-                        if let Some(active) = api.label_plugin_active().await {
-                            apply_label_state(active, &gate, &connected_peers).await;
-                        }
-                    }
-                    Err(RecvError::Closed) => break,
-                    _ => {}
-                }
-            }
-        });
     }
 
     /// Auto-detect the source type and add a single torrent to Deluge.
@@ -449,12 +480,14 @@ impl ServerHandler for DelugeServer {
         if context.peer.peer_info().is_none() {
             context.peer.set_peer_info(request.clone());
         }
-        // Negotiate first: a refused version gets no peer tracking or background tasks.
-        let result = self.negotiate_initialize(&request)?;
-        // Track this peer so the plugin watcher can deliver tools/list_changed.
-        self.connected_peers.write().await.push(context.peer.clone());
-        self.start_session_tasks(&context.peer);
-        Ok(result)
+        self.negotiate_initialize(&request)
+    }
+
+    /// Register the peer for `tools/list_changed` only once the client has completed
+    /// the handshake; stateless requests never send this and are never registered.
+    async fn on_initialized(&self, context: NotificationContext<RoleServer>) {
+        debug!("client initialized");
+        self.register_peer(&context.peer).await;
     }
 
     /// Cap negotiation at 2025-11-25, the last revision with an `initialize` handshake.
@@ -631,6 +664,7 @@ impl ServerHandler for DelugeServer {
             .write()
             .await
             .insert(uri.clone(), context.peer.clone());
+        self.ensure_event_forwarder(&context.peer);
         debug!("Subscribed to resource {uri}");
         Ok(())
     }
@@ -729,5 +763,15 @@ mod tests {
         // 2026-07-28 drops `initialize` and sessions, which peer tracking, resource
         // subscriptions and the plugin watcher depend on. See ADR-0014.
         assert!(!versions.contains(&ProtocolVersion::V_2026_07_28));
+    }
+
+    #[test]
+    fn add_torrent_schema_max_items_matches_handler_cap() {
+        let schema = rmcp::schemars::schema_for!(params::AddTorrentParams);
+        let json = serde_json::to_value(&schema).unwrap();
+        assert_eq!(
+            json["properties"]["torrent_sources"]["maxItems"],
+            serde_json::json!(super::MAX_TORRENT_SOURCES)
+        );
     }
 }

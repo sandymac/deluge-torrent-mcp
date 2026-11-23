@@ -390,6 +390,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-native-tls",
+ "tokio-util",
  "tower",
  "tower-http",
  "tracing",

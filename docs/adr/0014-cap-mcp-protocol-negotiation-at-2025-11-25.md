@@ -36,13 +36,12 @@ through `2025-11-25`. `initialize` negotiates with `negotiate_initialize` agains
 and `server/discover` advertises only it. The HTTP transport keeps
 `legacy_session_mode(true)` explicitly.
 
-Keep the session factory and `DelugeServer::new` side-effect free. The plugin watcher and
-resource-event forwarder are spawned from `initialize` (after successful negotiation), once
-per server instance, and each exits on its next Deluge event once its session's peer
-transport has closed.
-
-Logging (`logging/setLevel`) is deprecated by SEP-2577 in `2026-07-28` but remains part of
-every revision we negotiate, so the capability stays, with `#[allow(deprecated)]`.
+Keep the session factory and `DelugeServer::new` side-effect free. The tool gate, the
+registry of initialized peers, and the Label-plugin watcher are process-wide
+(`SharedState`, one watcher per process), so stateless requests also see live plugin state.
+A session registers its peer on `notifications/initialized` (once, pruning closed peers) and
+spawns its resource-event forwarder on its first `resources/subscribe`; the forwarder exits
+within 30 s of its session's transport closing, even if the daemon is idle.
 
 ## Consequences
 
@@ -51,9 +50,8 @@ every revision we negotiate, so the capability stays, with `#[allow(deprecated)]
   stateless requests naming `2026-07-28` are rejected (`-32022`) with the supported list.
   Current clients negotiate `2025-11-25` or earlier as before.
 - Stateless requests at a supported version (inline `_meta`, no `initialize`) are still
-  served, but without push notifications and with the Label-plugin gate as of process
-  start rather than live.
+  served with live tool gating, but receive no push notifications.
 - Raising the ceiling requires moving peer tracking, subscriptions and the plugin watcher
-  onto SEP-2575 listen streams, and making the watcher process-wide instead of per session.
+  onto SEP-2575 listen streams.
   A unit test (`protocol_negotiation_is_capped_at_last_initialize_revision`) fails if the
   ceiling moves without that work.

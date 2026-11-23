@@ -7,7 +7,7 @@
 //! that should be re-fetched; [`apply_label_state`] records a Label-plugin
 //! toggle in the [`ToolGate`] and, when the visible tool set changes, fans out
 //! `tools/list_changed` to every connected peer. The watcher task that drives
-//! these lives in [`DelugeServer::spawn_plugin_watcher`](super::DelugeServer).
+//! these lives in [`SharedState::spawn_plugin_watcher`](super::SharedState).
 
 use std::sync::Arc;
 

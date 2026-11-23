@@ -30,7 +30,7 @@ Cargo for package management and build system
 | `tower-http` | CORS and tracing middleware layers for axum |
 | `tracing` | Logging |
 | `tracing-subscriber` | Log output formatting — **must be configured to write to stderr or a file, never stdout**. Any output on stdout corrupts the JSON-RPC framing used by the MCP stdio transport. |
-| `clap` | CLI args (Deluge host/port/credentials, transport selection, `--enable-tool`, `--disable-tool`, `--list-tools`, `--api-token`, `--http-bind`, `--test-connection`, `--oauth-issuer`, `--oauth-state-file`, `--response-config`) — credentials, OAuth, and response-shaping settings can also be supplied via environment variables (`DELUGE_HOST`, `DELUGE_PORT`, `DELUGE_USERNAME`, `DELUGE_PASSWORD`, `DELUGE_API_TOKEN`, `DELUGE_OAUTH_ISSUER`, `DELUGE_OAUTH_STATE_FILE`, `DELUGE_RESPONSE_CONFIG`) |
+| `clap` | CLI args (Deluge host/port/credentials, transport selection, `--enable-tool`, `--disable-tool`, `--list-tools`, `--api-token`, `--http-bind`, `--allowed-host`, `--allowed-origin`, `--test-connection`, `--oauth-issuer`, `--oauth-state-file`, `--response-config`) — credentials, OAuth, and response-shaping settings can also be supplied via environment variables (`DELUGE_HOST`, `DELUGE_PORT`, `DELUGE_USERNAME`, `DELUGE_PASSWORD`, `DELUGE_API_TOKEN`, `DELUGE_ALLOWED_HOST`, `DELUGE_ALLOWED_ORIGIN`, `DELUGE_OAUTH_ISSUER`, `DELUGE_OAUTH_STATE_FILE`, `DELUGE_RESPONSE_CONFIG`) |
 
 rencode serialization is implemented internally as `src/rencode.rs` rather than using a third-party crate.
 
@@ -46,7 +46,7 @@ The server supports two MCP transports:
 - **stdio** — for local use with Claude Desktop and similar clients
 - **HTTP/SSE** — for remote use with network-accessible clients; MCP clients connect to `http://<host>:<port>/mcp`. Protected by optional Bearer token authentication (`--api-token`).
 
-MCP protocol negotiation is capped at `2025-11-25` (the last revision with `initialize`/sessions) because push notifications depend on sessions — see ADR-0014. Session background tasks start in `initialize`, never in `DelugeServer::new` or the HTTP session factory (rmcp 3 also calls the factory for stateless requests). Both transports cap a single message at 33 MiB (`MAX_MCP_MESSAGE_BYTES`), sized to the 32 MiB per-call `add_torrent` limit.
+MCP protocol negotiation is capped at `2025-11-25` (the last revision with `initialize`/sessions) because push notifications depend on sessions — see ADR-0014. `DelugeServer::new` and the HTTP session factory must stay side-effect free (rmcp 3 also calls the factory for stateless requests): the tool gate, peer registry and plugin watcher are process-wide (`SharedState`); a session registers its peer on `notifications/initialized` and starts its resource-event forwarder on first subscribe. Browser `Origin`s are rejected unless listed via `--allowed-origin`. Both transports cap a single message at 33 MiB (`MAX_MCP_MESSAGE_BYTES`), sized to the 32 MiB per-call `add_torrent` limit.
 
 ### Deluge RPC API
 Deluge exposes a custom binary RPC protocol over TCP (default port 58846). The daemon must be running and accessible. Authentication is required before issuing commands. The API is documented at https://deluge.readthedocs.io/en/deluge-2.0.1/reference/api.html

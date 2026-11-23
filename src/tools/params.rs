@@ -14,7 +14,7 @@ use serde::Deserialize;
 #[derive(Deserialize, schemars::JsonSchema)]
 pub(super) struct AddTorrentParams {
     /// Torrent sources to add. Each entry is auto-detected: magnet: URIs, http/https URLs, or base64-encoded .torrent file content.
-    #[schemars(length(min = 1))]
+    #[schemars(length(min = 1, max = 100))]
     pub(super) torrent_sources: Vec<String>,
 }
 
