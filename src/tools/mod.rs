@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Sandy McArthur, Jr.
 // SPDX-License-Identifier: MIT
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -45,8 +45,7 @@ mod values;
 use gate::ToolGate;
 use params::*;
 use plugin_watcher::{
-    NOTIFY_TIMEOUT, apply_label_state, event_to_resource_uris, prune_closed_peers,
-    spawn_tool_list_fanout,
+    apply_label_state, event_to_resource_uris, prune_closed_peers, spawn_tool_list_fanout,
 };
 
 /// Largest total of `torrent_sources` `add_torrent` accepts in one call (32 MiB) — a
@@ -181,6 +180,13 @@ impl SharedState {
     }
 }
 
+/// What woke the resource-event forwarder.
+enum ForwarderStep {
+    Event(Result<DelugeEvent, RecvError>),
+    Tick,
+    BatchDone,
+}
+
 /// How often a session's resource-event forwarder checks whether its session has
 /// closed, so an idle daemon (no events to wake it) cannot keep it alive.
 const SESSION_CLOSED_POLL: std::time::Duration = std::time::Duration::from_secs(30);
@@ -251,9 +257,17 @@ impl DelugeServer {
     }
 
     /// Forward Deluge push events to this session's resource subscribers as
-    /// `notifications/resources/updated` — spawned at most once, on the first
-    /// subscribe. Exits once `session_peer`'s transport has closed: checked on every
-    /// event and every [`SESSION_CLOSED_POLL`], so a quiet daemon cannot strand it.
+    /// `notifications/resources/updated` — spawned at most once, on the first subscribe,
+    /// and runs until the session closes (checked on every event and every
+    /// [`SESSION_CLOSED_POLL`], so a quiet daemon cannot strand it).
+    ///
+    /// At most one batch of sends is in flight. rmcp does not cancel a notification once
+    /// queued, and a client that stops reading its SSE stream blocks its session worker,
+    /// so instead of timing out (which would leave sends queued) or giving up (which
+    /// would silently end a subscription the client made once), URIs that change while a
+    /// batch is in flight are collected in a set and sent when it completes. A wedged
+    /// client therefore costs one in-flight batch plus a set bounded by its
+    /// subscriptions, and a slow-but-alive one still receives every changed URI.
     fn ensure_event_forwarder(&self, session_peer: &Peer<RoleServer>) {
         if self.forwarder_started.swap(true, Ordering::AcqRel) {
             return;
@@ -261,71 +275,60 @@ impl DelugeServer {
         let session_peer = session_peer.clone();
         let mut event_rx = self.api.subscribe_events();
         let subs_for_task = self.subscribed_uris.clone();
-        let forwarder_started = self.forwarder_started.clone();
         tokio::spawn(async move {
             let mut closed_poll = tokio::time::interval(SESSION_CLOSED_POLL);
-            'events: loop {
-                // broadcast::Receiver::recv is cancel-safe, so losing the race to the
-                // poll tick drops no event.
-                let received = tokio::select! {
-                    r = event_rx.recv() => Some(r),
-                    _ = closed_poll.tick() => None,
+            let mut pending: BTreeSet<String> = BTreeSet::new();
+            let mut inflight: Option<tokio::task::JoinHandle<()>> = None;
+            loop {
+                // broadcast::Receiver::recv is cancel-safe, so losing the race to another
+                // branch drops no event.
+                let step = tokio::select! {
+                    r = event_rx.recv() => ForwarderStep::Event(r),
+                    _ = closed_poll.tick() => ForwarderStep::Tick,
+                    _ = async { inflight.as_mut().expect("guarded").await }, if inflight.is_some() => {
+                        ForwarderStep::BatchDone
+                    }
                 };
                 if session_peer.is_transport_closed() {
                     debug!("Session closed — stopping resource event forwarder");
                     break;
                 }
-                let Some(received) = received else { continue };
-                match received {
-                    Ok(event) => {
+                match step {
+                    ForwarderStep::Tick => {}
+                    ForwarderStep::BatchDone => inflight = None,
+                    ForwarderStep::Event(Ok(event)) => {
                         let uris = event_to_resource_uris(&event);
-                        if uris.is_empty() {
-                            continue;
-                        }
-                        // Snapshot the matching URIs so no lock is held while sending.
-                        let targets: Vec<String> = {
+                        if !uris.is_empty() {
                             let subs = subs_for_task.read().await;
-                            uris.into_iter().filter(|u| subs.contains(u)).collect()
-                        };
-                        for uri in targets {
+                            pending.extend(uris.into_iter().filter(|u| subs.contains(u)));
+                        }
+                    }
+                    ForwarderStep::Event(Err(RecvError::Lagged(n))) => {
+                        // Events were dropped, so any subscribed resource may be stale:
+                        // tell the client to re-read all of them.
+                        warn!("Resource event subscriber lagged by {n} events — re-notifying all subscriptions");
+                        pending.extend(subs_for_task.read().await.iter().cloned());
+                    }
+                    ForwarderStep::Event(Err(RecvError::Closed)) => break,
+                }
+                if inflight.is_none() && !pending.is_empty() {
+                    let batch = std::mem::take(&mut pending);
+                    let peer = session_peer.clone();
+                    inflight = Some(tokio::spawn(async move {
+                        for uri in batch {
                             let param = ResourceUpdatedNotificationParam::new(uri.clone());
-                            match tokio::time::timeout(
-                                NOTIFY_TIMEOUT,
-                                session_peer.notify_resource_updated(param),
-                            )
-                            .await
-                            {
-                                Ok(Ok(())) => {}
-                                Ok(Err(e)) => {
-                                    // Only fails once the session's transport is gone.
-                                    debug!("resource_updated notification failed for {uri}: {e}");
-                                    break 'events;
-                                }
-                                Err(_) => {
-                                    // The client isn't draining its stream. A timed-out send
-                                    // stays queued inside rmcp (it is not cancelled), so
-                                    // retrying every event would pile them up. Stop; a new
-                                    // subscribe restarts the forwarder.
-                                    warn!(
-                                        "resource_updated timed out for {uri}; stopping this \
-                                         session's resource notifications until it re-subscribes"
-                                    );
-                                    break 'events;
-                                }
+                            if let Err(e) = peer.notify_resource_updated(param).await {
+                                // Only fails once the session's transport is gone.
+                                debug!("resource_updated notification failed for {uri}: {e}");
+                                break;
                             }
                         }
-                    }
-                    Err(RecvError::Lagged(n)) => {
-                        warn!(
-                            "Resource event subscriber lagged by {n} events — \
-                             some resource_updated notifications may have been missed"
-                        );
-                    }
-                    Err(RecvError::Closed) => break,
+                    }));
                 }
             }
-            // Let a later subscribe start a fresh forwarder.
-            forwarder_started.store(false, Ordering::Release);
+            if let Some(batch) = inflight {
+                batch.abort();
+            }
         });
     }
 

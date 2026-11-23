@@ -51,9 +51,13 @@ gate and wakes one persistent fan-out task through a `Notify` (one permit, so ra
 coalesce into one follow-up run). Each run notifies all peers concurrently with a 5 s
 timeout per peer, so one client that stops reading cannot stall other sessions or later
 toggles. rmcp does not cancel a timed-out send — it stays queued for that session — so
-coalescing also bounds the pile-up for a wedged peer to one per run. For the same reason the
-resource-event forwarder stops on its first timed-out send rather than queueing one per
-event; the session's next `resources/subscribe` starts a fresh forwarder.
+coalescing also bounds the pile-up for a wedged peer to one per run. The resource-event
+forwarder uses no timeout and never gives up while its session is open (a client
+subscribes once, so stopping would silently end its updates): it keeps at most one batch of
+sends in flight and gathers URIs that change meanwhile into a set, sent when the batch
+completes. A wedged client thus costs one in-flight batch plus a set bounded by its
+subscriptions; a slow one still receives every changed URI. On broadcast lag it
+re-notifies all subscribed URIs.
 
 Known limitation (pre-existing, also in rmcp 1.x): rmcp restarts a session's idle timer on
 every message the server sends and discards sends to a dropped SSE stream. A client that
