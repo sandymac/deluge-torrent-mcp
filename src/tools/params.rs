@@ -156,7 +156,7 @@ pub(super) struct ListTorrentsParams {
     pub(super) sort_by: Option<SortField>,
     /// Sort direction (default: asc).
     pub(super) sort_order: Option<SortOrder>,
-    /// Max torrents per page (default: 100).
+    /// Max torrents per page (default: 100). 0 returns only the counts, no torrents.
     pub(super) limit: Option<usize>,
     /// Torrents to skip (default: 0). Use next_offset from previous response to paginate.
     pub(super) offset: Option<usize>,

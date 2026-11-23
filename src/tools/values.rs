@@ -125,6 +125,28 @@ impl DelugeServer {
     pub(super) fn value_to_json_string(v: Value) -> String {
         serde_json::to_string(&crate::rencode::value_to_json(v)).unwrap_or_default()
     }
+
+    /// Pagination header for `list_torrents`. `next_offset` appears only when a further
+    /// page exists *and* this page advanced: a `limit` of 0 is a count-only request, so
+    /// it reports `has_more` truthfully but gives no `next_offset` a loop could spin on.
+    pub(super) fn page_summary(
+        total: usize,
+        offset: usize,
+        returned: usize,
+        limit: usize,
+    ) -> serde_json::Map<String, serde_json::Value> {
+        let has_more = offset.saturating_add(returned) < total;
+        let mut out = serde_json::Map::new();
+        out.insert("total".into(), serde_json::json!(total));
+        out.insert("returned".into(), serde_json::json!(returned));
+        out.insert("offset".into(), serde_json::json!(offset));
+        out.insert("limit".into(), serde_json::json!(limit));
+        out.insert("has_more".into(), serde_json::json!(has_more));
+        if has_more && returned > 0 {
+            out.insert("next_offset".into(), serde_json::json!(offset + returned));
+        }
+        out
+    }
 }
 
 #[cfg(test)]
@@ -157,6 +179,27 @@ mod tests {
             .iter()
             .map(|(_, v)| DelugeServer::torrent_name(v))
             .collect()
+    }
+
+    #[test]
+    fn page_summary_limit_zero_is_count_only() {
+        let s = DelugeServer::page_summary(23, 0, 0, 0);
+        assert_eq!(s["total"], 23);
+        assert_eq!(s["returned"], 0);
+        assert_eq!(s["limit"], 0);
+        assert_eq!(s["has_more"], true);
+        assert!(!s.contains_key("next_offset"), "count-only must not invite paging");
+    }
+
+    #[test]
+    fn page_summary_pages_forward() {
+        let s = DelugeServer::page_summary(23, 10, 10, 10);
+        assert_eq!(s["has_more"], true);
+        assert_eq!(s["next_offset"], 20);
+
+        let last = DelugeServer::page_summary(23, 20, 3, 10);
+        assert_eq!(last["has_more"], false);
+        assert!(!last.contains_key("next_offset"));
     }
 
     #[test]

@@ -129,7 +129,8 @@ impl DelugeServer {
         Parameters(p): Parameters<ListTorrentsParams>,
         context: RequestContext<RoleServer>,
     ) -> Result<String, String> {
-        let limit = p.limit.unwrap_or(100).max(1);
+        // limit 0 is a count-only request: honoured as-is, never clamped up to 1.
+        let limit = p.limit.unwrap_or(100);
         let offset = p.offset.unwrap_or(0);
         let sort_by = p.sort_by.unwrap_or(SortField::Name);
         let sort_order = p.sort_order.unwrap_or(SortOrder::Asc);
@@ -223,18 +224,7 @@ impl DelugeServer {
         Self::sort_torrent_pairs(&mut pairs, sort_by, sort_order);
 
         let page: Vec<_> = pairs.into_iter().skip(offset).take(limit).collect();
-        let returned = page.len();
-        let has_more = offset + returned < total;
-
-        let mut out = serde_json::Map::new();
-        out.insert("total".into(), serde_json::json!(total));
-        out.insert("returned".into(), serde_json::json!(returned));
-        out.insert("offset".into(), serde_json::json!(offset));
-        out.insert("limit".into(), serde_json::json!(limit));
-        out.insert("has_more".into(), serde_json::json!(has_more));
-        if has_more {
-            out.insert("next_offset".into(), serde_json::json!(offset + returned));
-        }
+        let mut out = Self::page_summary(total, offset, page.len(), limit);
 
         let mut torrents = serde_json::Map::new();
         for (k, mut v) in page {
