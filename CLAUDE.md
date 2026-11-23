@@ -46,6 +46,8 @@ The server supports two MCP transports:
 - **stdio** — for local use with Claude Desktop and similar clients
 - **HTTP/SSE** — for remote use with network-accessible clients; MCP clients connect to `http://<host>:<port>/mcp`. Protected by optional Bearer token authentication (`--api-token`).
 
+MCP protocol negotiation is capped at `2025-11-25` (the last revision with `initialize`/sessions) because push notifications depend on sessions — see ADR-0014. Session background tasks start in `initialize`, never in `DelugeServer::new` or the HTTP session factory (rmcp 3 also calls the factory for stateless requests). Both transports cap a single message at 33 MiB (`MAX_MCP_MESSAGE_BYTES`), sized to the 32 MiB per-call `add_torrent` limit.
+
 ### Deluge RPC API
 Deluge exposes a custom binary RPC protocol over TCP (default port 58846). The daemon must be running and accessible. Authentication is required before issuing commands. The API is documented at https://deluge.readthedocs.io/en/deluge-2.0.1/reference/api.html
 

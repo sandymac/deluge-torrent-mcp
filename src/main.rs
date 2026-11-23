@@ -395,7 +395,6 @@ async fn main() -> anyhow::Result<()> {
                 initial_label_plugin_active,
                 response_config.clone(),
             );
-            server.spawn_plugin_watcher();
             // rmcp caps a stdio line at 16 MiB by default; raise it to match the largest
             // input add_torrent accepts (a 32 MiB base64 .torrent) while staying bounded.
             let (stdin, stdout) = rmcp::transport::stdio();
@@ -445,8 +444,10 @@ async fn main() -> anyhow::Result<()> {
                 .with_max_request_body_bytes(tools::MAX_MCP_MESSAGE_BYTES);
 
             // Build the MCP service — factory creates a DelugeServer per session.
-            // Each session spawns its own plugin watcher so it gets independent
-            // tools/list_changed delivery to its own peer.
+            // rmcp 3 also calls this factory for stateless requests (inline `_meta`,
+            // `server/discover`), so it must stay side-effect free: each server spawns its
+            // plugin watcher and resource-event forwarder from `initialize`, giving each
+            // real session independent tools/list_changed delivery to its own peer.
             let mcp_service = {
                 let api = api.clone();
                 let enabled_tools = enabled_tools.clone();
@@ -464,8 +465,7 @@ async fn main() -> anyhow::Result<()> {
                             // default used when a request URL carries no per-request config.
                             response_config.clone(),
                         );
-                        server.spawn_plugin_watcher();
-                        Ok(server)
+                                    Ok(server)
                     },
                     Arc::new(LocalSessionManager::default()),
                     http_config,

@@ -3,6 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use rmcp::{
@@ -45,14 +46,17 @@ use gate::ToolGate;
 use params::*;
 use plugin_watcher::{apply_label_state, event_to_resource_uris};
 
-/// Largest base64 `.torrent` payload `add_torrent` accepts per source (32 MiB).
+/// Largest total of `torrent_sources` `add_torrent` accepts in one call (32 MiB) — a
+/// single base64 `.torrent` or several summed. Enforced per call, not per source, so
+/// that everything the tool accepts also fits in one transport message.
 pub(crate) const MAX_BASE64_TORRENT_BYTES: usize = 32 * 1024 * 1024;
 
-/// Largest single MCP message either transport accepts: one maximal base64 torrent
-/// plus 1 MiB headroom for the JSON-RPC envelope and other arguments. Applied as
+/// Largest single MCP message either transport accepts: a maximal `add_torrent` call
+/// plus 1 MiB headroom for the JSON-RPC envelope and JSON string escaping. Applied as
 /// rmcp's HTTP `max_request_body_bytes` (default 4 MiB) and stdio `max_line_length`
 /// (default 16 MiB) so neither transport rejects an input `add_torrent` would accept,
-/// while still bounding memory per message.
+/// while still bounding memory per message. Oversized messages get HTTP 413; on stdio
+/// rmcp drops the line and logs to stderr without a JSON-RPC error.
 pub(crate) const MAX_MCP_MESSAGE_BYTES: usize = MAX_BASE64_TORRENT_BYTES + 1024 * 1024;
 const _: () = assert!(MAX_MCP_MESSAGE_BYTES > MAX_BASE64_TORRENT_BYTES);
 
@@ -106,6 +110,12 @@ pub(crate) struct DelugeServer {
     /// process-wide config from `--response-config`; on HTTP it is the fallback when a request's
     /// per-request config is absent. See [`Self::resolve_config`].
     default_config: ResponseConfig,
+    /// Set once this server's session background tasks (resource-event forwarder and
+    /// plugin watcher) have been spawned. They start from `initialize`, not construction:
+    /// rmcp 3 also runs the HTTP session factory for stateless requests (inline `_meta`,
+    /// `server/discover`) that never initialize, and spawning there leaked two tasks per
+    /// request. See [`Self::start_session_tasks`].
+    session_tasks_started: Arc<AtomicBool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -129,12 +139,43 @@ impl DelugeServer {
         let subscribers: Arc<RwLock<HashMap<String, Peer<RoleServer>>>> =
             Arc::new(RwLock::new(HashMap::new()));
 
-        // Background task: forward Deluge push events to subscribed MCP peers.
-        let mut event_rx = api.subscribe_events();
-        let subs_for_task = subscribers.clone();
+        Self {
+            api,
+            gate,
+            tool_router: Self::build_tool_router(),
+            subscribers,
+            connected_peers: Arc::new(RwLock::new(Vec::new())),
+            default_config,
+            session_tasks_started: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Spawn this session's background tasks — at most once per server instance.
+    ///
+    /// Called from `initialize`, so only real sessions (stdio, or an HTTP session that
+    /// completed the handshake) get them. Each task exits after the next Deluge event
+    /// once `peer`'s transport has closed, so ended sessions stop accumulating tasks.
+    fn start_session_tasks(&self, peer: &Peer<RoleServer>) {
+        if self.session_tasks_started.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        self.spawn_event_forwarder(peer.clone());
+        self.spawn_plugin_watcher(peer.clone());
+    }
+
+    /// Forward Deluge push events to this session's resource subscribers as
+    /// `notifications/resources/updated`.
+    fn spawn_event_forwarder(&self, session_peer: Peer<RoleServer>) {
+        let mut event_rx = self.api.subscribe_events();
+        let subs_for_task = self.subscribers.clone();
         tokio::spawn(async move {
             loop {
-                match event_rx.recv().await {
+                let received = event_rx.recv().await;
+                if session_peer.is_transport_closed() {
+                    debug!("Session closed — stopping resource event forwarder");
+                    break;
+                }
+                match received {
                     Ok(event) => {
                         let uris = event_to_resource_uris(&event);
                         if uris.is_empty() {
@@ -175,15 +216,6 @@ impl DelugeServer {
                 }
             }
         });
-
-        Self {
-            api,
-            gate,
-            tool_router: Self::build_tool_router(),
-            subscribers,
-            connected_peers: Arc::new(RwLock::new(Vec::new())),
-            default_config,
-        }
     }
 
     /// Resolve the [`ResponseConfig`] for the current call.
@@ -209,7 +241,7 @@ impl DelugeServer {
     /// events for the Label plugin and updates the [`ToolGate`] accordingly.
     /// On reconnect or broadcast lag it re-probes via `core.get_enabled_plugins`
     /// to recover the authoritative state.
-    pub(crate) fn spawn_plugin_watcher(&self) {
+    fn spawn_plugin_watcher(&self, session_peer: Peer<RoleServer>) {
         let api = self.api.clone();
         let gate = self.gate.clone();
         let connected_peers = self.connected_peers.clone();
@@ -226,7 +258,12 @@ impl DelugeServer {
             }
 
             loop {
-                match event_rx.recv().await {
+                let received = event_rx.recv().await;
+                if session_peer.is_transport_closed() {
+                    debug!("Session closed — stopping plugin watcher");
+                    break;
+                }
+                match received {
                     Ok(DelugeEvent::PluginEnabled { name }) if name == "Label" => {
                         apply_label_state(true, &gate, &connected_peers).await;
                     }
@@ -412,9 +449,12 @@ impl ServerHandler for DelugeServer {
         if context.peer.peer_info().is_none() {
             context.peer.set_peer_info(request.clone());
         }
+        // Negotiate first: a refused version gets no peer tracking or background tasks.
+        let result = self.negotiate_initialize(&request)?;
         // Track this peer so the plugin watcher can deliver tools/list_changed.
         self.connected_peers.write().await.push(context.peer.clone());
-        self.negotiate_initialize(&request)
+        self.start_session_tasks(&context.peer);
+        Ok(result)
     }
 
     /// Cap negotiation at 2025-11-25, the last revision with an `initialize` handshake.
@@ -473,7 +513,10 @@ impl ServerHandler for DelugeServer {
             Resource::new("deluge://torrents", "All Torrents")
                 .with_title("All Torrents")
                 .with_description(
-                    "Snapshot of all torrents with current status, as                      {\"torrents\": {<info_hash>: {fields}}}.                      Subscribe for live updates when torrents are added, removed,                      or change state.",
+                    "Snapshot of all torrents with current status, as \
+                     {\"torrents\": {<info_hash>: {fields}}}. \
+                     Subscribe for live updates when torrents are added, removed, \
+                     or change state.",
                 )
                 .with_mime_type("application/json"),
         ]))
@@ -488,7 +531,9 @@ impl ServerHandler for DelugeServer {
             ResourceTemplate::new("deluge://torrent/{info_hash}", "Torrent Status")
                 .with_title("Torrent Status")
                 .with_description(
-                    "Complete status and metadata for a single torrent.                      Subscribe for live updates on state changes, file renames,                      and storage moves.",
+                    "Complete status and metadata for a single torrent. \
+                     Subscribe for live updates on state changes, file renames, \
+                     and storage moves.",
                 )
                 .with_mime_type("application/json"),
         ]))

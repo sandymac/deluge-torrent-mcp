@@ -18,10 +18,15 @@ Several features of this server depend on `initialize` and a long-lived session:
 - `DelugeServer::initialize` records each peer in `connected_peers`, which is how the plugin
   watcher delivers `notifications/tools/list_changed` when the Label plugin flips (ADR-0008).
 - Resource subscriptions (`resources/subscribe`) keep a `Peer` to push `resources/updated`.
-- The HTTP session factory spawns one plugin watcher per session; served statelessly it
-  would spawn one per request.
+- Each server instance runs a plugin watcher and a resource-event forwarder.
 
 A `2026-07-28` client would get none of the push behaviour, with no error on either side.
+
+Separately, rmcp 3 runs the HTTP session factory for *any* request it routes statelessly —
+`server/discover`, and sessionless POSTs carrying inline `_meta` (protocol version + client
+capabilities) — even in legacy session mode, and even when the request is then rejected for
+its version. The factory used to spawn both background tasks, so each such request leaked
+two tasks that lived until process exit.
 
 ## Decision
 
@@ -31,13 +36,23 @@ through `2025-11-25`. `initialize` negotiates with `negotiate_initialize` agains
 and `server/discover` advertises only it. The HTTP transport keeps
 `legacy_session_mode(true)` explicitly.
 
+Keep the session factory and `DelugeServer::new` side-effect free. The plugin watcher and
+resource-event forwarder are spawned from `initialize` (after successful negotiation), once
+per server instance, and each exits on its next Deluge event once its session's peer
+transport has closed.
+
 Logging (`logging/setLevel`) is deprecated by SEP-2577 in `2026-07-28` but remains part of
 every revision we negotiate, so the capability stays, with `#[allow(deprecated)]`.
 
 ## Consequences
 
-- Clients that only speak `2026-07-28` are refused at negotiation rather than silently
-  losing notifications. Current clients still negotiate `2025-11-25` or earlier.
+- An `initialize` requesting `2026-07-28` is answered with `2025-11-25` (standard
+  version fallback); the client gets a full session or disconnects. `server/discover` and
+  stateless requests naming `2026-07-28` are rejected (`-32022`) with the supported list.
+  Current clients negotiate `2025-11-25` or earlier as before.
+- Stateless requests at a supported version (inline `_meta`, no `initialize`) are still
+  served, but without push notifications and with the Label-plugin gate as of process
+  start rather than live.
 - Raising the ceiling requires moving peer tracking, subscriptions and the plugin watcher
   onto SEP-2575 listen streams, and making the watcher process-wide instead of per session.
   A unit test (`protocol_negotiation_is_capped_at_last_initialize_revision`) fails if the
