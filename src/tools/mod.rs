@@ -44,7 +44,10 @@ mod values;
 
 use gate::ToolGate;
 use params::*;
-use plugin_watcher::{NOTIFY_TIMEOUT, apply_label_state, event_to_resource_uris, prune_closed_peers};
+use plugin_watcher::{
+    NOTIFY_TIMEOUT, apply_label_state, event_to_resource_uris, prune_closed_peers,
+    spawn_tool_list_fanout,
+};
 
 /// Largest total of `torrent_sources` `add_torrent` accepts in one call (32 MiB) — a
 /// single base64 `.torrent` or several summed. Enforced per call, not per source, so
@@ -136,30 +139,30 @@ impl SharedState {
     /// `core.get_enabled_plugins` to recover the authoritative state.
     pub(crate) fn spawn_plugin_watcher(&self, api: DelugeApi) {
         let gate = self.gate.clone();
-        let connected_peers = self.connected_peers.clone();
+        let fanout = spawn_tool_list_fanout(self.connected_peers.clone());
         let mut event_rx = api.subscribe_events();
 
         tokio::spawn(async move {
             // Seed from an authoritative probe: the startup value may already be stale,
             // and the receiver above buffers any events that arrive meanwhile.
             if let Some(active) = api.label_plugin_active().await {
-                apply_label_state(active, &gate, &connected_peers).await;
+                apply_label_state(active, &gate, &fanout);
             }
 
             loop {
                 match event_rx.recv().await {
                     Ok(DelugeEvent::PluginEnabled { name }) if name == "Label" => {
-                        apply_label_state(true, &gate, &connected_peers).await;
+                        apply_label_state(true, &gate, &fanout);
                     }
                     Ok(DelugeEvent::PluginDisabled { name }) if name == "Label" => {
-                        apply_label_state(false, &gate, &connected_peers).await;
+                        apply_label_state(false, &gate, &fanout);
                     }
                     Ok(DelugeEvent::Reconnected) => {
                         // Re-seed from the daemon — the previous state may be stale
                         // and `set_event_interest` was just re-issued, so we may have
                         // missed transitions while disconnected.
                         if let Some(active) = api.label_plugin_active().await {
-                            apply_label_state(active, &gate, &connected_peers).await;
+                            apply_label_state(active, &gate, &fanout);
                         }
                     }
                     Err(RecvError::Lagged(n)) => {
@@ -167,7 +170,7 @@ impl SharedState {
                             "Plugin watcher lagged by {n} events — re-probing plugin state"
                         );
                         if let Some(active) = api.label_plugin_active().await {
-                            apply_label_state(active, &gate, &connected_peers).await;
+                            apply_label_state(active, &gate, &fanout);
                         }
                     }
                     Err(RecvError::Closed) => break,
@@ -258,9 +261,10 @@ impl DelugeServer {
         let session_peer = session_peer.clone();
         let mut event_rx = self.api.subscribe_events();
         let subs_for_task = self.subscribed_uris.clone();
+        let forwarder_started = self.forwarder_started.clone();
         tokio::spawn(async move {
             let mut closed_poll = tokio::time::interval(SESSION_CLOSED_POLL);
-            loop {
+            'events: loop {
                 // broadcast::Receiver::recv is cancel-safe, so losing the race to the
                 // poll tick drops no event.
                 let received = tokio::select! {
@@ -295,13 +299,18 @@ impl DelugeServer {
                                 Ok(Err(e)) => {
                                     // Only fails once the session's transport is gone.
                                     debug!("resource_updated notification failed for {uri}: {e}");
-                                    break;
+                                    break 'events;
                                 }
                                 Err(_) => {
-                                    // The client isn't draining its stream; drop this batch
-                                    // rather than backing up the forwarder.
-                                    debug!("resource_updated notification timed out for {uri}");
-                                    break;
+                                    // The client isn't draining its stream. A timed-out send
+                                    // stays queued inside rmcp (it is not cancelled), so
+                                    // retrying every event would pile them up. Stop; a new
+                                    // subscribe restarts the forwarder.
+                                    warn!(
+                                        "resource_updated timed out for {uri}; stopping this \
+                                         session's resource notifications until it re-subscribes"
+                                    );
+                                    break 'events;
                                 }
                             }
                         }
@@ -315,6 +324,8 @@ impl DelugeServer {
                     Err(RecvError::Closed) => break,
                 }
             }
+            // Let a later subscribe start a fresh forwarder.
+            forwarder_started.store(false, Ordering::Release);
         });
     }
 

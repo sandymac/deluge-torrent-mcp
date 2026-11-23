@@ -12,7 +12,7 @@
 use std::sync::Arc;
 
 use rmcp::{Peer, RoleServer};
-use tokio::sync::RwLock;
+use tokio::sync::{Notify, RwLock};
 use tracing::{debug, info, warn};
 
 use super::gate::ToolGate;
@@ -41,13 +41,9 @@ pub(super) fn event_to_resource_uris(event: &DelugeEvent) -> Vec<String> {
 }
 
 /// Apply a new Label-plugin state to the [`ToolGate`]. If it actually changes
-/// the visible tool set, fans out `tools/list_changed` to every connected peer.
-/// Peers whose session has closed are pruned.
-pub(super) async fn apply_label_state(
-    active: bool,
-    gate: &Arc<ToolGate>,
-    connected_peers: &Arc<RwLock<Vec<Peer<RoleServer>>>>,
-) {
+/// the visible tool set, wakes the `tools/list_changed` fan-out (see
+/// [`spawn_tool_list_fanout`]). Never awaits a client.
+pub(super) fn apply_label_state(active: bool, gate: &Arc<ToolGate>, fanout: &Notify) {
     if !gate.set_label_plugin_active(active) {
         return;
     }
@@ -56,31 +52,48 @@ pub(super) async fn apply_label_state(
         "Label plugin is now {} on the Deluge daemon — tool list updated",
         if active { "enabled" } else { "disabled" }
     );
+    fanout.notify_one();
+}
 
-    // Fan out tools/list_changed from a snapshot (no lock held across awaits), off the
-    // watcher loop and concurrently, each send bounded by NOTIFY_TIMEOUT. rmcp's send
-    // waits for room in the session's outbound channel, so one client that stops
-    // reading its SSE stream would otherwise stall every other peer and the watcher
-    // itself — which is process-wide, so later toggles would never reach the gate.
-    let peers_snapshot: Vec<Peer<RoleServer>> = connected_peers.read().await.clone();
-    let connected_peers = connected_peers.clone();
+/// Spawn the process-wide `tools/list_changed` fan-out task and return its waker.
+///
+/// One persistent task, not one per toggle: [`Notify`] holds at most one permit, so
+/// toggles that arrive while a fan-out is running coalesce into a single follow-up run
+/// (the notification carries no payload; clients re-fetch `tools/list`, which already
+/// reflects the gate). Each run notifies a snapshot of peers concurrently, each send
+/// bounded by [`NOTIFY_TIMEOUT`], so a client that stops reading its SSE stream cannot
+/// stall the others. A timed-out send stays queued inside rmcp and is not cancelled, so
+/// coalescing also bounds how many can pile up for a wedged peer: one per run.
+pub(super) fn spawn_tool_list_fanout(
+    connected_peers: Arc<RwLock<Vec<Peer<RoleServer>>>>,
+) -> Arc<Notify> {
+    let wake = Arc::new(Notify::new());
+    let wake_task = wake.clone();
     tokio::spawn(async move {
-        let mut sends = tokio::task::JoinSet::new();
-        for peer in peers_snapshot {
-            sends.spawn(async move {
-                match tokio::time::timeout(NOTIFY_TIMEOUT, peer.notify_tool_list_changed()).await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => debug!("notify_tool_list_changed failed for a peer: {e}"),
-                    Err(_) => warn!("notify_tool_list_changed timed out for a peer; skipping it"),
-                }
-            });
-        }
-        while sends.join_next().await.is_some() {}
+        loop {
+            wake_task.notified().await;
+            // Snapshot so no lock is held across awaits.
+            let peers_snapshot: Vec<Peer<RoleServer>> = connected_peers.read().await.clone();
+            let mut sends = tokio::task::JoinSet::new();
+            for peer in peers_snapshot {
+                sends.spawn(async move {
+                    match tokio::time::timeout(NOTIFY_TIMEOUT, peer.notify_tool_list_changed())
+                        .await
+                    {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => debug!("notify_tool_list_changed failed for a peer: {e}"),
+                        Err(_) => warn!("notify_tool_list_changed timed out for a peer"),
+                    }
+                });
+            }
+            while sends.join_next().await.is_some() {}
 
-        // Prune by the peer's own state, never by position: sessions register and
-        // prune concurrently, so indices from the snapshot cannot be trusted here.
-        prune_closed_peers(&mut *connected_peers.write().await);
+            // Prune by the peer's own state, never by position: sessions register and
+            // prune concurrently, so indices from the snapshot cannot be trusted here.
+            prune_closed_peers(&mut *connected_peers.write().await);
+        }
     });
+    wake
 }
 
 /// Upper bound on one server→client notification send. A peer that cannot accept
@@ -90,4 +103,48 @@ pub(super) const NOTIFY_TIMEOUT: std::time::Duration = std::time::Duration::from
 /// Drop peers whose session transport has closed.
 pub(super) fn prune_closed_peers(peers: &mut Vec<Peer<RoleServer>>) {
     peers.retain(|p| !p.is_transport_closed());
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use tokio::sync::Notify;
+
+    use super::apply_label_state;
+    use crate::tools::gate::ToolGate;
+
+    fn gate() -> Arc<ToolGate> {
+        let tool = "deluge_list_labels".to_string();
+        Arc::new(ToolGate::new(
+            HashSet::from([tool.clone()]),
+            HashSet::from([tool]),
+            false,
+        ))
+    }
+
+    async fn woken(fanout: &Notify) -> bool {
+        tokio::time::timeout(Duration::from_millis(50), fanout.notified()).await.is_ok()
+    }
+
+    #[tokio::test]
+    async fn wakes_fanout_only_when_visibility_changes() {
+        let (gate, fanout) = (gate(), Notify::new());
+        apply_label_state(false, &gate, &fanout); // unchanged
+        assert!(!woken(&fanout).await);
+        apply_label_state(true, &gate, &fanout); // changed
+        assert!(woken(&fanout).await);
+    }
+
+    #[tokio::test]
+    async fn rapid_toggles_coalesce_into_one_wake() {
+        let (gate, fanout) = (gate(), Notify::new());
+        for active in [true, false, true, false, true] {
+            apply_label_state(active, &gate, &fanout);
+        }
+        assert!(woken(&fanout).await);
+        assert!(!woken(&fanout).await, "Notify should hold at most one permit");
+    }
 }

@@ -37,9 +37,35 @@ struct RequestOrigin {
     port: u16,
 }
 
+/// Literal syntax check run before URL parsing. The WHATWG parser silently repairs
+/// input — backslashes, dot segments, tabs and spaces, an empty port (`h:`), empty
+/// userinfo (`@h`) — so without this a malformed entry would pass startup, and a
+/// non-canonical request `Origin` could pass CORS while rmcp's stricter check rejects it.
+fn check_origin_syntax(s: &str) -> Result<(), String> {
+    let lower = s.to_ascii_lowercase();
+    let authority = lower
+        .strip_prefix("http://")
+        .or_else(|| lower.strip_prefix("https://"))
+        .ok_or_else(|| "must start with http:// or https://".to_string())?;
+    if authority.is_empty() {
+        return Err("missing host".to_string());
+    }
+    if let Some(c) = authority
+        .chars()
+        .find(|c| matches!(c, '/' | '\\' | '?' | '#' | '@') || c.is_ascii_whitespace() || c.is_control())
+    {
+        return Err(format!("unexpected character {c:?}; use scheme://host[:port]"));
+    }
+    if authority.ends_with(':') {
+        return Err("empty port".to_string());
+    }
+    Ok(())
+}
+
 /// Parse `scheme://host[:port]` into (scheme, canonical host, effective port).
 /// Rejects anything that is not a bare http(s) origin.
 fn parse_origin(s: &str) -> Result<(String, String, u16), String> {
+    check_origin_syntax(s)?;
     let url = url::Url::parse(s).map_err(|e| format!("not a valid origin ({e})"))?;
     let scheme = url.scheme();
     if scheme != "http" && scheme != "https" {
@@ -200,6 +226,10 @@ mod tests {
             "", "  ", "localhost:6274", "ftp://x", "http://", "http://h/path", "http://h/",
             "http://h:0", "http://h:99999", "http://u@h", "http://h?q", "http://::1:8080",
             "http://[oops]:8080", "http://*.example.com", "http://h:8080:*", "null",
+            // Forms the URL parser would silently repair:
+            "http://localhost:6274/a/..", "http://localhost:6274\\", "http:\\\\localhost:6274",
+            "http://@localhost:6274", "http://localhost:", "http://localhost:6274/ ",
+            "http://loc\talhost:6274",
         ] {
             assert!(AllowedOrigins::parse(&[bad.to_string()]).is_err(), "{bad:?} should be rejected");
         }

@@ -46,10 +46,14 @@ would drop `tools/list_changed` for them). `resources/subscribe` is refused outs
 initialized session; the first one spawns the session's resource-event forwarder, which
 exits within 30 s of its session's transport closing, even if the daemon is idle. Peers are
 pruned by their own closed state, never by list position, because registration and
-fan-out run concurrently. The single watcher never awaits clients itself: each toggle's
-`tools/list_changed` fan-out runs in its own task, concurrently, with a 5 s timeout per
-peer, so one client that stops reading cannot stall other sessions or later toggles. The
-resource-event forwarder bounds each send the same way.
+fan-out run concurrently. The single watcher never awaits clients itself: it updates the
+gate and wakes one persistent fan-out task through a `Notify` (one permit, so rapid toggles
+coalesce into one follow-up run). Each run notifies all peers concurrently with a 5 s
+timeout per peer, so one client that stops reading cannot stall other sessions or later
+toggles. rmcp does not cancel a timed-out send — it stays queued for that session — so
+coalescing also bounds the pile-up for a wedged peer to one per run. For the same reason the
+resource-event forwarder stops on its first timed-out send rather than queueing one per
+event; the session's next `resources/subscribe` starts a fresh forwarder.
 
 Known limitation (pre-existing, also in rmcp 1.x): rmcp restarts a session's idle timer on
 every message the server sends and discards sends to a dropped SSE stream. A client that
