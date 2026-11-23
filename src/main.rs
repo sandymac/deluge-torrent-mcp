@@ -16,6 +16,7 @@ use tracing::{info, warn};
 mod deluge;
 mod ids;
 mod oauth;
+mod origin;
 mod rencode;
 mod response_config;
 mod tools;
@@ -101,7 +102,8 @@ struct Cli {
     allowed_host: Vec<String>,
 
     /// Browser origin(s) allowed to call the HTTP transport, e.g. a browser-based MCP
-    /// client such as http://localhost:6274. Include the scheme; use `:*` for any port.
+    /// client such as http://localhost:6274. Format scheme://host[:port]; an omitted port
+    /// means the scheme's default, `:*` means any port; a malformed entry fails startup.
     /// Requests carrying any other Origin header are rejected with 403, and with none
     /// configured every browser origin is rejected. Native MCP clients send no Origin and
     /// are unaffected. Comma-separated or repeated.
@@ -337,6 +339,10 @@ async fn main() -> anyhow::Result<()> {
         "Starting deluge-torrent-mcp"
     );
 
+    // Validate --allowed-origin before touching the network, so a typo fails fast.
+    let allowed_origins =
+        origin::AllowedOrigins::parse(&cli.allowed_origin).map_err(anyhow::Error::msg)?;
+
     let (client, auth_level) = deluge::DelugeClient::connect(
         &cli.host,
         cli.port,
@@ -424,7 +430,6 @@ async fn main() -> anyhow::Result<()> {
                 StreamableHttpService,
             };
             use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
-            use tower_http::cors::CorsLayer;
             use tower_http::trace::TraceLayer;
 
             if cli.api_token.is_none() && cli.oauth_issuer.is_none() {
@@ -448,17 +453,22 @@ async fn main() -> anyhow::Result<()> {
             // site from calling a loopback server (the Host is legitimately 127.0.0.1), so
             // rmcp's Origin check is always on: requests carrying an Origin must match
             // --allowed-origin, and with none configured every browser Origin is rejected.
-            // Native MCP clients send no Origin and are unaffected.
-            if cli.allowed_origin.is_empty() {
+            // Native MCP clients send no Origin and are unaffected. Entries were validated
+            // at startup and normalized once, so rmcp's check and the CORS layer apply
+            // exactly the same policy.
+            if allowed_origins.is_empty() {
                 info!("HTTP Origin allow-list empty — browser-origin requests are rejected");
             } else {
-                info!(allowed_origins = %cli.allowed_origin.join(", "), "HTTP Origin allow-list");
+                info!(
+                    allowed_origins = %allowed_origins.normalized().join(", "),
+                    "HTTP Origin allow-list"
+                );
             }
             // Cancelled on shutdown so open SSE streams end and the axum drain completes.
             let mcp_cancel = tokio_util::sync::CancellationToken::new();
             let http_config = mcp_http_config(
                 allowed_hosts,
-                cli.allowed_origin.clone(),
+                allowed_origins.normalized(),
                 mcp_cancel.child_token(),
             );
 
@@ -487,15 +497,14 @@ async fn main() -> anyhow::Result<()> {
                 )
             };
 
-            // CORS only when browser origins are allowed at all; otherwise browsers get no
-            // CORS grant (and rmcp would 403 them anyway). rmcp's Origin check remains the
-            // enforcement point — CORS only decides whether a browser may read responses.
-            let with_cors = |router: Router| {
-                if cli.allowed_origin.is_empty() {
-                    router
-                } else {
-                    router.layer(CorsLayer::permissive())
-                }
+            // CORS only for the allowed origins (none configured = no CORS at all). rmcp's
+            // Origin check remains the enforcement point on /mcp — CORS only decides which
+            // browser pages may read responses. Applied outermost, so it also covers the
+            // auth middleware's 401s and, in OAuth mode, the OAuth endpoints a browser
+            // client must fetch (discovery, /register, /token).
+            let with_cors = |router: Router| match allowed_origins.cors_layer() {
+                Some(cors) => router.layer(cors),
+                None => router,
             };
 
             let mut shutdown_oauth_state: Option<Arc<oauth::OAuthState>> = None;
@@ -532,19 +541,14 @@ async fn main() -> anyhow::Result<()> {
 
                 shutdown_oauth_state = Some(oauth_state);
 
-                // Protected MCP routes — CORS (if any) only on /mcp
-                let mcp_router = with_cors(
-                    Router::new()
-                        .nest_service("/mcp", mcp_service)
-                        // Runs before nest strips /mcp, so it sees the /mcp/<format> tail.
-                        .layer(middleware::from_fn(response_config_layer))
-                        .layer(auth_middleware),
-                );
+                // Protected MCP routes.
+                let mcp_router = Router::new()
+                    .nest_service("/mcp", mcp_service)
+                    // Runs before nest strips /mcp, so it sees the /mcp/<format> tail.
+                    .layer(middleware::from_fn(response_config_layer))
+                    .layer(auth_middleware);
 
-                // OAuth endpoints get no CORS (browser-to-browser calls are not needed)
-                oauth_router
-                    .merge(mcp_router)
-                    .layer(TraceLayer::new_for_http())
+                with_cors(oauth_router.merge(mcp_router)).layer(TraceLayer::new_for_http())
             } else {
                 // --- Static Bearer token mode (existing behavior) ---
                 let api_token = cli.api_token.clone();

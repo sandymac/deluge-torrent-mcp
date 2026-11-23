@@ -46,7 +46,7 @@ The server supports two MCP transports:
 - **stdio** — for local use with Claude Desktop and similar clients
 - **HTTP/SSE** — for remote use with network-accessible clients; MCP clients connect to `http://<host>:<port>/mcp`. Protected by optional Bearer token authentication (`--api-token`).
 
-MCP protocol negotiation is capped at `2025-11-25` (the last revision with `initialize`/sessions) because push notifications depend on sessions — see ADR-0014. `DelugeServer::new` and the HTTP session factory must stay side-effect free (rmcp 3 also calls the factory for stateless requests): the tool gate, peer registry and plugin watcher are process-wide (`SharedState`); a session registers its peer on `notifications/initialized` and starts its resource-event forwarder on first subscribe. Browser `Origin`s are rejected unless listed via `--allowed-origin`. Both transports cap a single message at 33 MiB (`MAX_MCP_MESSAGE_BYTES`), sized to the 32 MiB per-call `add_torrent` limit.
+MCP protocol negotiation is capped at `2025-11-25` (the last revision with `initialize`/sessions) because push notifications depend on sessions — see ADR-0014. `DelugeServer::new` and the HTTP session factory must stay side-effect free (rmcp 3 also calls the factory for stateless requests): the tool gate, peer registry and plugin watcher are process-wide (`SharedState`); a session registers its peer on `initialize` and starts its resource-event forwarder on first subscribe (refused outside an initialized session). Peers are pruned by closed state, never by list index. Browser `Origin`s are rejected unless listed via `--allowed-origin`; `src/origin.rs` validates and normalizes that list once and drives both rmcp's Origin check and the CORS layer. Both transports cap a single message at 33 MiB (`MAX_MCP_MESSAGE_BYTES`), sized to the 32 MiB per-call `add_torrent` limit.
 
 ### Deluge RPC API
 Deluge exposes a custom binary RPC protocol over TCP (default port 58846). The daemon must be running and accessible. Authentication is required before issuing commands. The API is documented at https://deluge.readthedocs.io/en/deluge-2.0.1/reference/api.html
@@ -195,6 +195,7 @@ The **path segment names the payload format** (the encoding namespace — `json`
 | `src/response_config/mod.rs` | The consumer-shaped-response DSL — `ResponseConfig`, the shared parser (HTTP path+query and STDIO flag), parse errors. |
 | `src/response_config/shape.rs` | Pure JSON shaping transform — minified/pretty serialization and the `defaults` (defaults-block + omit) transform. |
 | `src/ids/mod.rs` | The `IdStrategy` seam — `encode`/`decode`/`describe` trait with the v1 `Full` (info-hash-is-id) implementation. |
+| `src/origin.rs` | Browser-origin policy for HTTP — parses/validates `--allowed-origin`, feeds rmcp's Origin check, builds the origin-scoped CORS layer. |
 | `src/deluge/mod.rs` | Deluge RPC client — TLS connection, cert fingerprint logging/pinning, auth, request multiplexing, zlib framing. |
 | `src/tools/mod.rs` | MCP tool implementations — all 21 tools, safety gate helpers, plugin watcher, Value→JSON conversion. |
 | `src/oauth/persist.rs` | Optional file-backed persistence for OAuth clients + access/refresh tokens — atomic JSON writes, `Instant` ↔ Unix conversion, debounced background flusher. |

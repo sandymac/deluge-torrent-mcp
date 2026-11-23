@@ -42,7 +42,7 @@ pub(super) fn event_to_resource_uris(event: &DelugeEvent) -> Vec<String> {
 
 /// Apply a new Label-plugin state to the [`ToolGate`]. If it actually changes
 /// the visible tool set, fans out `tools/list_changed` to every connected peer.
-/// Stale peers (those whose send fails) are pruned.
+/// Peers whose session has closed are pruned.
 pub(super) async fn apply_label_state(
     active: bool,
     gate: &Arc<ToolGate>,
@@ -57,26 +57,21 @@ pub(super) async fn apply_label_state(
         if active { "enabled" } else { "disabled" }
     );
 
-    // Fan out tools/list_changed. Prune peers whose notify fails (closed
-    // sessions) while preserving any peers added concurrently via initialize()
-    // between the snapshot and the prune. `connected_peers` is append-only
-    // outside this function, so positions 0..snapshot_len correspond to the
-    // snapshot and positions >= snapshot_len are new arrivals we must keep.
+    // Fan out tools/list_changed from a snapshot, so no lock is held across awaits.
     let peers_snapshot: Vec<Peer<RoleServer>> = connected_peers.read().await.clone();
-    let snapshot_len = peers_snapshot.len();
-    let mut success = vec![false; snapshot_len];
-    for (i, peer) in peers_snapshot.iter().enumerate() {
-        match peer.notify_tool_list_changed().await {
-            Ok(()) => success[i] = true,
-            Err(e) => debug!("notify_tool_list_changed failed for a peer: {e}"),
+    for peer in &peers_snapshot {
+        if let Err(e) = peer.notify_tool_list_changed().await {
+            debug!("notify_tool_list_changed failed for a peer: {e}");
         }
     }
 
-    let mut peers = connected_peers.write().await;
-    let current = std::mem::take(&mut *peers);
-    for (i, peer) in current.into_iter().enumerate() {
-        if i >= snapshot_len || success[i] {
-            peers.push(peer);
-        }
-    }
+    // Prune by the peer's own state, never by position: sessions register and
+    // prune concurrently, so indices from the snapshot cannot be trusted here.
+    // A failed notify means the session's transport is closed.
+    prune_closed_peers(&mut *connected_peers.write().await);
+}
+
+/// Drop peers whose session transport has closed.
+pub(super) fn prune_closed_peers(peers: &mut Vec<Peer<RoleServer>>) {
+    peers.retain(|p| !p.is_transport_closed());
 }

@@ -251,7 +251,7 @@ deluge-torrent-mcp -u admin -p secret --transport http \
 
 **Behind a reverse proxy / TLS.** The server speaks plain HTTP only — terminate TLS at a reverse proxy (nginx, Caddy, Traefik). When the proxy forwards a public hostname, add it with `--allowed-host` (or `DELUGE_ALLOWED_HOST`), otherwise the built-in DNS-rebinding guard rejects the request with `403`. The loopback hosts, the `--http-bind` host, and the `--oauth-issuer` host are accepted automatically.
 
-**Browser clients.** Requests carrying an `Origin` header are rejected with `403` unless the origin is listed with `--allowed-origin` (or `DELUGE_ALLOWED_ORIGIN`), so a web page cannot drive the server through the user's browser. Native MCP clients send no `Origin` and need nothing. A browser-based client such as the MCP Inspector needs its origin listed, e.g. `--allowed-origin http://localhost:6274`.
+**Browser clients.** Requests carrying an `Origin` header are rejected with `403` unless the origin is listed with `--allowed-origin` (or `DELUGE_ALLOWED_ORIGIN`), so a web page cannot drive the server through the user's browser. Native MCP clients send no `Origin` and need nothing. A browser-based client such as the MCP Inspector needs its origin listed, e.g. `--allowed-origin http://localhost:6274`. Write each origin as `scheme://host[:port]`: an omitted port means the scheme's default port (80/443), `:*` means any port, and a malformed entry stops the server at startup. CORS is granted only to listed origins, so a browser client using `--api-token` or OAuth can send its `Authorization` header.
 
 ---
 
@@ -274,7 +274,7 @@ deluge-torrent-mcp --host 192.168.1.50 --port 58846 -u admin -p secret [OPTIONS]
 | `--transport <stdio\|http>` | — | `stdio` | MCP transport to use |
 | `--http-bind <ADDR>` | — | `127.0.0.1:8080` | Bind address for the HTTP transport. Use `0.0.0.0:8080` for all interfaces (IPv6: bracket notation, e.g. `[::]:8080`) |
 | `--allowed-host <HOST>` | `DELUGE_ALLOWED_HOST` | — | Extra Host header value(s) to accept on the HTTP transport, for when behind a reverse proxy. Repeatable, comma-separated |
-| `--allowed-origin <ORIGIN>` | `DELUGE_ALLOWED_ORIGIN` | — (reject all browser origins) | Browser origin(s) allowed to call the HTTP transport, with scheme; `:*` matches any port. Repeatable, comma-separated |
+| `--allowed-origin <ORIGIN>` | `DELUGE_ALLOWED_ORIGIN` | — (reject all browser origins) | Browser origin(s) allowed to call the HTTP transport, as `scheme://host[:port]`; no port = scheme default, `:*` = any port. Repeatable, comma-separated |
 | `--api-token <TOKEN>` | `DELUGE_API_TOKEN` | — | Bearer token required for HTTP requests (recommended). In OAuth mode it also gates the consent screen as the operator Access Code |
 | `--oauth-issuer <URL>` | `DELUGE_OAUTH_ISSUER` | — | Public HTTPS base URL clients reach over the internet; setting it enables OAuth 2.1 mode |
 | `--oauth-state-file <PATH>` | `DELUGE_OAUTH_STATE_FILE` | — | Persist OAuth client registrations and tokens across restarts (only meaningful with `--oauth-issuer`) |

@@ -20,6 +20,15 @@ impl DelugeServer {
         if hashes.is_empty() {
             return Err("info_hashes must not be empty.".to_string());
         }
+        // Some tools issue one daemon RPC per hash; bound the work one call can request.
+        // Mirrors the schema's maxItems, which clients may not enforce.
+        if hashes.len() > super::MAX_INFO_HASHES {
+            return Err(format!(
+                "info_hashes has {} entries; at most {} are accepted per call.",
+                hashes.len(),
+                super::MAX_INFO_HASHES
+            ));
+        }
         for h in hashes {
             Self::validate_info_hash(&h.0)?;
         }

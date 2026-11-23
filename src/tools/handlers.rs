@@ -56,7 +56,7 @@ impl DelugeServer {
         // Per-call cap so anything accepted here also fits in one transport message
         // (see MAX_MCP_MESSAGE_BYTES).
         let total: usize = p.torrent_sources.iter().map(String::len).sum();
-        if p.torrent_sources.len() > 1 && total > super::MAX_BASE64_TORRENT_BYTES {
+        if total > super::MAX_BASE64_TORRENT_BYTES {
             return Err(format!(
                 "torrent_sources total {total} bytes, exceeding the 32 MiB per-call limit. \
                  Split large .torrent uploads across separate calls."

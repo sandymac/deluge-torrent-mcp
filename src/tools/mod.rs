@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Sandy McArthur, Jr.
 // SPDX-License-Identifier: MIT
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -19,7 +19,7 @@ use rmcp::{
         UnsubscribeRequestParams,
     },
     serde_json,
-    service::{NotificationContext, RequestContext},
+    service::RequestContext,
     ErrorData, RoleServer,
 };
 use tokio::sync::{broadcast::error::RecvError, RwLock};
@@ -44,7 +44,7 @@ mod values;
 
 use gate::ToolGate;
 use params::*;
-use plugin_watcher::{apply_label_state, event_to_resource_uris};
+use plugin_watcher::{apply_label_state, event_to_resource_uris, prune_closed_peers};
 
 /// Largest total of `torrent_sources` `add_torrent` accepts in one call (32 MiB) — a
 /// single base64 `.torrent` or several summed. Enforced per call, not per source, so
@@ -54,6 +54,10 @@ pub(crate) const MAX_BASE64_TORRENT_BYTES: usize = 32 * 1024 * 1024;
 /// Most `torrent_sources` `add_torrent` accepts per call. Must match the
 /// `length(max = ...)` on `AddTorrentParams::torrent_sources`.
 pub(crate) const MAX_TORRENT_SOURCES: usize = 100;
+
+/// Most `info_hashes` any batch tool accepts per call. Must match every
+/// `length(min = 1, max = ...)` on an unbounded `info_hashes` param in `params.rs`.
+pub(crate) const MAX_INFO_HASHES: usize = 1000;
 
 /// Largest single MCP message either transport accepts: a maximal `add_torrent` call
 /// plus 1 MiB headroom for the JSON-RPC envelope and JSON string escaping. Applied as
@@ -100,9 +104,12 @@ impl LabelAction {
 #[derive(Clone)]
 pub(crate) struct SharedState {
     gate: Arc<ToolGate>,
-    /// Initialized MCP peers, registered on `notifications/initialized`. Closed peers
-    /// are pruned on registration and whenever a fan-out to them fails.
+    /// Initialized MCP peers, registered on `initialize`. Closed peers are pruned on
+    /// every registration and after every fan-out.
     connected_peers: Arc<RwLock<Vec<Peer<RoleServer>>>>,
+    /// Built once: generating the 21 tools' JSON schemas per session — and per
+    /// stateless HTTP request — is wasted work.
+    tool_router: ToolRouter<DelugeServer>,
 }
 
 impl SharedState {
@@ -118,6 +125,7 @@ impl SharedState {
                 initial_label_plugin_active,
             )),
             connected_peers: Arc::new(RwLock::new(Vec::new())),
+            tool_router: DelugeServer::build_tool_router(),
         }
     }
 
@@ -179,8 +187,8 @@ const SESSION_CLOSED_POLL: std::time::Duration = std::time::Duration::from_secs(
 
 /// One MCP session's handler. Constructing it has no side effects: rmcp 3 also builds
 /// one per stateless HTTP request (inline `_meta`, `server/discover`). Session work
-/// starts lazily — peer registration on `notifications/initialized`, the resource-event
-/// forwarder on the first `resources/subscribe`.
+/// starts lazily — peer registration on `initialize` (which stateless requests never
+/// send), the resource-event forwarder on the first `resources/subscribe`.
 #[derive(Clone)]
 pub(crate) struct DelugeServer {
     api: DelugeApi,
@@ -188,17 +196,18 @@ pub(crate) struct DelugeServer {
     /// and the live Label-plugin state. Shared process-wide; see [`SharedState`].
     gate: Arc<ToolGate>,
     tool_router: ToolRouter<Self>,
-    /// Active resource subscriptions: resource URI → connected peer.
-    /// One subscriber per URI — last `subscribe` call wins.
-    subscribers: Arc<RwLock<HashMap<String, Peer<RoleServer>>>>,
+    /// This session's resource subscriptions (URIs). Notifications go to the session's
+    /// own peer, captured when the forwarder starts.
+    subscribed_uris: Arc<RwLock<HashSet<String>>>,
     /// Process-wide set of initialized peers; see [`SharedState`].
     connected_peers: Arc<RwLock<Vec<Peer<RoleServer>>>>,
     /// Response shaping config used when a request carries none. On STDIO this is the
     /// process-wide config from `--response-config`; on HTTP it is the fallback when a request's
     /// per-request config is absent. See [`Self::resolve_config`].
     default_config: ResponseConfig,
-    /// Set once this session's peer is registered in `connected_peers`, so a repeated
-    /// `notifications/initialized` cannot register it twice.
+    /// Set once this session has initialized and its peer is registered in
+    /// `connected_peers`. Guards against double registration on a repeated
+    /// `initialize`, and gates `resources/subscribe` to real sessions.
     peer_registered: Arc<AtomicBool>,
     /// Set once this session's resource-event forwarder is spawned.
     forwarder_started: Arc<AtomicBool>,
@@ -217,8 +226,8 @@ impl DelugeServer {
         Self {
             api,
             gate: shared.gate.clone(),
-            tool_router: Self::build_tool_router(),
-            subscribers: Arc::new(RwLock::new(HashMap::new())),
+            tool_router: shared.tool_router.clone(),
+            subscribed_uris: Arc::new(RwLock::new(HashSet::new())),
             connected_peers: shared.connected_peers.clone(),
             default_config,
             peer_registered: Arc::new(AtomicBool::new(false)),
@@ -226,14 +235,14 @@ impl DelugeServer {
         }
     }
 
-    /// Register this session's peer for `tools/list_changed` fan-out — once per session.
-    /// Prunes peers whose transport has closed while holding the lock.
+    /// Register this session's peer for `tools/list_changed` fan-out — once per session,
+    /// from `initialize`. Prunes peers whose transport has closed while holding the lock.
     async fn register_peer(&self, peer: &Peer<RoleServer>) {
         if self.peer_registered.swap(true, Ordering::AcqRel) {
             return;
         }
         let mut peers = self.connected_peers.write().await;
-        peers.retain(|p| !p.is_transport_closed());
+        prune_closed_peers(&mut peers);
         peers.push(peer.clone());
     }
 
@@ -247,7 +256,7 @@ impl DelugeServer {
         }
         let session_peer = session_peer.clone();
         let mut event_rx = self.api.subscribe_events();
-        let subs_for_task = self.subscribers.clone();
+        let subs_for_task = self.subscribed_uris.clone();
         tokio::spawn(async move {
             let mut closed_poll = tokio::time::interval(SESSION_CLOSED_POLL);
             loop {
@@ -268,28 +277,17 @@ impl DelugeServer {
                         if uris.is_empty() {
                             continue;
                         }
-                        let mut failed_uris = Vec::new();
-                        {
+                        // Snapshot the matching URIs so no lock is held while sending.
+                        let targets: Vec<String> = {
                             let subs = subs_for_task.read().await;
-                            for uri in &uris {
-                                if let Some(peer) = subs.get(uri) {
-                                    let param =
-                                        ResourceUpdatedNotificationParam::new(uri.clone());
-                                    if let Err(e) =
-                                        peer.notify_resource_updated(param).await
-                                    {
-                                        debug!(
-                                            "resource_updated notification failed for {uri}: {e}"
-                                        );
-                                        failed_uris.push(uri.clone());
-                                    }
-                                }
-                            }
-                        }
-                        if !failed_uris.is_empty() {
-                            let mut subs = subs_for_task.write().await;
-                            for uri in &failed_uris {
-                                subs.remove(uri);
+                            uris.into_iter().filter(|u| subs.contains(u)).collect()
+                        };
+                        for uri in targets {
+                            let param = ResourceUpdatedNotificationParam::new(uri.clone());
+                            if let Err(e) = session_peer.notify_resource_updated(param).await {
+                                // Only fails once the session's transport is gone.
+                                debug!("resource_updated notification failed for {uri}: {e}");
+                                break;
                             }
                         }
                     }
@@ -480,14 +478,13 @@ impl ServerHandler for DelugeServer {
         if context.peer.peer_info().is_none() {
             context.peer.set_peer_info(request.clone());
         }
-        self.negotiate_initialize(&request)
-    }
-
-    /// Register the peer for `tools/list_changed` only once the client has completed
-    /// the handshake; stateless requests never send this and are never registered.
-    async fn on_initialized(&self, context: NotificationContext<RoleServer>) {
-        debug!("client initialized");
+        // Negotiate first: a refused version registers nothing.
+        let result = self.negotiate_initialize(&request)?;
+        // Register here rather than on `notifications/initialized`: rmcp 3 lets clients
+        // proceed without sending that notification, and they should still get
+        // tools/list_changed. Stateless requests never call `initialize`.
         self.register_peer(&context.peer).await;
+        Ok(result)
     }
 
     /// Cap negotiation at 2025-11-25, the last revision with an `initialize` handshake.
@@ -660,10 +657,16 @@ impl ServerHandler for DelugeServer {
                 None,
             ));
         }
-        self.subscribers
-            .write()
-            .await
-            .insert(uri.clone(), context.peer.clone());
+        // Only an initialized session can receive notifications. A stateless request
+        // (rmcp 3 serves inline-`_meta` requests without `initialize`) has nowhere to
+        // deliver them, so refuse rather than spawn a forwarder that cannot.
+        if !self.peer_registered.load(Ordering::Acquire) {
+            return Err(ErrorData::invalid_request(
+                "resources/subscribe requires an initialized session",
+                None,
+            ));
+        }
+        self.subscribed_uris.write().await.insert(uri.clone());
         self.ensure_event_forwarder(&context.peer);
         debug!("Subscribed to resource {uri}");
         Ok(())
@@ -674,7 +677,7 @@ impl ServerHandler for DelugeServer {
         request: UnsubscribeRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<(), ErrorData> {
-        if self.subscribers.write().await.remove(&request.uri).is_some() {
+        if self.subscribed_uris.write().await.remove(&request.uri) {
             debug!("Unsubscribed from resource {}", request.uri);
         }
         Ok(())
@@ -773,5 +776,24 @@ mod tests {
             json["properties"]["torrent_sources"]["maxItems"],
             serde_json::json!(super::MAX_TORRENT_SOURCES)
         );
+    }
+
+    /// Every tool's `info_hashes` array is capped in the schema at exactly the limit
+    /// `validate_info_hashes` enforces (or at 1, for single-torrent tools).
+    #[test]
+    fn info_hashes_schema_caps_match_validator() {
+        let mut checked = 0;
+        for tool in DelugeServer::build_tool_router().list_all() {
+            let schema = serde_json::Value::Object((*tool.input_schema).clone());
+            let Some(prop) = schema["properties"].get("info_hashes") else { continue };
+            let max = prop["maxItems"].as_u64();
+            assert!(
+                max == Some(1) || max == Some(super::MAX_INFO_HASHES as u64),
+                "{}: info_hashes maxItems is {max:?}",
+                tool.name
+            );
+            checked += 1;
+        }
+        assert!(checked >= 7, "expected every info_hashes tool to be checked, got {checked}");
     }
 }

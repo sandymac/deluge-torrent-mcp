@@ -39,9 +39,18 @@ and `server/discover` advertises only it. The HTTP transport keeps
 Keep the session factory and `DelugeServer::new` side-effect free. The tool gate, the
 registry of initialized peers, and the Label-plugin watcher are process-wide
 (`SharedState`, one watcher per process), so stateless requests also see live plugin state.
-A session registers its peer on `notifications/initialized` (once, pruning closed peers) and
-spawns its resource-event forwarder on its first `resources/subscribe`; the forwarder exits
-within 30 s of its session's transport closing, even if the daemon is idle.
+A session registers its peer on `initialize` (once, after successful negotiation, pruning
+closed peers; rmcp 3 lets clients skip `notifications/initialized`, so registering there
+would drop `tools/list_changed` for them). `resources/subscribe` is refused outside an
+initialized session; the first one spawns the session's resource-event forwarder, which
+exits within 30 s of its session's transport closing, even if the daemon is idle. Peers are
+pruned by their own closed state, never by list position, because registration and
+fan-out run concurrently.
+
+Known limitation (pre-existing, also in rmcp 1.x): rmcp restarts a session's idle timer on
+every message the server sends and discards sends to a dropped SSE stream. A client that
+subscribes and then vanishes without `DELETE /mcp` therefore keeps its session alive for as
+long as the daemon keeps producing events.
 
 ## Consequences
 

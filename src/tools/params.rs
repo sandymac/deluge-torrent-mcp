@@ -28,14 +28,14 @@ pub(super) struct InfoHash(
 #[derive(Deserialize, schemars::JsonSchema)]
 pub(super) struct TorrentIdParams {
     /// Torrent info_hashes to operate on.
-    #[schemars(length(min = 1))]
+    #[schemars(length(min = 1, max = 1000))]
     pub(super) info_hashes: Vec<InfoHash>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
 pub(super) struct RemoveTorrentParams {
     /// Torrent info_hashes to remove.
-    #[schemars(length(min = 1))]
+    #[schemars(length(min = 1, max = 1000))]
     pub(super) info_hashes: Vec<InfoHash>,
     /// If true, permanently deletes all downloaded files from disk — this is irreversible. If false (default), removes the torrent from Deluge but leaves files on disk. Always confirm with the user before setting to true.
     #[serde(default)]
@@ -46,7 +46,7 @@ pub(super) struct RemoveTorrentParams {
 #[derive(Deserialize, schemars::JsonSchema)]
 pub(super) struct SetOptionsParams {
     /// Torrent info_hashes to set options on.
-    #[schemars(length(min = 1))]
+    #[schemars(length(min = 1, max = 1000))]
     pub(super) info_hashes: Vec<InfoHash>,
     /// Max download speed in KiB/s.
     pub(super) max_download_speed: Option<f64>,
@@ -69,7 +69,7 @@ pub(super) struct SetOptionsParams {
 #[derive(Deserialize, schemars::JsonSchema)]
 pub(super) struct MoveStorageParams {
     /// Torrent info_hashes to move.
-    #[schemars(length(min = 1))]
+    #[schemars(length(min = 1, max = 1000))]
     pub(super) info_hashes: Vec<InfoHash>,
     /// Absolute destination directory path on the Deluge server. Deluge will attempt to create it if it does not exist. The Deluge process must have write access to this path.
     pub(super) dest: String,
@@ -179,7 +179,7 @@ pub(super) struct LabelNameParams {
 #[derive(Deserialize, schemars::JsonSchema)]
 pub(super) struct SetTorrentLabelParams {
     /// Torrent info_hashes to apply the label to.
-    #[schemars(length(min = 1))]
+    #[schemars(length(min = 1, max = 1000))]
     pub(super) info_hashes: Vec<InfoHash>,
     /// Label to assign. Pass an empty string or "No Label" to clear the torrent's label.
     /// Otherwise must already exist on the daemon — use deluge_create_label first if it does not.
