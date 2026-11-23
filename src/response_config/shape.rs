@@ -79,7 +79,9 @@ fn factor_defaults(value: Value) -> Value {
             if let Value::Object(fields) = row {
                 for (key, default) in &eligible {
                     if fields.get(*key).is_some_and(|v| value_eq(v, default)) {
-                        fields.remove(*key);
+                        // shift_remove keeps the remaining fields in order (plain
+                        // remove would swap the last field into this slot).
+                        fields.shift_remove(*key);
                     }
                 }
             }
@@ -115,6 +117,27 @@ mod tests {
             format: Format::Json,
             shape: ShapeOpts { whitespace, omit_defaults },
             ids: IdSelector::Full,
+        }
+    }
+
+    /// list_torrents' sort order lives only in the key order of the `torrents` object, so
+    /// every shape must emit rows in insertion order, never re-sorted by info hash.
+    #[test]
+    fn row_order_survives_every_shape() {
+        let mut rows = Map::new();
+        for hash in ["ffff", "aaaa", "cccc"] {
+            rows.insert(hash.to_string(), json!({"name": hash, "state": "Seeding", "eta": 0}));
+        }
+        let value = json!({"total": 3, "torrents": Value::Object(rows)});
+        for ws in [Whitespace::Minified, Whitespace::Pretty] {
+            for omit in [false, true] {
+                let out = shape_response(value.clone(), &cfg(ws, omit));
+                let pos = |h: &str| out.find(&format!("\"{h}\"")).unwrap();
+                assert!(
+                    pos("ffff") < pos("aaaa") && pos("aaaa") < pos("cccc"),
+                    "rows re-ordered (omit_defaults={omit}): {out}"
+                );
+            }
         }
     }
 
