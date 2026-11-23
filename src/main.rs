@@ -501,7 +501,7 @@ async fn main() -> anyhow::Result<()> {
             // Origin check remains the enforcement point on /mcp — CORS only decides which
             // browser pages may read responses. Applied outermost, so it also covers the
             // auth middleware's 401s and, in OAuth mode, the OAuth endpoints a browser
-            // client must fetch (discovery, /register, /token).
+            // client must fetch (discovery, /register, /token) — never /authorize.
             let with_cors = |router: Router| match allowed_origins.cors_layer() {
                 Some(cors) => router.layer(cors),
                 None => router,
@@ -533,6 +533,7 @@ async fn main() -> anyhow::Result<()> {
                 }
 
                 let oauth_router = oauth::oauth_routes(oauth_state.clone());
+                let authorize_router = oauth::oauth_authorize_routes(oauth_state.clone());
 
                 let auth_middleware = middleware::from_fn_with_state(
                     oauth_state.clone(),
@@ -548,7 +549,11 @@ async fn main() -> anyhow::Result<()> {
                     .layer(middleware::from_fn(response_config_layer))
                     .layer(auth_middleware);
 
-                with_cors(oauth_router.merge(mcp_router)).layer(TraceLayer::new_for_http())
+                // /authorize is merged outside the CORS layer: its consent page carries
+                // the approval nonce and must never be readable cross-origin.
+                with_cors(oauth_router.merge(mcp_router))
+                    .merge(authorize_router)
+                    .layer(TraceLayer::new_for_http())
             } else {
                 // --- Static Bearer token mode (existing behavior) ---
                 let api_token = cli.api_token.clone();
@@ -894,5 +899,26 @@ mod tests {
             origin_status(Some("https://evil.example"), &allowed).await,
             StatusCode::FORBIDDEN
         );
+    }
+
+    /// Our normalized `--allowed-origin` forms must be ones rmcp's own Origin check
+    /// accepts — otherwise CORS and enforcement would disagree.
+    #[tokio::test]
+    async fn rmcp_accepts_normalized_allowed_origins() {
+        use axum::http::StatusCode;
+        let normalized = crate::origin::AllowedOrigins::parse(&[
+            "http://[0:0:0:0:0:0:0:1]:8080".to_string(),
+            "https://app.example.com".to_string(),
+            "http://dev.local:*".to_string(),
+        ])
+        .unwrap()
+        .normalized();
+        let allowed: Vec<&str> = normalized.iter().map(String::as_str).collect();
+        for origin in ["http://[::1]:8080", "https://app.example.com", "http://dev.local:5173"] {
+            assert_eq!(origin_status(Some(origin), &allowed).await, StatusCode::OK, "{origin}");
+        }
+        for origin in ["http://[::1]:8081", "https://app.example.com:8443", "https://dev.local:5173"] {
+            assert_eq!(origin_status(Some(origin), &allowed).await, StatusCode::FORBIDDEN, "{origin}");
+        }
     }
 }

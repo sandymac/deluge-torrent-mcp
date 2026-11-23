@@ -28,7 +28,7 @@ pub(super) struct InfoHash(
 #[derive(Deserialize, schemars::JsonSchema)]
 pub(super) struct TorrentIdParams {
     /// Torrent info_hashes to operate on.
-    #[schemars(length(min = 1, max = 1000))]
+    #[schemars(length(min = 1))]
     pub(super) info_hashes: Vec<InfoHash>,
 }
 
@@ -46,7 +46,7 @@ pub(super) struct RemoveTorrentParams {
 #[derive(Deserialize, schemars::JsonSchema)]
 pub(super) struct SetOptionsParams {
     /// Torrent info_hashes to set options on.
-    #[schemars(length(min = 1, max = 1000))]
+    #[schemars(length(min = 1))]
     pub(super) info_hashes: Vec<InfoHash>,
     /// Max download speed in KiB/s.
     pub(super) max_download_speed: Option<f64>,
@@ -69,7 +69,7 @@ pub(super) struct SetOptionsParams {
 #[derive(Deserialize, schemars::JsonSchema)]
 pub(super) struct MoveStorageParams {
     /// Torrent info_hashes to move.
-    #[schemars(length(min = 1, max = 1000))]
+    #[schemars(length(min = 1))]
     pub(super) info_hashes: Vec<InfoHash>,
     /// Absolute destination directory path on the Deluge server. Deluge will attempt to create it if it does not exist. The Deluge process must have write access to this path.
     pub(super) dest: String,

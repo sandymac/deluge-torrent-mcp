@@ -85,6 +85,7 @@ impl DelugeServer {
     ) -> Result<String, String> {
         self.gate.check("deluge_remove_torrent")?;
         Self::validate_info_hashes(&p.info_hashes)?;
+        Self::check_per_hash_batch(&p.info_hashes)?;
         let hashes = p.info_hashes;
         let status_word = if p.delete_data { "deleted" } else { "ok" };
         let mut results = serde_json::Map::new();
@@ -520,6 +521,7 @@ impl DelugeServer {
     ) -> Result<String, String> {
         self.gate.check("deluge_set_torrent_label")?;
         Self::validate_info_hashes(&p.info_hashes)?;
+        Self::check_per_hash_batch(&p.info_hashes)?;
         let label = Self::normalize_label_for_set(&p.label)?;
 
         let create_label_hint = self.create_label_hint();

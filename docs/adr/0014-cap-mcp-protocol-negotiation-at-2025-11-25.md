@@ -18,7 +18,8 @@ Several features of this server depend on `initialize` and a long-lived session:
 - `DelugeServer::initialize` records each peer in `connected_peers`, which is how the plugin
   watcher delivers `notifications/tools/list_changed` when the Label plugin flips (ADR-0008).
 - Resource subscriptions (`resources/subscribe`) keep a `Peer` to push `resources/updated`.
-- Each server instance runs a plugin watcher and a resource-event forwarder.
+- Each server instance ran a plugin watcher and a resource-event forwarder (before this
+  decision moved the watcher to process scope; see Decision).
 
 A `2026-07-28` client would get none of the push behaviour, with no error on either side.
 
@@ -45,7 +46,10 @@ would drop `tools/list_changed` for them). `resources/subscribe` is refused outs
 initialized session; the first one spawns the session's resource-event forwarder, which
 exits within 30 s of its session's transport closing, even if the daemon is idle. Peers are
 pruned by their own closed state, never by list position, because registration and
-fan-out run concurrently.
+fan-out run concurrently. The single watcher never awaits clients itself: each toggle's
+`tools/list_changed` fan-out runs in its own task, concurrently, with a 5 s timeout per
+peer, so one client that stops reading cannot stall other sessions or later toggles. The
+resource-event forwarder bounds each send the same way.
 
 Known limitation (pre-existing, also in rmcp 1.x): rmcp restarts a session's idle timer on
 every message the server sends and discards sends to a dropped SSE stream. A client that

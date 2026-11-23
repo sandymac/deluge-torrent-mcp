@@ -44,7 +44,7 @@ mod values;
 
 use gate::ToolGate;
 use params::*;
-use plugin_watcher::{apply_label_state, event_to_resource_uris, prune_closed_peers};
+use plugin_watcher::{NOTIFY_TIMEOUT, apply_label_state, event_to_resource_uris, prune_closed_peers};
 
 /// Largest total of `torrent_sources` `add_torrent` accepts in one call (32 MiB) — a
 /// single base64 `.torrent` or several summed. Enforced per call, not per source, so
@@ -55,9 +55,10 @@ pub(crate) const MAX_BASE64_TORRENT_BYTES: usize = 32 * 1024 * 1024;
 /// `length(max = ...)` on `AddTorrentParams::torrent_sources`.
 pub(crate) const MAX_TORRENT_SOURCES: usize = 100;
 
-/// Most `info_hashes` any batch tool accepts per call. Must match every
-/// `length(min = 1, max = ...)` on an unbounded `info_hashes` param in `params.rs`.
-pub(crate) const MAX_INFO_HASHES: usize = 1000;
+/// Most `info_hashes` accepted per call by tools that issue one daemon RPC per hash
+/// (`remove_torrent`, `set_torrent_label`). Must match the `length(max = ...)` on those
+/// tools' params in `params.rs`. Single-RPC batch tools are not capped.
+pub(crate) const MAX_PER_HASH_BATCH: usize = 1000;
 
 /// Largest single MCP message either transport accepts: a maximal `add_torrent` call
 /// plus 1 MiB headroom for the JSON-RPC envelope and JSON string escaping. Applied as
@@ -284,10 +285,24 @@ impl DelugeServer {
                         };
                         for uri in targets {
                             let param = ResourceUpdatedNotificationParam::new(uri.clone());
-                            if let Err(e) = session_peer.notify_resource_updated(param).await {
-                                // Only fails once the session's transport is gone.
-                                debug!("resource_updated notification failed for {uri}: {e}");
-                                break;
+                            match tokio::time::timeout(
+                                NOTIFY_TIMEOUT,
+                                session_peer.notify_resource_updated(param),
+                            )
+                            .await
+                            {
+                                Ok(Ok(())) => {}
+                                Ok(Err(e)) => {
+                                    // Only fails once the session's transport is gone.
+                                    debug!("resource_updated notification failed for {uri}: {e}");
+                                    break;
+                                }
+                                Err(_) => {
+                                    // The client isn't draining its stream; drop this batch
+                                    // rather than backing up the forwarder.
+                                    debug!("resource_updated notification timed out for {uri}");
+                                    break;
+                                }
                             }
                         }
                     }
@@ -490,9 +505,9 @@ impl ServerHandler for DelugeServer {
     /// Cap negotiation at 2025-11-25, the last revision with an `initialize` handshake.
     ///
     /// 2026-07-28 clients are served statelessly via `server/discover` and never call
-    /// `initialize`, so peer tracking (`connected_peers` → `tools/list_changed`), resource
-    /// subscriptions, and the per-session plugin watcher would silently stop working for
-    /// them. Raise this ceiling only after those move onto SEP-2575 listen streams.
+    /// `initialize`, so peer registration (`connected_peers` → `tools/list_changed`) and
+    /// resource subscriptions would silently stop working for them. Raise this ceiling
+    /// only after those move onto SEP-2575 listen streams.
     fn supported_protocol_versions(&self) -> std::borrow::Cow<'static, [ProtocolVersion]> {
         std::borrow::Cow::Borrowed(supported_protocol_versions())
     }
@@ -778,20 +793,21 @@ mod tests {
         );
     }
 
-    /// Every tool's `info_hashes` array is capped in the schema at exactly the limit
-    /// `validate_info_hashes` enforces (or at 1, for single-torrent tools).
+    /// Per-hash-RPC tools cap `info_hashes` in the schema at exactly the handler limit;
+    /// single-RPC batch tools stay uncapped (or are single-torrent, max 1).
     #[test]
-    fn info_hashes_schema_caps_match_validator() {
+    fn info_hashes_schema_caps_match_handlers() {
+        const PER_HASH: [&str; 2] = ["deluge_remove_torrent", "deluge_set_torrent_label"];
         let mut checked = 0;
         for tool in DelugeServer::build_tool_router().list_all() {
             let schema = serde_json::Value::Object((*tool.input_schema).clone());
             let Some(prop) = schema["properties"].get("info_hashes") else { continue };
             let max = prop["maxItems"].as_u64();
-            assert!(
-                max == Some(1) || max == Some(super::MAX_INFO_HASHES as u64),
-                "{}: info_hashes maxItems is {max:?}",
-                tool.name
-            );
+            if PER_HASH.contains(&tool.name.as_ref()) {
+                assert_eq!(max, Some(super::MAX_PER_HASH_BATCH as u64), "{}", tool.name);
+            } else {
+                assert!(max.is_none() || max == Some(1), "{}: maxItems {max:?}", tool.name);
+            }
             checked += 1;
         }
         assert!(checked >= 7, "expected every info_hashes tool to be checked, got {checked}");

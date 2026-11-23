@@ -3,20 +3,25 @@
 
 //! Browser-origin policy for the HTTP transport.
 //!
-//! `--allowed-origin` entries are parsed and normalized once at startup, then used for
-//! both enforcement points so they cannot disagree:
+//! `--allowed-origin` entries are parsed with the WHATWG URL parser (`url`), validated,
+//! and canonicalized once at startup, then used for both enforcement points so they
+//! cannot disagree:
 //!
 //! - rmcp's Origin check on `/mcp` (403 for a non-matching `Origin`), fed the
-//!   [`AllowedOrigins::normalized`] strings, which always carry an explicit port or
-//!   `:*` so rmcp's deprecated "no port = any port" rule never applies;
+//!   [`AllowedOrigins::normalized`] strings — canonical host, and always an explicit
+//!   port or `:*`, so rmcp's deprecated "no port = any port" rule never applies;
 //! - the CORS layer ([`AllowedOrigins::cors_layer`]), which grants a browser read
-//!   access only for a matching origin and names the headers MCP actually uses
-//!   (`Access-Control-Allow-Headers: *` does not cover `Authorization`).
+//!   access only for a matching origin.
+//!
+//! Canonicalization matches how browsers serialize `Origin`: lowercase host, IPv6 in
+//! compressed bracketed form, IDNs as punycode, default port implied.
+
+use std::time::Duration;
 
 use axum::http::{HeaderName, HeaderValue, Method, header};
-use tower_http::cors::{AllowOrigin, CorsLayer};
+use tower_http::cors::{AllowHeaders, AllowOrigin, CorsLayer};
 
-/// One allowed origin: scheme, lowercase host, and a port (`None` = any port, from `:*`).
+/// One allowed origin: scheme, canonical host, and a port (`None` = any port, from `:*`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct OriginRule {
     scheme: String,
@@ -32,61 +37,59 @@ struct RequestOrigin {
     port: u16,
 }
 
-fn default_port(scheme: &str) -> u16 {
-    if scheme == "https" { 443 } else { 80 }
-}
-
-/// Split `scheme://authority` into (scheme, host, port-text). Rejects paths, userinfo,
-/// query strings, and non-http(s) schemes. IPv6 hosts keep their brackets.
-fn split_origin(s: &str) -> Result<(String, String, Option<&str>), String> {
-    let (scheme, authority) = s
-        .split_once("://")
-        .ok_or_else(|| "missing scheme (expected e.g. http://localhost:6274)".to_string())?;
-    let scheme = scheme.to_ascii_lowercase();
+/// Parse `scheme://host[:port]` into (scheme, canonical host, effective port).
+/// Rejects anything that is not a bare http(s) origin.
+fn parse_origin(s: &str) -> Result<(String, String, u16), String> {
+    let url = url::Url::parse(s).map_err(|e| format!("not a valid origin ({e})"))?;
+    let scheme = url.scheme();
     if scheme != "http" && scheme != "https" {
         return Err(format!("unsupported scheme `{scheme}` (use http or https)"));
     }
-    if authority.is_empty() || authority.contains(['/', '?', '#', '@']) {
-        return Err("must be scheme://host[:port] with no path, query, or userinfo".to_string());
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("must not contain userinfo".to_string());
     }
-    let (host, port) = if let Some(rest) = authority.strip_prefix('[') {
-        let (h, after) = rest
-            .split_once(']')
-            .ok_or_else(|| "unterminated IPv6 host".to_string())?;
-        let port = match after {
-            "" => None,
-            p => Some(p.strip_prefix(':').ok_or_else(|| "bad port".to_string())?),
-        };
-        (format!("[{}]", h.to_ascii_lowercase()), port)
-    } else {
-        match authority.rsplit_once(':') {
-            Some((h, p)) => (h.to_ascii_lowercase(), Some(p)),
-            None => (authority.to_ascii_lowercase(), None),
-        }
-    };
-    if host.is_empty() || host == "[]" {
-        return Err("missing host".to_string());
+    if url.query().is_some() || url.fragment().is_some() || !matches!(url.path(), "" | "/") {
+        return Err("must be scheme://host[:port] with no path, query, or fragment".to_string());
     }
-    Ok((scheme, host, port))
+    // The parser keeps the authority's trailing slash only as path "/"; reject an explicit
+    // one in the input too, so the entry reads as an origin.
+    if s.ends_with('/') {
+        return Err("must not end with `/`".to_string());
+    }
+    let host = url.host_str().ok_or_else(|| "missing host".to_string())?;
+    if host.contains('*') {
+        return Err("wildcard hosts are not supported".to_string());
+    }
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(|| "missing port".to_string())?;
+    if port == 0 {
+        return Err("invalid port 0".to_string());
+    }
+    Ok((scheme.to_string(), host.to_string(), port))
 }
 
-fn parse_port(p: &str) -> Result<u16, String> {
-    p.parse::<u16>()
-        .ok()
-        .filter(|&n| n != 0)
-        .ok_or_else(|| format!("invalid port `{p}`"))
+/// Whether an already-validated origin string spells out a port (`…:8080`). Checked
+/// textually because the URL parser drops an explicit default port (`:443`).
+fn has_explicit_port(origin: &str) -> bool {
+    let authority = origin.split_once("://").map_or(origin, |(_, a)| a);
+    // An IPv6 host ends in `]`; only a `:` after it can introduce a port.
+    let after_host = authority.rsplit_once(']').map_or(authority, |(_, rest)| rest);
+    after_host.contains(':')
 }
 
 impl OriginRule {
     fn parse(entry: &str) -> Result<Self, String> {
-        let (scheme, host, port) = split_origin(entry)?;
-        let port = match port {
-            Some("*") => None,
-            Some(p) => Some(parse_port(p)?),
-            // No port: the scheme's default port only — never "any port".
-            None => Some(default_port(&scheme)),
+        // `:*` (any port) is our syntax, not URL syntax: strip it before parsing.
+        let (base, any_port) = match entry.strip_suffix(":*") {
+            Some(base) => (base, true),
+            None => (entry, false),
         };
-        Ok(Self { scheme, host, port })
+        let (scheme, host, port) = parse_origin(base)?;
+        if any_port && has_explicit_port(base) {
+            return Err("give either a port or `:*`, not both".to_string());
+        }
+        Ok(Self { scheme, host, port: (!any_port).then_some(port) })
     }
 
     fn normalized(&self) -> String {
@@ -105,11 +108,7 @@ impl OriginRule {
 
 impl RequestOrigin {
     fn parse(value: &str) -> Option<Self> {
-        let (scheme, host, port) = split_origin(value).ok()?;
-        let port = match port {
-            None => default_port(&scheme),
-            Some(p) => parse_port(p).ok()?,
-        };
+        let (scheme, host, port) = parse_origin(value).ok()?;
         Some(Self { scheme, host, port })
     }
 }
@@ -141,7 +140,7 @@ impl AllowedOrigins {
         self.rules.is_empty()
     }
 
-    /// Entries for rmcp's `allowed_origins`, each with an explicit port or `:*`.
+    /// Entries for rmcp's `allowed_origins`: canonical host, explicit port or `:*`.
     pub(crate) fn normalized(&self) -> Vec<String> {
         self.rules.iter().map(OriginRule::normalized).collect()
     }
@@ -155,8 +154,12 @@ impl AllowedOrigins {
     }
 
     /// CORS for the allowed origins only, or `None` when no origin is allowed (browsers
-    /// then get no CORS grant at all). Lists MCP's request and response headers
-    /// explicitly: a `*` wildcard would not cover `Authorization`.
+    /// then get no CORS grant at all).
+    ///
+    /// Request headers are mirrored from the preflight: the origin is already
+    /// allow-listed and credentials mode is never enabled, so an explicit list adds no
+    /// protection — and could not enumerate MCP's extensible headers (`Mcp-Method`,
+    /// `Mcp-Name`, `Mcp-Param-*`). A literal `*` would not cover `Authorization`.
     pub(crate) fn cors_layer(&self) -> Option<CorsLayer> {
         if self.is_empty() {
             return None;
@@ -167,19 +170,14 @@ impl AllowedOrigins {
             CorsLayer::new()
                 .allow_origin(AllowOrigin::predicate(move |origin, _| policy.allows(origin)))
                 .allow_methods([Method::GET, Method::POST, Method::DELETE])
-                .allow_headers([
-                    header::AUTHORIZATION,
-                    header::CONTENT_TYPE,
-                    header::ACCEPT,
-                    mcp("mcp-session-id"),
-                    mcp("mcp-protocol-version"),
-                    mcp("last-event-id"),
-                ])
+                .allow_headers(AllowHeaders::mirror_request())
                 .expose_headers([
                     mcp("mcp-session-id"),
                     mcp("mcp-protocol-version"),
                     header::WWW_AUTHENTICATE,
-                ]),
+                ])
+                // Every MCP POST is non-simple; let browsers reuse a preflight briefly.
+                .max_age(Duration::from_secs(600)),
         )
     }
 }
@@ -198,23 +196,44 @@ mod tests {
 
     #[test]
     fn rejects_malformed_and_empty_entries() {
-        for bad in ["", "  ", "localhost:6274", "ftp://x", "http://", "http://h/path", "http://h:0", "http://h:99999", "http://u@h"] {
+        for bad in [
+            "", "  ", "localhost:6274", "ftp://x", "http://", "http://h/path", "http://h/",
+            "http://h:0", "http://h:99999", "http://u@h", "http://h?q", "http://::1:8080",
+            "http://[oops]:8080", "http://*.example.com", "http://h:8080:*", "null",
+        ] {
             assert!(AllowedOrigins::parse(&[bad.to_string()]).is_err(), "{bad:?} should be rejected");
         }
     }
 
     #[test]
-    fn normalizes_to_explicit_ports() {
-        let o = allowed(&["http://LocalHost:6274", "https://app.example.com", "http://dev.local:*", "http://[::1]:8080"]);
+    fn normalizes_to_canonical_hosts_and_explicit_ports() {
+        let o = allowed(&[
+            "http://LocalHost:6274",
+            "https://app.example.com",
+            "http://dev.local:*",
+            "http://[0:0:0:0:0:0:0:1]:8080",
+            "https://bücher.example",
+        ]);
         assert_eq!(
             o.normalized(),
-            ["http://localhost:6274", "https://app.example.com:443", "http://dev.local:*", "http://[::1]:8080"]
+            [
+                "http://localhost:6274",
+                "https://app.example.com:443",
+                "http://dev.local:*",
+                "http://[::1]:8080",
+                "https://xn--bcher-kva.example:443",
+            ]
         );
     }
 
     #[test]
     fn matching_honors_scheme_host_and_port() {
-        let o = allowed(&["http://localhost:6274", "https://app.example.com", "http://dev.local:*"]);
+        let o = allowed(&[
+            "http://localhost:6274",
+            "https://app.example.com",
+            "http://dev.local:*",
+            "http://[0:0:0:0:0:0:0:1]:8080",
+        ]);
         assert!(o.allows(&hv("http://localhost:6274")));
         assert!(!o.allows(&hv("http://localhost:6275")));
         assert!(!o.allows(&hv("https://localhost:6274")));
@@ -223,6 +242,8 @@ mod tests {
         assert!(o.allows(&hv("https://app.example.com:443")));
         assert!(!o.allows(&hv("https://app.example.com:8443")));
         assert!(o.allows(&hv("http://dev.local:1234")));
+        // Long-form IPv6 rule matches the browser's compressed serialization.
+        assert!(o.allows(&hv("http://[::1]:8080")));
         assert!(!o.allows(&hv("https://evil.example")));
         assert!(!o.allows(&hv("null")));
     }
@@ -233,7 +254,7 @@ mod tests {
     }
 
     /// Preflight as a browser sends it before an authenticated MCP POST.
-    async fn preflight(origin: &str) -> axum::http::HeaderMap {
+    async fn preflight(origin: &str, request_headers: &str) -> axum::http::HeaderMap {
         use tower::ServiceExt;
         let cors = allowed(&["http://localhost:6274"]).cors_layer().unwrap();
         let app = axum::Router::new()
@@ -244,21 +265,23 @@ mod tests {
             .uri("/mcp")
             .header("origin", origin)
             .header("access-control-request-method", "POST")
-            .header("access-control-request-headers", "authorization,content-type,mcp-session-id")
+            .header("access-control-request-headers", request_headers)
             .body(axum::body::Body::empty())
             .unwrap();
         app.oneshot(req).await.unwrap().headers().clone()
     }
 
     #[tokio::test]
-    async fn preflight_grants_authorization_to_allowed_origin_only() {
-        let ok = preflight("http://localhost:6274").await;
+    async fn preflight_grants_requested_headers_to_allowed_origin_only() {
+        let wanted = "authorization,content-type,mcp-session-id,mcp-method,mcp-name";
+        let ok = preflight("http://localhost:6274", wanted).await;
         assert_eq!(ok["access-control-allow-origin"], "http://localhost:6274");
         let allow_headers = ok["access-control-allow-headers"].to_str().unwrap().to_ascii_lowercase();
-        assert!(allow_headers.contains("authorization"), "{allow_headers}");
-        assert!(allow_headers.contains("mcp-session-id"), "{allow_headers}");
+        for h in wanted.split(',') {
+            assert!(allow_headers.contains(h), "{h} missing from {allow_headers}");
+        }
 
-        let denied = preflight("https://evil.example").await;
+        let denied = preflight("https://evil.example", wanted).await;
         assert!(denied.get("access-control-allow-origin").is_none());
     }
 }

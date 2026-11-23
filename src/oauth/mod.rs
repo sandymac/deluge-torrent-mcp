@@ -34,7 +34,9 @@ pub(crate) use middleware::oauth_auth_middleware;
 pub(crate) use persist::spawn_persistence;
 pub(crate) use state::OAuthState;
 
-/// Build a Router containing all OAuth 2.1 endpoints.
+/// Build a Router containing the OAuth 2.1 endpoints a client calls programmatically:
+/// discovery, dynamic registration, and token. A browser-based client must `fetch()`
+/// these, so they may sit behind the origin-scoped CORS layer.
 ///
 /// These routes are unauthenticated — they must NOT be behind the MCP auth middleware.
 pub(crate) fn oauth_routes(state: Arc<OAuthState>) -> Router {
@@ -48,10 +50,20 @@ pub(crate) fn oauth_routes(state: Arc<OAuthState>) -> Router {
             get(discovery::authorization_server_metadata),
         )
         .route("/register", post(registration::handle_register))
+        .route("/token", post(token::handle_token))
+        .with_state(state)
+}
+
+/// Build a Router for the consent endpoint (`/authorize`, GET and POST).
+///
+/// Must NEVER get CORS: the consent page embeds the nonce that approves the request, so
+/// a cross-origin read would let a script approve without the user seeing the page. The
+/// authorization endpoint is reached by top-level navigation, which needs no CORS.
+pub(crate) fn oauth_authorize_routes(state: Arc<OAuthState>) -> Router {
+    Router::new()
         .route(
             "/authorize",
             get(authorize::handle_authorize_get).post(authorize::handle_authorize_post),
         )
-        .route("/token", post(token::handle_token))
         .with_state(state)
 }

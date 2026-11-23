@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use rmcp::{Peer, RoleServer};
 use tokio::sync::RwLock;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use super::gate::ToolGate;
 use crate::deluge::DelugeEvent;
@@ -57,19 +57,35 @@ pub(super) async fn apply_label_state(
         if active { "enabled" } else { "disabled" }
     );
 
-    // Fan out tools/list_changed from a snapshot, so no lock is held across awaits.
+    // Fan out tools/list_changed from a snapshot (no lock held across awaits), off the
+    // watcher loop and concurrently, each send bounded by NOTIFY_TIMEOUT. rmcp's send
+    // waits for room in the session's outbound channel, so one client that stops
+    // reading its SSE stream would otherwise stall every other peer and the watcher
+    // itself — which is process-wide, so later toggles would never reach the gate.
     let peers_snapshot: Vec<Peer<RoleServer>> = connected_peers.read().await.clone();
-    for peer in &peers_snapshot {
-        if let Err(e) = peer.notify_tool_list_changed().await {
-            debug!("notify_tool_list_changed failed for a peer: {e}");
+    let connected_peers = connected_peers.clone();
+    tokio::spawn(async move {
+        let mut sends = tokio::task::JoinSet::new();
+        for peer in peers_snapshot {
+            sends.spawn(async move {
+                match tokio::time::timeout(NOTIFY_TIMEOUT, peer.notify_tool_list_changed()).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => debug!("notify_tool_list_changed failed for a peer: {e}"),
+                    Err(_) => warn!("notify_tool_list_changed timed out for a peer; skipping it"),
+                }
+            });
         }
-    }
+        while sends.join_next().await.is_some() {}
 
-    // Prune by the peer's own state, never by position: sessions register and
-    // prune concurrently, so indices from the snapshot cannot be trusted here.
-    // A failed notify means the session's transport is closed.
-    prune_closed_peers(&mut *connected_peers.write().await);
+        // Prune by the peer's own state, never by position: sessions register and
+        // prune concurrently, so indices from the snapshot cannot be trusted here.
+        prune_closed_peers(&mut *connected_peers.write().await);
+    });
 }
+
+/// Upper bound on one server→client notification send. A peer that cannot accept
+/// a notification within this window is skipped for that notification.
+pub(super) const NOTIFY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Drop peers whose session transport has closed.
 pub(super) fn prune_closed_peers(peers: &mut Vec<Peer<RoleServer>>) {
